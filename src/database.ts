@@ -59,7 +59,8 @@ type DebtRow = {
 
 type DebtHistoryRow = {
   id: string; debt_id: string; type: DebtHistoryType; amount: number | null; from_date: string | null;
-  to_date: string | null; occurred_at: string; note: string | null;
+  to_date: string | null; occurred_at: string; note: string | null; operation_id: string | null;
+  related_history_id: string | null;
 };
 
 export type DebtInput = Omit<Debt, 'id' | 'currentBalance' | 'status'>;
@@ -160,12 +161,14 @@ export async function initializeDatabase() {
     CREATE TABLE IF NOT EXISTS debt_history (
       id TEXT PRIMARY KEY NOT NULL,
       debt_id TEXT NOT NULL,
-      type TEXT NOT NULL CHECK(type IN ('created', 'edited', 'payment', 'early_payment', 'extension', 'overdue')),
+      type TEXT NOT NULL CHECK(type IN ('created', 'edited', 'payment', 'early_payment', 'payment_reversed', 'extension', 'overdue')),
       amount REAL,
       from_date TEXT,
       to_date TEXT,
       occurred_at TEXT NOT NULL,
       note TEXT,
+      operation_id TEXT,
+      related_history_id TEXT,
       FOREIGN KEY(debt_id) REFERENCES debts(id) ON DELETE CASCADE
     );
     CREATE TABLE IF NOT EXISTS app_settings (
@@ -185,7 +188,12 @@ export async function initializeDatabase() {
       account_id TEXT NOT NULL,
       date TEXT NOT NULL,
       kind TEXT NOT NULL CHECK(kind IN ('income', 'expense')),
-      source TEXT NOT NULL CHECK(source IN ('manual', 'debt')),
+      source TEXT NOT NULL CHECK(source IN ('manual', 'debt', 'interest', 'sms', 'receipt')),
+      debt_id TEXT,
+      related_operation_id TEXT,
+      account_amount REAL,
+      account_currency TEXT,
+      status TEXT NOT NULL DEFAULT 'posted' CHECK(status IN ('posted', 'reversed')),
       created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
     );
     CREATE TABLE IF NOT EXISTS budgets (
@@ -337,23 +345,33 @@ export async function initializeDatabase() {
       COMMIT;
     `);
   }
+  const operationColumns = await db.getAllAsync<{ name: string }>('PRAGMA table_info(operations)');
+  const operationExtras = [
+    ['debt_id', 'TEXT'], ['related_operation_id', 'TEXT'], ['account_amount', 'REAL'],
+    ['account_currency', 'TEXT'], ["status", "TEXT NOT NULL DEFAULT 'posted'"],
+  ] as const;
+  for (const [name, sqlType] of operationExtras) {
+    if (!operationColumns.some((column) => column.name === name)) await db.execAsync(`ALTER TABLE operations ADD COLUMN ${name} ${sqlType};`);
+  }
   const debtHistorySql = await db.getFirstAsync<{ sql: string }>("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'debt_history'");
-  if (debtHistorySql?.sql && !debtHistorySql.sql.includes("'edited'")) {
+  if (debtHistorySql?.sql && !debtHistorySql.sql.includes("'payment_reversed'")) {
     await db.execAsync(`
       BEGIN;
       CREATE TABLE debt_history_v2 (
         id TEXT PRIMARY KEY NOT NULL, debt_id TEXT NOT NULL,
-        type TEXT NOT NULL CHECK(type IN ('created', 'edited', 'payment', 'early_payment', 'extension', 'overdue')),
+        type TEXT NOT NULL CHECK(type IN ('created', 'edited', 'payment', 'early_payment', 'payment_reversed', 'extension', 'overdue')),
         amount REAL, from_date TEXT, to_date TEXT, occurred_at TEXT NOT NULL, note TEXT,
+        operation_id TEXT, related_history_id TEXT,
         FOREIGN KEY(debt_id) REFERENCES debts(id) ON DELETE CASCADE
       );
-      INSERT INTO debt_history_v2 SELECT * FROM debt_history;
+      INSERT INTO debt_history_v2 (id, debt_id, type, amount, from_date, to_date, occurred_at, note)
+        SELECT id, debt_id, type, amount, from_date, to_date, occurred_at, note FROM debt_history;
       DROP TABLE debt_history;
       ALTER TABLE debt_history_v2 RENAME TO debt_history;
       COMMIT;
     `);
   }
-  await db.execAsync('PRAGMA user_version = 4;');
+  await db.execAsync('PRAGMA user_version = 5;');
 }
 
 export async function listAccounts(): Promise<Account[]> {
@@ -573,43 +591,96 @@ export async function listDebtHistory(debtId: string): Promise<DebtHistory[]> {
   return rows.map((row) => ({
     id: row.id, debtId: row.debt_id, type: row.type, amount: row.amount ?? undefined,
     fromDate: row.from_date ?? undefined, toDate: row.to_date ?? undefined,
-    occurredAt: row.occurred_at, note: row.note ?? undefined,
+    occurredAt: row.occurred_at, note: row.note ?? undefined, operationId: row.operation_id ?? undefined,
+    relatedHistoryId: row.related_history_id ?? undefined,
   }));
 }
 
-export async function recordDebtPayment(debtId: string, requestedAmount: number, paymentDate: string, note?: string) {
+const convertUsingStoredRates = async (db: SQLite.SQLiteDatabase, amount: number, from: string, to: string) => {
+  if (from === to) return amount;
+  const base = await db.getFirstAsync<{ value: string }>("SELECT value FROM app_settings WHERE key = 'base_currency'");
+  const source = from === base?.value ? 1 : (await db.getFirstAsync<{ rate_to_base: number }>('SELECT rate_to_base FROM currency_rates WHERE currency = ?', from))?.rate_to_base;
+  const target = to === base?.value ? 1 : (await db.getFirstAsync<{ rate_to_base: number }>('SELECT rate_to_base FROM currency_rates WHERE currency = ?', to))?.rate_to_base;
+  if (!source || !target) throw new Error(`Нет курса ${from}/${to}`);
+  return amount * source / target;
+};
+
+export async function recordDebtPayment(debtId: string, requestedAmount: number, paymentDate: string, accountId?: string | null, note?: string) {
   const db = await getDatabase();
   const row = await db.getFirstAsync<DebtRow>('SELECT * FROM debts WHERE id = ?', debtId);
   if (!row) throw new Error('Debt not found');
-  const amount = Math.min(requestedAmount, row.current_balance);
-  if (amount <= 0) return;
+  if (!Number.isFinite(requestedAmount) || requestedAmount <= 0) throw new Error('Сумма погашения должна быть больше нуля');
+  if (requestedAmount > row.current_balance + 0.000001) throw new Error('Сумма погашения больше остатка долга');
+  const amount = requestedAmount;
   const balance = Math.max(0, row.current_balance - amount);
   const paid = balance < 0.000001;
   const historyType: DebtHistoryType = paid && paymentDate < row.due_date ? 'early_payment' : 'payment';
+  const selectedAccountId = accountId === undefined ? row.account_id : accountId;
   await db.withTransactionAsync(async () => {
     await db.runAsync("UPDATE debts SET current_balance = ?, status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?", balance, paid ? 'paid' : row.status, debtId);
-    if (row.account_id) {
-      const account = await db.getFirstAsync<{ currency: string }>('SELECT currency FROM accounts WHERE id = ?', row.account_id);
-      let accountAmount = amount;
-      if (account && account.currency !== row.currency) {
-        const base = await db.getFirstAsync<{ value: string }>("SELECT value FROM app_settings WHERE key = 'base_currency'");
-        const source = row.currency === base?.value ? 1 : (await db.getFirstAsync<{ rate_to_base: number }>('SELECT rate_to_base FROM currency_rates WHERE currency = ?', row.currency))?.rate_to_base;
-        const target = account.currency === base?.value ? 1 : (await db.getFirstAsync<{ rate_to_base: number }>('SELECT rate_to_base FROM currency_rates WHERE currency = ?', account.currency))?.rate_to_base;
-        if (!source || !target) throw new Error(`Нет курса ${row.currency}/${account.currency}`);
-        accountAmount = amount * source / target;
-      }
+    let operationId: string | undefined;
+    if (selectedAccountId) {
+      const account = await db.getFirstAsync<{ currency: string }>('SELECT currency FROM accounts WHERE id = ?', selectedAccountId);
+      if (!account) throw new Error('Счёт погашения не найден');
+      const accountAmount = await convertUsingStoredRates(db, amount, row.currency, account.currency);
       const delta = row.direction === 'owed_to_me' ? accountAmount : -accountAmount;
-      await db.runAsync('UPDATE accounts SET balance = balance + ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?', delta, row.account_id);
+      await db.runAsync('UPDATE accounts SET balance = balance + ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?', delta, selectedAccountId);
+      operationId = makeId();
       await db.runAsync(
-        `INSERT INTO operations (id, title, category, amount, currency, account_id, date, kind, source)
-         VALUES (?, ?, 'Долги', ?, ?, ?, ?, ?, 'debt')`,
-        makeId(), `${row.direction === 'owed_to_me' ? 'Возврат долга' : 'Погашение долга'} · ${row.person}`,
-        amount, row.currency, row.account_id, paymentDate, row.direction === 'owed_to_me' ? 'income' : 'expense',
+        `INSERT INTO operations (id, title, category, amount, currency, account_id, date, kind, source,
+          debt_id, account_amount, account_currency, status)
+         VALUES (?, ?, 'Долги', ?, ?, ?, ?, ?, 'debt', ?, ?, ?, 'posted')`,
+        operationId, `${row.direction === 'owed_to_me' ? 'Возврат долга' : 'Погашение долга'} · ${row.person}`,
+        amount, row.currency, selectedAccountId, paymentDate, row.direction === 'owed_to_me' ? 'income' : 'expense',
+        debtId, accountAmount, account.currency,
       );
     }
     await db.runAsync(
-      'INSERT INTO debt_history (id, debt_id, type, amount, occurred_at, note) VALUES (?, ?, ?, ?, ?, ?)',
-      makeId(), debtId, historyType, amount, `${paymentDate}T12:00:00.000Z`, note ?? null,
+      'INSERT INTO debt_history (id, debt_id, type, amount, occurred_at, note, operation_id) VALUES (?, ?, ?, ?, ?, ?, ?)',
+      makeId(), debtId, historyType, amount, `${paymentDate}T12:00:00.000Z`, note ?? null, operationId ?? null,
+    );
+  });
+}
+
+export async function reverseDebtPayment(debtId: string, historyId: string, fallbackAccountId?: string) {
+  const db = await getDatabase();
+  const debt = await db.getFirstAsync<DebtRow>('SELECT * FROM debts WHERE id = ?', debtId);
+  const history = await db.getFirstAsync<DebtHistoryRow>('SELECT * FROM debt_history WHERE id = ? AND debt_id = ?', historyId, debtId);
+  if (!debt || !history || !['payment', 'early_payment'].includes(history.type) || !history.amount) throw new Error('Погашение не найдено');
+  const alreadyReversed = await db.getFirstAsync<{ id: string }>("SELECT id FROM debt_history WHERE related_history_id = ? AND type = 'payment_reversed'", historyId);
+  if (alreadyReversed) throw new Error('Это погашение уже отменено');
+  const operation = history.operation_id ? await db.getFirstAsync<{
+    id: string; account_id: string; account_amount: number | null; account_currency: string | null;
+    kind: 'income' | 'expense'; status: 'posted' | 'reversed'; date: string;
+  }>('SELECT * FROM operations WHERE id = ?', history.operation_id) : null;
+  const accountId = operation?.account_id ?? fallbackAccountId;
+  await db.withTransactionAsync(async () => {
+    const restored = Math.min(debt.original_amount, debt.current_balance + history.amount!);
+    const status: DebtStatus = debt.due_date < localToday() ? 'overdue' : 'active';
+    await db.runAsync('UPDATE debts SET current_balance = ?, status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?', restored, status, debtId);
+    let reversalOperationId: string | undefined;
+    if (accountId) {
+      const account = await db.getFirstAsync<{ currency: string }>('SELECT currency FROM accounts WHERE id = ?', accountId);
+      if (!account) throw new Error('Счёт исходного погашения не найден');
+      const accountAmount = operation?.account_amount ?? await convertUsingStoredRates(db, history.amount!, debt.currency, account.currency);
+      const originalKind = operation?.kind ?? (debt.direction === 'owed_to_me' ? 'income' : 'expense');
+      const reverseKind = originalKind === 'income' ? 'expense' : 'income';
+      const delta = reverseKind === 'income' ? accountAmount : -accountAmount;
+      await db.runAsync('UPDATE accounts SET balance = balance + ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?', delta, accountId);
+      reversalOperationId = makeId();
+      await db.runAsync(
+        `INSERT INTO operations (id, title, category, amount, currency, account_id, date, kind, source,
+          debt_id, related_operation_id, account_amount, account_currency, status)
+         VALUES (?, ?, 'Долги', ?, ?, ?, ?, ?, 'debt', ?, ?, ?, ?, 'posted')`,
+        reversalOperationId, `Отмена погашения · ${debt.person}`, history.amount, debt.currency, accountId,
+        localToday(), reverseKind, debtId, operation?.id ?? null, accountAmount, account.currency,
+      );
+      if (operation) await db.runAsync("UPDATE operations SET status = 'reversed' WHERE id = ?", operation.id);
+    }
+    await db.runAsync(
+      `INSERT INTO debt_history (id, debt_id, type, amount, occurred_at, note, operation_id, related_history_id)
+       VALUES (?, ?, 'payment_reversed', ?, ?, ?, ?, ?)`,
+      makeId(), debtId, history.amount, new Date().toISOString(), 'Ошибочное погашение отменено', reversalOperationId ?? null, historyId,
     );
   });
 }
@@ -674,8 +745,16 @@ export async function listOperations(): Promise<FinancialOperation[]> {
   const rows = await db.getAllAsync<{
     id: string; title: string; category: string; amount: number; currency: string;
     account_id: string; date: string; kind: 'income' | 'expense'; source: FinancialOperation['source'];
+    debt_id: string | null; related_operation_id: string | null; account_amount: number | null;
+    account_currency: string | null; status: 'posted' | 'reversed' | null;
   }>('SELECT * FROM operations ORDER BY date DESC, created_at DESC');
-  return rows.map((row) => ({ id: row.id, title: row.title, category: row.category, amount: row.amount, currency: row.currency, accountId: row.account_id, date: row.date, kind: row.kind, source: row.source }));
+  return rows.map((row) => ({
+    id: row.id, title: row.title, category: row.category, amount: row.amount, currency: row.currency,
+    accountId: row.account_id, date: row.date, kind: row.kind, source: row.source,
+    debtId: row.debt_id ?? undefined, relatedOperationId: row.related_operation_id ?? undefined,
+    accountAmount: row.account_amount ?? undefined, accountCurrency: row.account_currency ?? undefined,
+    status: row.status ?? 'posted',
+  }));
 }
 
 const monthlyDueDates = (startDate: string, trackingFrom: string, through: string) => {

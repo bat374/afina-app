@@ -7,7 +7,7 @@ export type RecurrenceUnit = 'day' | 'week' | 'month' | 'year';
 export type CashFlowKind = 'income' | 'expense';
 export type DebtDirection = 'owed_to_me' | 'i_owe';
 export type DebtStatus = 'active' | 'overdue' | 'paid';
-export type DebtHistoryType = 'created' | 'edited' | 'payment' | 'early_payment' | 'extension' | 'overdue';
+export type DebtHistoryType = 'created' | 'edited' | 'payment' | 'early_payment' | 'payment_reversed' | 'extension' | 'overdue';
 
 export type Account = {
   id: string;
@@ -97,6 +97,8 @@ export type DebtHistory = {
   toDate?: string;
   occurredAt: string;
   note?: string;
+  operationId?: string;
+  relatedHistoryId?: string;
 };
 
 export type CurrencySettings = {
@@ -117,6 +119,11 @@ export type FinancialOperation = {
   date: string;
   kind: 'income' | 'expense';
   source: 'manual' | 'debt' | 'interest' | 'sms' | 'receipt';
+  debtId?: string;
+  relatedOperationId?: string;
+  accountAmount?: number;
+  accountCurrency?: string;
+  status?: 'posted' | 'reversed';
 };
 
 export type Budget = {
