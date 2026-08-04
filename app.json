@@ -1,0 +1,40 @@
+{
+  "expo": {
+    "name": "Афина",
+    "slug": "afinaapp",
+    "version": "1.0.0",
+    "icon": "./assets/icon-v2.png",
+    "orientation": "portrait",
+    "userInterfaceStyle": "light",
+    "splash": {
+      "backgroundColor": "#EDF5F8"
+    },
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "app.afina.finance"
+    },
+    "android": {
+      "package": "app.afina.finance",
+      "softwareKeyboardLayoutMode": "resize",
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/icon-v2.png",
+        "backgroundColor": "#263C4A"
+      }
+    },
+    "plugins": [
+      [
+        "expo-image-picker",
+        {
+          "photosPermission": "Разрешите Афине выбрать скриншот для распознавания операций."
+        }
+      ],
+      "expo-asset",
+      "expo-sqlite"
+    ],
+    "extra": {
+      "eas": {
+        "projectId": "53ab750b-30b0-4e8f-abf6-75e0b537f801"
+      }
+    }
+  }
+}
