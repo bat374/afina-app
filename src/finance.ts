@@ -40,7 +40,7 @@ export const getCurrencyTotals = (accounts: Account[]) => {
   return totals;
 };
 
-const convertedFlowAmount = (flow: PlannedExpense, account: Account | undefined, currency: string, settings?: CurrencySettings) => {
+export const flowAmountInCurrency = (flow: PlannedExpense, account: Account | undefined, currency: string, settings?: CurrencySettings) => {
   const targetCurrency = account?.currency ?? flow.currency;
   if (targetCurrency !== currency) return null;
   if (flow.currency === targetCurrency) return flow.amount;
@@ -120,7 +120,7 @@ export function buildMonthProjection(accounts: Account[], currency: string, year
     let expenseTotal = scheduledCreditPayment;
     if (!past) for (const expense of plannedExpenses) {
       const linkedAccount = accounts.find((item) => item.id === expense.accountId);
-      const amount = convertedFlowAmount(expense, linkedAccount, currency, settings);
+      const amount = flowAmountInCurrency(expense, linkedAccount, currency, settings);
       if (amount === null || !occursOn(expense, current)) continue;
       if (expense.kind === 'income') { income += amount; balance += amount; }
       else { expenseTotal += amount; balance -= amount; }

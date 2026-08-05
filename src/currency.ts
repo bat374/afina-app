@@ -5,6 +5,13 @@ export const convertToBase = (amount: number, currency: string, settings: Curren
   return rate && rate > 0 ? amount * rate : null;
 };
 
+export const convertCurrency = (amount: number, from: string, to: string, settings: CurrencySettings) => {
+  if (from === to) return amount;
+  const sourceRate = from === settings.baseCurrency ? 1 : settings.rates[from];
+  const targetRate = to === settings.baseCurrency ? 1 : settings.rates[to];
+  return sourceRate && sourceRate > 0 && targetRate && targetRate > 0 ? amount * sourceRate / targetRate : null;
+};
+
 export const consolidatedNetWorth = (accounts: Account[], debts: Debt[], settings: CurrencySettings) => {
   let total = 0;
   const missing = new Set<string>();
