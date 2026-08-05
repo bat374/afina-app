@@ -43,7 +43,18 @@ const accountRows = (snapshot: LocalSnapshot) => snapshot.accounts.map((account)
   minimum_payment_percent: account.minimumPaymentPercent ?? null, accent: account.accent,
 }));
 
-export async function uploadLocalDataToCloud(userId: string): Promise<SyncResult> {
+// Guards against overlapping uploads: the caller re-triggers this on every local state
+// change (debounced), so a slow upload can still be in flight when the next one fires.
+// Running two uploads concurrently races on the same Supabase rows in unpredictable order.
+let uploadInFlight: Promise<SyncResult> | null = null;
+
+export function uploadLocalDataToCloud(userId: string): Promise<SyncResult> {
+  if (uploadInFlight) return uploadInFlight;
+  uploadInFlight = runUpload(userId).finally(() => { uploadInFlight = null; });
+  return uploadInFlight;
+}
+
+async function runUpload(userId: string): Promise<SyncResult> {
   if (!supabase) return { uploaded: false, reason: 'not_configured' };
   const snapshot = await exportLocalSnapshot();
 
