@@ -18,6 +18,9 @@ import { calculateGoalProgress } from './src/goals';
 import { localToday, nextMonthlyDate, toLocalIso } from './src/date';
 import { recurrenceLabel } from './src/recurrence';
 import { AnalyticsPeriod, analyticsRange, summarizeOperations, summarizePlannedFlows } from './src/analytics';
+import { supabase, isCloudConfigured } from './src/supabase';
+import { initializeCloudData, uploadLocalDataToCloud } from './src/cloudSync';
+import type { Session } from '@supabase/supabase-js';
 
 type Tab = 'home' | 'accounts' | 'calendar' | 'operations' | 'analytics';
 
@@ -123,7 +126,7 @@ function Home({ onImport, go, accounts, plannedExpenses, debts, currencySettings
       <Text style={[s.heroStatLabel, { marginTop: 10 }]}>СЧЕТА ПО ВАЛЮТАМ</Text>
       <Text style={s.heroOtherCurrency}>{money(totals[primaryCurrency] ?? 0, false, primaryCurrency)}</Text>
       {currencies.slice(1).map((currency) => <Text key={currency} style={s.heroOtherCurrency}>+ {money(totals[currency] ?? 0, false, currency)}</Text>)}
-      <View style={s.heroDelta}><Ionicons name="phone-portrait-outline" size={14} color="#DCE7DD" /><Text style={s.heroDeltaText}> Данные сохранены на устройстве</Text></View>
+      <View style={s.heroDelta}><Ionicons name="cloud-done-outline" size={14} color="#DCE7DD" /><Text style={s.heroDeltaText}> Данные синхронизируются с облаком</Text></View>
       <View style={s.heroRule} />
       <View style={s.heroStats}>
         <View><Text style={s.heroStatLabel}>Активно</Text><Text style={s.heroStat}>0 {primaryCurrency}</Text></View>
@@ -897,7 +900,7 @@ const tabs: { key: Tab; label: string; icon: keyof typeof Ionicons.glyphMap }[] 
   { key: 'analytics', label: 'Аналитика', icon: 'pie-chart-outline' },
 ];
 
-function AppContent() {
+function AppContent({ userId }: { userId: string }) {
   const [tab, setTab] = useState<Tab>('home');
   const [importOpen, setImportOpen] = useState(false);
   const [accountEditorOpen, setAccountEditorOpen] = useState(false);
@@ -921,6 +924,7 @@ function AppContent() {
   const [userBudgets, setUserBudgets] = useState<Budget[]>([]);
   const [financialGoals, setFinancialGoals] = useState<FinancialGoal[]>([]);
   const [currencySettings, setCurrencySettings] = useState<CurrencySettings>({ baseCurrency: 'UZS', rates: { UZS: 1 }, autoUpdate: true });
+  const [databaseReady, setDatabaseReady] = useState(false);
 
   const reloadAccounts = async () => setUserAccounts(await listAccounts());
   const reloadExpenses = async () => setPlannedExpenses(await listPlannedExpenses());
@@ -935,6 +939,14 @@ function AppContent() {
 
   useEffect(() => {
     initializeDatabase().then(async () => {
+      try {
+        await initializeCloudData(userId);
+      } catch (error) {
+        Alert.alert(
+          'Облако временно недоступно',
+          `Данные на телефоне сохранены. Афина повторит синхронизацию позже.${error instanceof Error ? `\n\n${error.message}` : ''}`,
+        );
+      }
       await synchronizeInterestPostings();
       await Promise.all([reloadAccounts(), reloadExpenses(), reloadDebts(), reloadOperations(), reloadBudgets(), reloadGoals()]);
       const stored = await getCurrencySettings(); setCurrencySettings(stored);
@@ -945,8 +957,16 @@ function AppContent() {
           const next = { ...fresh, autoUpdate: true }; await saveCurrencySettings(next); setCurrencySettings(next);
         } catch { /* Офлайн: продолжаем использовать последний сохранённый курс. */ }
       }
+      setDatabaseReady(true);
     }).catch(() => Alert.alert('Не удалось открыть локальную базу', 'Перезапустите приложение и попробуйте снова.'));
-  }, []);
+  }, [userId]);
+  useEffect(() => {
+    if (!databaseReady) return;
+    const timer = setTimeout(() => {
+      uploadLocalDataToCloud(userId).catch(() => { /* Offline changes remain queued in SQLite. */ });
+    }, 1200);
+    return () => clearTimeout(timer);
+  }, [databaseReady, userId, userAccounts, plannedExpenses, debts, operations, userBudgets, financialGoals, currencySettings]);
   useEffect(() => {
     let knownDate = localToday();
     const timer = setInterval(async () => {
@@ -1050,9 +1070,76 @@ function AppContent() {
   </SafeAreaView>;
 }
 
-export default function App() { return <SafeAreaProvider><AppContent /></SafeAreaProvider>; }
+function AuthScreen() {
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
+  const [register, setRegister] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [message, setMessage] = useState('');
+
+  const submit = async () => {
+    if (!supabase || !email.trim() || password.length < 6) {
+      setMessage('Введите email и пароль не короче 6 символов.');
+      return;
+    }
+    setBusy(true); setMessage('');
+    const result = register
+      ? await supabase.auth.signUp({ email: email.trim(), password })
+      : await supabase.auth.signInWithPassword({ email: email.trim(), password });
+    setBusy(false);
+    if (result.error) setMessage(result.error.message);
+    else if (register && !result.data.session) setMessage('Проверьте почту и подтвердите регистрацию.');
+  };
+
+  return <SafeAreaView style={s.authSafe}>
+    <StatusBar style="dark" />
+    <KeyboardAvoidingView style={s.authKeyboard} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
+      <ScrollView contentContainerStyle={s.authPage} keyboardShouldPersistTaps="handled">
+        <View style={s.authMark}><Text style={s.authMarkText}>А</Text></View>
+        <Text style={s.authTitle}>Афина</Text>
+        <Text style={s.authSubtitle}>Ваши финансы синхронизируются с защищённым облаком</Text>
+        <View style={s.authCard}>
+          <Text style={s.fieldLabel}>Email</Text>
+          <TextInput style={s.input} value={email} onChangeText={setEmail} autoCapitalize="none" keyboardType="email-address" autoComplete="email" />
+          <Text style={s.fieldLabel}>Пароль</Text>
+          <TextInput style={s.input} value={password} onChangeText={setPassword} secureTextEntry autoCapitalize="none" autoComplete={register ? 'new-password' : 'current-password'} />
+          {!!message && <Text style={s.authMessage}>{message}</Text>}
+          <Pressable style={[s.primaryButton, busy && { opacity: .55 }]} disabled={busy} onPress={submit}>
+            {busy ? <ActivityIndicator color="white" /> : <Text style={s.primaryText}>{register ? 'Создать аккаунт' : 'Войти'}</Text>}
+          </Pressable>
+          <Pressable style={s.secondaryButton} onPress={() => { setRegister((value) => !value); setMessage(''); }}>
+            <Text style={s.secondaryText}>{register ? 'Уже есть аккаунт — войти' : 'Первый вход — зарегистрироваться'}</Text>
+          </Pressable>
+        </View>
+      </ScrollView>
+    </KeyboardAvoidingView>
+  </SafeAreaView>;
+}
+
+function CloudGate() {
+  const [session, setSession] = useState<Session | null>(null);
+  const [loading, setLoading] = useState(true);
+  useEffect(() => {
+    if (!supabase) { setLoading(false); return; }
+    supabase.auth.getSession().then(({ data }) => { setSession(data.session); setLoading(false); });
+    const { data } = supabase.auth.onAuthStateChange((_event, next) => setSession(next));
+    return () => data.subscription.unsubscribe();
+  }, []);
+  if (loading) return <View style={s.cloudLoading}><ActivityIndicator size="large" color={C.blue} /></View>;
+  if (!isCloudConfigured || !supabase) return <View style={s.cloudLoading}><Text style={s.authMessage}>Облачное подключение не настроено.</Text></View>;
+  if (!session) return <AuthScreen />;
+  return <AppContent userId={session.user.id} />;
+}
+
+export default function App() { return <SafeAreaProvider><CloudGate /></SafeAreaProvider>; }
 
 const s = StyleSheet.create({
+  authSafe: { flex: 1, backgroundColor: C.bg }, authKeyboard: { flex: 1 }, authPage: { flexGrow: 1, justifyContent: 'center', padding: 24 },
+  authMark: { width: 64, height: 64, borderRadius: 22, backgroundColor: '#D7EAF2', alignItems: 'center', justifyContent: 'center', alignSelf: 'center' },
+  authMarkText: { color: C.navy, fontSize: 28, fontWeight: '800' }, authTitle: { color: C.ink, fontSize: 32, fontWeight: '800', textAlign: 'center', marginTop: 16 },
+  authSubtitle: { color: C.muted, fontSize: 14, lineHeight: 21, textAlign: 'center', marginTop: 7, marginBottom: 24 },
+  authCard: { backgroundColor: C.card, borderRadius: 22, padding: 20 }, authMessage: { color: C.red, fontSize: 12, lineHeight: 17, marginBottom: 12 },
+  cloudLoading: { flex: 1, alignItems: 'center', justifyContent: 'center', backgroundColor: C.bg, padding: 24 },
   safe: { flex: 1, backgroundColor: C.bg }, screen: { flex: 1 }, page: { padding: 20, paddingBottom: 24 },
   header: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 22 }, eyebrow: { fontSize: 11, letterSpacing: 1.6, color: C.muted, fontWeight: '700', marginBottom: 4 }, title: { fontSize: 28, fontWeight: '700', color: C.ink, letterSpacing: -.7 },
   avatar: { width: 42, height: 42, borderRadius: 21, backgroundColor: '#D8EAF2', alignItems: 'center', justifyContent: 'center' }, avatarText: { color: C.navy, fontSize: 17, fontWeight: '700' },

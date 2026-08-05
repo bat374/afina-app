@@ -68,6 +68,19 @@ export type FinancialOperationInput = Omit<FinancialOperation, 'id' | 'source'>;
 export type BudgetInput = Omit<Budget, 'id'>;
 export type FinancialGoalInput = Omit<FinancialGoal, 'id'>;
 
+export type LocalSnapshot = {
+  schemaVersion: 1;
+  exportedAt: string;
+  accounts: Account[];
+  scheduledFlows: PlannedExpense[];
+  debts: Debt[];
+  debtHistory: DebtHistory[];
+  operations: FinancialOperation[];
+  budgets: Budget[];
+  goals: FinancialGoal[];
+  currencySettings: CurrencySettings;
+};
+
 let database: Promise<SQLite.SQLiteDatabase> | null = null;
 
 const getDatabase = () => {
@@ -909,4 +922,135 @@ export async function saveFinancialGoal(input: FinancialGoalInput, id?: string) 
 export async function deleteFinancialGoal(id: string) {
   const db = await getDatabase();
   await db.runAsync('DELETE FROM financial_goals WHERE id = ?', id);
+}
+
+export async function exportLocalSnapshot(): Promise<LocalSnapshot> {
+  const [accounts, scheduledFlows, debts, operations, budgets, goals, currencySettings] = await Promise.all([
+    listAccounts(),
+    listPlannedExpenses(),
+    listDebts(),
+    listOperations(),
+    listBudgets(),
+    listFinancialGoals(),
+    getCurrencySettings(),
+  ]);
+  const debtHistory = (await Promise.all(debts.map((debt) => listDebtHistory(debt.id)))).flat();
+  return {
+    schemaVersion: 1,
+    exportedAt: new Date().toISOString(),
+    accounts,
+    scheduledFlows,
+    debts,
+    debtHistory,
+    operations,
+    budgets,
+    goals,
+    currencySettings,
+  };
+}
+
+export async function getLinkedCloudUserId() {
+  const db = await getDatabase();
+  const row = await db.getFirstAsync<{ value: string }>("SELECT value FROM app_settings WHERE key = 'cloud_user_id'");
+  return row?.value;
+}
+
+export async function setLinkedCloudUserId(userId: string) {
+  const db = await getDatabase();
+  await db.runAsync("INSERT OR REPLACE INTO app_settings (key, value) VALUES ('cloud_user_id', ?)", userId);
+}
+
+export async function replaceLocalSnapshot(snapshot: LocalSnapshot) {
+  const db = await getDatabase();
+  await db.withTransactionAsync(async () => {
+    await db.execAsync(`
+      DELETE FROM debt_history;
+      DELETE FROM interest_postings;
+      DELETE FROM operations;
+      DELETE FROM scheduled_flows;
+      DELETE FROM planned_expenses;
+      DELETE FROM financial_goals;
+      DELETE FROM budgets;
+      DELETE FROM debts;
+      DELETE FROM accounts;
+      DELETE FROM currency_rates;
+    `);
+    for (const account of snapshot.accounts) {
+      await db.runAsync(
+        `INSERT INTO accounts (id, name, subtitle, type, balance, currency, rate, rate_caption,
+          start_date, maturity_date, interest_schedule, interest_destination, destination_account_id,
+          next_interest_date, auto_renewal, rate_review_reminder, withdrawal_policy, minimum_balance,
+          replenishment_allowed, credit_limit, statement_day, payment_due_day, grace_period_days,
+          minimum_payment_percent, accent, interest_tracking_from)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        account.id, account.name, account.subtitle, account.type === 'credit_card' ? 'card' : account.type,
+        account.balance, account.currency, account.rate ?? null, account.rateCaption ?? null,
+        account.startDate ?? null, account.maturityDate ?? null, account.interestSchedule ?? null,
+        account.interestDestination ?? null, account.destinationAccountId ?? null,
+        account.nextInterestDate ?? null, account.autoRenewal ? 1 : 0,
+        account.rateReviewReminder === false ? 0 : 1, account.withdrawalPolicy ?? null,
+        account.minimumBalance ?? null, account.replenishmentAllowed === undefined ? null : account.replenishmentAllowed ? 1 : 0,
+        account.creditLimit ?? null, account.statementDay ?? null, account.paymentDueDay ?? null,
+        account.gracePeriodDays ?? null, account.minimumPaymentPercent ?? null, account.accent,
+        account.startDate ?? localToday(),
+      );
+    }
+    for (const flow of snapshot.scheduledFlows) {
+      await db.runAsync(
+        `INSERT INTO scheduled_flows (id, title, category, amount, currency, account_id, start_date,
+          end_date, repeat_rule, kind, repeat_interval, repeat_unit, weekdays, exchange_rate, source_transaction_id)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        flow.id, flow.title, flow.category, flow.amount, flow.currency, flow.accountId ?? null,
+        flow.startDate, flow.endDate ?? null, flow.repeat, flow.kind, flow.repeatInterval ?? 1,
+        flow.repeatUnit ?? null, flow.weekdays ? JSON.stringify(flow.weekdays) : null,
+        flow.exchangeRate ?? null, flow.sourceTransactionId ?? null,
+      );
+    }
+    for (const debt of snapshot.debts) {
+      await db.runAsync(
+        `INSERT INTO debts (id, person, title, direction, original_amount, current_balance, currency,
+          account_id, start_date, due_date, status, note) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        debt.id, debt.person, debt.title, debt.direction, debt.originalAmount, debt.currentBalance,
+        debt.currency, debt.accountId ?? null, debt.startDate, debt.dueDate, debt.status, debt.note ?? null,
+      );
+    }
+    for (const operation of snapshot.operations) {
+      await db.runAsync(
+        `INSERT INTO operations (id, title, category, amount, currency, account_id, date, kind, source,
+          debt_id, related_operation_id, account_amount, account_currency, status)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        operation.id, operation.title, operation.category, operation.amount, operation.currency,
+        operation.accountId, operation.date, operation.kind, operation.source, operation.debtId ?? null,
+        operation.relatedOperationId ?? null, operation.accountAmount ?? null,
+        operation.accountCurrency ?? null, operation.status ?? 'posted',
+      );
+    }
+    for (const event of snapshot.debtHistory) {
+      await db.runAsync(
+        `INSERT INTO debt_history (id, debt_id, type, amount, from_date, to_date, occurred_at, note,
+          operation_id, related_history_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        event.id, event.debtId, event.type, event.amount ?? null, event.fromDate ?? null,
+        event.toDate ?? null, event.occurredAt, event.note ?? null, event.operationId ?? null,
+        event.relatedHistoryId ?? null,
+      );
+    }
+    for (const budget of snapshot.budgets) {
+      await db.runAsync('INSERT INTO budgets (id, category, currency, limit_amount) VALUES (?, ?, ?, ?)',
+        budget.id, budget.category, budget.currency, budget.limit);
+    }
+    for (const goal of snapshot.goals) {
+      await db.runAsync(
+        'INSERT INTO financial_goals (id, title, type, target, currency, deadline, account_id, debt_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+        goal.id, goal.title, goal.type, goal.target, goal.currency, goal.deadline,
+        goal.accountId ?? null, goal.debtId ?? null,
+      );
+    }
+    await db.runAsync("INSERT OR REPLACE INTO app_settings (key, value) VALUES ('base_currency', ?)", snapshot.currencySettings.baseCurrency);
+    await db.runAsync("INSERT OR REPLACE INTO app_settings (key, value) VALUES ('rates_last_updated', ?)", snapshot.currencySettings.lastUpdated ?? '');
+    await db.runAsync("INSERT OR REPLACE INTO app_settings (key, value) VALUES ('rates_source', ?)", snapshot.currencySettings.source ?? 'manual');
+    await db.runAsync("INSERT OR REPLACE INTO app_settings (key, value) VALUES ('rates_auto_update', ?)", snapshot.currencySettings.autoUpdate === false ? '0' : '1');
+    for (const [currency, rate] of Object.entries(snapshot.currencySettings.rates)) {
+      await db.runAsync('INSERT INTO currency_rates (currency, rate_to_base) VALUES (?, ?)', currency, rate);
+    }
+  });
 }

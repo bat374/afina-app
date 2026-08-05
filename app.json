@@ -2,7 +2,7 @@
   "expo": {
     "name": "Афина",
     "slug": "afinaapp",
-    "version": "1.1.0",
+    "version": "1.2.1",
     "icon": "./assets/icon-v2.png",
     "orientation": "portrait",
     "userInterfaceStyle": "light",
@@ -29,7 +29,8 @@
         }
       ],
       "expo-asset",
-      "expo-sqlite"
+      "expo-sqlite",
+      "expo-secure-store"
     ],
     "extra": {
       "eas": {
