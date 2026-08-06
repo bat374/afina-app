@@ -620,6 +620,31 @@ export function createDebt(input: DebtInput) {
   });
 }
 
+const DEBT_DIRECTION_LABEL: Record<DebtDirection, string> = { owed_to_me: 'Мне должны', i_owe: 'Я должна' };
+
+async function describeDebtChanges(db: SQLite.SQLiteDatabase, row: DebtRow, input: DebtInput, nextBalance: number): Promise<string> {
+  const changes: string[] = [];
+  if (row.person !== input.person) changes.push(`Кто: «${row.person}» → «${input.person}»`);
+  if (row.title !== input.title) changes.push(`Название: «${row.title}» → «${input.title}»`);
+  if (row.direction !== input.direction) changes.push(`Направление: ${DEBT_DIRECTION_LABEL[row.direction]} → ${DEBT_DIRECTION_LABEL[input.direction]}`);
+  if (row.original_amount !== input.originalAmount || row.currency !== input.currency) {
+    changes.push(`Сумма: ${row.original_amount} ${row.currency} → ${input.originalAmount} ${input.currency}`);
+  }
+  if (Math.abs(row.current_balance - nextBalance) > 0.000001) changes.push(`Остаток: ${row.current_balance} → ${nextBalance}`);
+  if ((row.account_id ?? null) !== (input.accountId ?? null)) {
+    const ids = [row.account_id, input.accountId].filter((value): value is string => !!value);
+    const names = ids.length
+      ? await db.getAllAsync<{ id: string; name: string }>(`SELECT id, name FROM accounts WHERE id IN (${ids.map(() => '?').join(',')})`, ...ids)
+      : [];
+    const nameOf = (accountId?: string | null) => accountId ? names.find((account) => account.id === accountId)?.name ?? accountId : 'без счёта';
+    changes.push(`Счёт: ${nameOf(row.account_id)} → ${nameOf(input.accountId)}`);
+  }
+  if (row.start_date !== input.startDate) changes.push(`Начало: ${row.start_date} → ${input.startDate}`);
+  if (row.due_date !== input.dueDate) changes.push(`Срок: ${row.due_date} → ${input.dueDate}`);
+  if ((row.note ?? '') !== (input.note ?? '')) changes.push('Комментарий изменён');
+  return changes.length ? `Изменены условия долга: ${changes.join('; ')}` : 'Условия сохранены без изменений';
+}
+
 export function updateDebt(id: string, input: DebtInput) {
   return enqueue(async () => {
     const db = await getDatabase();
@@ -628,6 +653,7 @@ export function updateDebt(id: string, input: DebtInput) {
     const paidPart = Math.max(0, row.original_amount - row.current_balance);
     const currentBalance = Math.max(0, input.originalAmount - paidPart);
     const nextStatus: DebtStatus = currentBalance < 0.000001 ? 'paid' : row.status === 'paid' ? 'active' : row.status;
+    const changeNote = await describeDebtChanges(db, row, input, currentBalance);
     await db.withTransactionAsync(async () => {
       await db.runAsync(
         `UPDATE debts SET person = ?, title = ?, direction = ?, original_amount = ?, current_balance = ?, status = ?,
@@ -637,7 +663,7 @@ export function updateDebt(id: string, input: DebtInput) {
       );
       await db.runAsync(
         'INSERT INTO debt_history (id, debt_id, type, occurred_at, note) VALUES (?, ?, ?, ?, ?)',
-        makeId(), id, 'edited', new Date().toISOString(), 'Изменены условия долга',
+        makeId(), id, 'edited', new Date().toISOString(), changeNote,
       );
     });
   });
@@ -667,7 +693,7 @@ const convertUsingStoredRates = async (db: SQLite.SQLiteDatabase, amount: number
   return amount * source / target;
 };
 
-export function recordDebtPayment(debtId: string, requestedAmount: number, paymentDate: string, accountId?: string | null, note?: string) {
+export function recordDebtPayment(debtId: string, requestedAmount: number, paymentDate: string, accountId?: string | null, exchangeRate?: number, note?: string) {
   return enqueue(async () => {
     const db = await getDatabase();
     const row = await db.getFirstAsync<DebtRow>('SELECT * FROM debts WHERE id = ?', debtId);
@@ -685,7 +711,9 @@ export function recordDebtPayment(debtId: string, requestedAmount: number, payme
       if (selectedAccountId) {
         const account = await db.getFirstAsync<{ currency: string }>('SELECT currency FROM accounts WHERE id = ?', selectedAccountId);
         if (!account) throw new Error('Счёт погашения не найден');
-        const accountAmount = await convertUsingStoredRates(db, amount, row.currency, account.currency);
+        const accountAmount = exchangeRate && exchangeRate > 0
+          ? amount * exchangeRate
+          : await convertUsingStoredRates(db, amount, row.currency, account.currency);
         const delta = row.direction === 'owed_to_me' ? accountAmount : -accountAmount;
         await db.runAsync('UPDATE accounts SET balance = balance + ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?', delta, selectedAccountId);
         operationId = makeId();
