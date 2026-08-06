@@ -8,6 +8,7 @@ export type CashFlowKind = 'income' | 'expense';
 export type DebtDirection = 'owed_to_me' | 'i_owe';
 export type DebtStatus = 'active' | 'overdue' | 'paid';
 export type DebtHistoryType = 'created' | 'edited' | 'payment' | 'early_payment' | 'payment_reversed' | 'extension' | 'overdue';
+export type PlannedOccurrenceStatus = 'planned' | 'completed' | 'cancelled';
 
 export type Account = {
   id: string;
@@ -71,6 +72,7 @@ export type PlannedExpense = {
   weekdays?: number[];
   exchangeRate?: number;
   sourceTransactionId?: string;
+  occurrencesTrackingFrom?: string;
 };
 
 export type Debt = {
@@ -124,6 +126,15 @@ export type FinancialOperation = {
   accountAmount?: number;
   accountCurrency?: string;
   status?: 'posted' | 'reversed';
+  sourceOccurrenceId?: string;
+};
+
+export type PlannedOccurrence = {
+  id: string;
+  flowId: string;
+  occurrenceDate: string;
+  status: PlannedOccurrenceStatus;
+  operationId?: string;
 };
 
 export type Budget = {

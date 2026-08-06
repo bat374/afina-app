@@ -1,6 +1,7 @@
 import * as SQLite from 'expo-sqlite';
-import { Account, AccountType, Budget, CashFlowKind, CurrencySettings, Debt, DebtDirection, DebtHistory, DebtHistoryType, DebtStatus, ExpenseRepeat, FinancialGoal, FinancialOperation, GoalType, InterestDestination, InterestSchedule, PlannedExpense, RecurrenceUnit, WithdrawalPolicy } from './types';
+import { Account, AccountType, Budget, CashFlowKind, CurrencySettings, Debt, DebtDirection, DebtHistory, DebtHistoryType, DebtStatus, ExpenseRepeat, FinancialGoal, FinancialOperation, GoalType, InterestDestination, InterestSchedule, PlannedExpense, PlannedOccurrence, PlannedOccurrenceStatus, RecurrenceUnit, WithdrawalPolicy } from './types';
 import { addLocalDays, daysBetween, localToday, nextBusinessMonday, nextMonthlyDate, parseLocalDate, previousMonthlyDate, toLocalIso } from './date';
+import { occursOn } from './recurrence';
 
 type AccountRow = {
   id: string;
@@ -49,6 +50,7 @@ type PlannedExpenseRow = {
   weekdays: string | null;
   exchange_rate: number | null;
   source_transaction_id: string | null;
+  occurrences_tracking_from: string | null;
 };
 
 type DebtRow = {
@@ -63,6 +65,10 @@ type DebtHistoryRow = {
   related_history_id: string | null;
 };
 
+type PlannedOccurrenceRow = {
+  id: string; flow_id: string; occurrence_date: string; status: PlannedOccurrenceStatus; operation_id: string | null;
+};
+
 export type DebtInput = Omit<Debt, 'id' | 'currentBalance' | 'status'>;
 export type FinancialOperationInput = Omit<FinancialOperation, 'id' | 'source'>;
 export type BudgetInput = Omit<Budget, 'id'>;
@@ -73,6 +79,7 @@ export type LocalSnapshot = {
   exportedAt: string;
   accounts: Account[];
   scheduledFlows: PlannedExpense[];
+  plannedOccurrences: PlannedOccurrence[];
   debts: Debt[];
   debtHistory: DebtHistory[];
   operations: FinancialOperation[];
@@ -253,6 +260,15 @@ async function initializeDatabaseCore() {
       UNIQUE(account_id, payout_date),
       FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE
     );
+    CREATE TABLE IF NOT EXISTS planned_occurrences (
+      id TEXT PRIMARY KEY NOT NULL,
+      flow_id TEXT NOT NULL,
+      occurrence_date TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'planned' CHECK(status IN ('planned', 'completed', 'cancelled')),
+      operation_id TEXT,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE(flow_id, occurrence_date)
+    );
     INSERT OR IGNORE INTO scheduled_flows
       (id, title, category, amount, currency, account_id, start_date, end_date, repeat_rule, kind,
        repeat_interval, repeat_unit, source_transaction_id, created_at, updated_at)
@@ -374,7 +390,7 @@ async function initializeDatabaseCore() {
   const operationColumns = await db.getAllAsync<{ name: string }>('PRAGMA table_info(operations)');
   const operationExtras = [
     ['debt_id', 'TEXT'], ['related_operation_id', 'TEXT'], ['account_amount', 'REAL'],
-    ['account_currency', 'TEXT'], ["status", "TEXT NOT NULL DEFAULT 'posted'"],
+    ['account_currency', 'TEXT'], ["status", "TEXT NOT NULL DEFAULT 'posted'"], ['source_occurrence_id', 'TEXT'],
   ] as const;
   for (const [name, sqlType] of operationExtras) {
     if (!operationColumns.some((column) => column.name === name)) await db.execAsync(`ALTER TABLE operations ADD COLUMN ${name} ${sqlType};`);
@@ -397,7 +413,13 @@ async function initializeDatabaseCore() {
       COMMIT;
     `);
   }
-  await db.execAsync('PRAGMA user_version = 5;');
+  const flowColumns = await db.getAllAsync<{ name: string }>('PRAGMA table_info(scheduled_flows)');
+  if (!flowColumns.some((column) => column.name === 'occurrences_tracking_from')) {
+    await db.execAsync('ALTER TABLE scheduled_flows ADD COLUMN occurrences_tracking_from TEXT;');
+    // One day before start_date, so the sync loop (which starts at trackingFrom + 1 day) evaluates start_date itself.
+    await db.execAsync("UPDATE scheduled_flows SET occurrences_tracking_from = date(start_date, '-1 day') WHERE occurrences_tracking_from IS NULL;");
+  }
+  await db.execAsync('PRAGMA user_version = 6;');
 }
 
 export function initializeDatabase() {
@@ -517,6 +539,7 @@ async function listPlannedExpensesCore(): Promise<PlannedExpense[]> {
     weekdays: row.weekdays ? row.weekdays.split(',').map(Number).filter((value) => value >= 1 && value <= 7) : undefined,
     exchangeRate: row.exchange_rate ?? undefined,
     sourceTransactionId: row.source_transaction_id ?? undefined,
+    occurrencesTrackingFrom: row.occurrences_tracking_from ?? undefined,
   }));
 }
 
@@ -541,12 +564,12 @@ export function savePlannedExpense(input: PlannedExpenseInput, id?: string) {
     } else {
       await db.runAsync(
         `INSERT INTO scheduled_flows (id, title, category, amount, currency, account_id, start_date, end_date,
-       repeat_rule, kind, repeat_interval, repeat_unit, weekdays, exchange_rate, source_transaction_id)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       repeat_rule, kind, repeat_interval, repeat_unit, weekdays, exchange_rate, source_transaction_id, occurrences_tracking_from)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         expenseId, input.title, input.category, input.amount, input.currency, input.accountId ?? null,
         input.startDate, input.endDate ?? null, input.repeat, input.kind, input.repeatInterval ?? 1,
         input.repeatUnit ?? null, input.weekdays?.join(',') ?? null, input.exchangeRate ?? null,
-        input.sourceTransactionId ?? null,
+        input.sourceTransactionId ?? null, addLocalDays(input.startDate, -1),
       );
     }
     return expenseId;
@@ -556,6 +579,7 @@ export function savePlannedExpense(input: PlannedExpenseInput, id?: string) {
 export function deletePlannedExpense(id: string) {
   return enqueue(async () => {
     const db = await getDatabase();
+    await db.runAsync('DELETE FROM planned_occurrences WHERE flow_id = ?', id);
     await db.runAsync('DELETE FROM scheduled_flows WHERE id = ?', id);
   });
 }
@@ -850,14 +874,14 @@ async function listOperationsCore(): Promise<FinancialOperation[]> {
     id: string; title: string; category: string; amount: number; currency: string;
     account_id: string; date: string; kind: 'income' | 'expense'; source: FinancialOperation['source'];
     debt_id: string | null; related_operation_id: string | null; account_amount: number | null;
-    account_currency: string | null; status: 'posted' | 'reversed' | null;
+    account_currency: string | null; status: 'posted' | 'reversed' | null; source_occurrence_id: string | null;
   }>('SELECT * FROM operations ORDER BY date DESC, created_at DESC');
   return rows.map((row) => ({
     id: row.id, title: row.title, category: row.category, amount: row.amount, currency: row.currency,
     accountId: row.account_id, date: row.date, kind: row.kind, source: row.source,
     debtId: row.debt_id ?? undefined, relatedOperationId: row.related_operation_id ?? undefined,
     accountAmount: row.account_amount ?? undefined, accountCurrency: row.account_currency ?? undefined,
-    status: row.status ?? 'posted',
+    status: row.status ?? 'posted', sourceOccurrenceId: row.source_occurrence_id ?? undefined,
   }));
 }
 
@@ -953,6 +977,88 @@ export function synchronizeInterestPostings(today = localToday()) {
   });
 }
 
+// Materializes dated instances of recurring plans into planned_occurrences, backfilling only up to
+// `today` (never the future) — mirrors synchronizeInterestPostings's cursor pattern so that a status
+// (planned/completed/cancelled) and a link to the resulting operation can survive rule edits/deletion.
+async function synchronizePlannedOccurrencesCore(today = localToday()) {
+  const db = await getDatabase();
+  const cursors = await db.getAllAsync<{ id: string; occurrences_tracking_from: string | null; end_date: string | null }>(
+    'SELECT id, occurrences_tracking_from, end_date FROM scheduled_flows WHERE occurrences_tracking_from IS NOT NULL',
+  );
+  if (!cursors.length) return;
+  const flows = await listPlannedExpensesCore();
+  const flowById = new Map(flows.map((flow) => [flow.id, flow]));
+  await db.withTransactionAsync(async () => {
+    for (const cursor of cursors) {
+      const flow = flowById.get(cursor.id);
+      const trackingFrom = cursor.occurrences_tracking_from;
+      if (!flow || !trackingFrom) continue;
+      const finalDate = cursor.end_date && cursor.end_date < today ? cursor.end_date : today;
+      if (finalDate <= trackingFrom) continue;
+      for (let date = addLocalDays(trackingFrom, 1); date <= finalDate; date = addLocalDays(date, 1)) {
+        const current = parseLocalDate(date);
+        if (current && occursOn(flow, current)) {
+          await db.runAsync(
+            "INSERT OR IGNORE INTO planned_occurrences (id, flow_id, occurrence_date, status) VALUES (?, ?, ?, 'planned')",
+            makeId(), flow.id, date,
+          );
+        }
+      }
+      await db.runAsync('UPDATE scheduled_flows SET occurrences_tracking_from = ? WHERE id = ?', finalDate, cursor.id);
+    }
+  });
+}
+
+export function synchronizePlannedOccurrences(today = localToday()) {
+  return enqueue(() => synchronizePlannedOccurrencesCore(today));
+}
+
+async function listPlannedOccurrencesCore(): Promise<PlannedOccurrence[]> {
+  const db = await getDatabase();
+  const rows = await db.getAllAsync<PlannedOccurrenceRow>('SELECT * FROM planned_occurrences ORDER BY occurrence_date DESC');
+  return rows.map((row) => ({
+    id: row.id, flowId: row.flow_id, occurrenceDate: row.occurrence_date, status: row.status,
+    operationId: row.operation_id ?? undefined,
+  }));
+}
+
+export function listPlannedOccurrences(): Promise<PlannedOccurrence[]> {
+  return enqueue(listPlannedOccurrencesCore);
+}
+
+export type PlannedExecutionInput = Omit<FinancialOperationInput, 'accountId'> & { accountId?: string };
+
+export function executePlannedOccurrence(occurrenceId: string, input: PlannedExecutionInput) {
+  return enqueue(async () => {
+    const db = await getDatabase();
+    const occurrence = await db.getFirstAsync<PlannedOccurrenceRow>('SELECT * FROM planned_occurrences WHERE id = ?', occurrenceId);
+    if (!occurrence) throw new Error('Плановое событие не найдено');
+    if (occurrence.status !== 'planned') throw new Error('Событие уже проведено или отменено');
+    let operationId: string | undefined;
+    await db.withTransactionAsync(async () => {
+      if (input.accountId) {
+        operationId = makeId();
+        const delta = input.kind === 'income' ? input.amount : -input.amount;
+        await db.runAsync(
+          `INSERT INTO operations (id, title, category, amount, currency, account_id, date, kind, source, source_occurrence_id)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'manual', ?)`,
+          operationId, input.title, input.category, input.amount, input.currency, input.accountId, input.date, input.kind, occurrenceId,
+        );
+        await db.runAsync('UPDATE accounts SET balance = balance + ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?', delta, input.accountId);
+      }
+      await db.runAsync("UPDATE planned_occurrences SET status = 'completed', operation_id = ? WHERE id = ?", operationId ?? null, occurrenceId);
+    });
+    return operationId;
+  });
+}
+
+export function cancelPlannedOccurrence(occurrenceId: string) {
+  return enqueue(async () => {
+    const db = await getDatabase();
+    await db.runAsync("UPDATE planned_occurrences SET status = 'cancelled' WHERE id = ? AND status = 'planned'", occurrenceId);
+  });
+}
+
 export function createOperation(input: FinancialOperationInput) {
   return enqueue(async () => {
     const db = await getDatabase();
@@ -1045,6 +1151,7 @@ export function exportLocalSnapshot(): Promise<LocalSnapshot> {
     // and running them concurrently is exactly the race that corrupts native statements.
     const accounts = await listAccountsCore();
     const scheduledFlows = await listPlannedExpensesCore();
+    const plannedOccurrences = await listPlannedOccurrencesCore();
     const debts = await listDebtsCore();
     const operations = await listOperationsCore();
     const budgets = await listBudgetsCore();
@@ -1057,6 +1164,7 @@ export function exportLocalSnapshot(): Promise<LocalSnapshot> {
       exportedAt: new Date().toISOString(),
       accounts,
       scheduledFlows,
+      plannedOccurrences,
       debts,
       debtHistory,
       operations,
@@ -1089,6 +1197,7 @@ export function replaceLocalSnapshot(snapshot: LocalSnapshot) {
       await db.execAsync(`
       DELETE FROM debt_history;
       DELETE FROM interest_postings;
+      DELETE FROM planned_occurrences;
       DELETE FROM operations;
       DELETE FROM scheduled_flows;
       DELETE FROM planned_expenses;
@@ -1121,12 +1230,13 @@ export function replaceLocalSnapshot(snapshot: LocalSnapshot) {
       for (const flow of snapshot.scheduledFlows) {
         await db.runAsync(
           `INSERT INTO scheduled_flows (id, title, category, amount, currency, account_id, start_date,
-          end_date, repeat_rule, kind, repeat_interval, repeat_unit, weekdays, exchange_rate, source_transaction_id)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          end_date, repeat_rule, kind, repeat_interval, repeat_unit, weekdays, exchange_rate, source_transaction_id, occurrences_tracking_from)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           flow.id, flow.title, flow.category, flow.amount, flow.currency, flow.accountId ?? null,
           flow.startDate, flow.endDate ?? null, flow.repeat, flow.kind, flow.repeatInterval ?? 1,
           flow.repeatUnit ?? null, flow.weekdays ? JSON.stringify(flow.weekdays) : null,
           flow.exchangeRate ?? null, flow.sourceTransactionId ?? null,
+          flow.occurrencesTrackingFrom ?? addLocalDays(flow.startDate, -1),
         );
       }
       for (const debt of snapshot.debts) {
@@ -1140,12 +1250,18 @@ export function replaceLocalSnapshot(snapshot: LocalSnapshot) {
       for (const operation of snapshot.operations) {
         await db.runAsync(
           `INSERT INTO operations (id, title, category, amount, currency, account_id, date, kind, source,
-          debt_id, related_operation_id, account_amount, account_currency, status)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          debt_id, related_operation_id, account_amount, account_currency, status, source_occurrence_id)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           operation.id, operation.title, operation.category, operation.amount, operation.currency,
           operation.accountId, operation.date, operation.kind, operation.source, operation.debtId ?? null,
           operation.relatedOperationId ?? null, operation.accountAmount ?? null,
-          operation.accountCurrency ?? null, operation.status ?? 'posted',
+          operation.accountCurrency ?? null, operation.status ?? 'posted', operation.sourceOccurrenceId ?? null,
+        );
+      }
+      for (const occurrence of snapshot.plannedOccurrences) {
+        await db.runAsync(
+          'INSERT INTO planned_occurrences (id, flow_id, occurrence_date, status, operation_id) VALUES (?, ?, ?, ?, ?)',
+          occurrence.id, occurrence.flowId, occurrence.occurrenceDate, occurrence.status, occurrence.operationId ?? null,
         );
       }
       for (const event of snapshot.debtHistory) {

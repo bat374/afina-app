@@ -9,8 +9,8 @@ import { Ionicons } from '@expo/vector-icons';
 import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
 import { budgets, calendarDays, goals, transactions } from './src/data';
 import { money, percent } from './src/format';
-import { Account, AccountType, Budget, CashFlowKind, CurrencySettings, Debt, DebtDirection, DebtHistory, ExpenseRepeat, FinancialGoal, FinancialOperation, GoalType, InterestSchedule, PlannedExpense, RecurrenceUnit, WithdrawalPolicy } from './src/types';
-import { AccountInput, BudgetInput, createDebt, createOperation, DebtInput, deleteAccount, deleteBudget, deleteFinancialGoal, deletePlannedExpense, extendDebt, FinancialGoalInput, FinancialOperationInput, getCurrencySettings, initializeDatabase, listAccounts, listBudgets, listDebtHistory, listDebts, listFinancialGoals, listOperations, listPlannedExpenses, markDebtOverdue, PlannedExpenseInput, recordDebtPayment, reverseDebtPayment, saveAccount, saveBudget, saveCurrencySettings, saveFinancialGoal, savePlannedExpense, synchronizeInterestPostings, updateDebt } from './src/database';
+import { Account, AccountType, Budget, CashFlowKind, CurrencySettings, Debt, DebtDirection, DebtHistory, ExpenseRepeat, FinancialGoal, FinancialOperation, GoalType, InterestSchedule, PlannedExpense, PlannedOccurrence, RecurrenceUnit, WithdrawalPolicy } from './src/types';
+import { AccountInput, BudgetInput, cancelPlannedOccurrence, createDebt, createOperation, DebtInput, deleteAccount, deleteBudget, deleteFinancialGoal, deletePlannedExpense, executePlannedOccurrence, extendDebt, FinancialGoalInput, FinancialOperationInput, getCurrencySettings, initializeDatabase, listAccounts, listBudgets, listDebtHistory, listDebts, listFinancialGoals, listOperations, listPlannedExpenses, listPlannedOccurrences, markDebtOverdue, PlannedExecutionInput, PlannedExpenseInput, recordDebtPayment, reverseDebtPayment, saveAccount, saveBudget, saveCurrencySettings, saveFinancialGoal, savePlannedExpense, synchronizeInterestPostings, synchronizePlannedOccurrences, updateDebt } from './src/database';
 import { DetectedAccount, recognizeAccountScreenshot } from './src/ocr';
 import { annualPassiveIncome, buildMonthProjection, getCurrencyTotals } from './src/finance';
 import { consolidatedNetWorth, convertToBase, fetchOfficialCurrencyRates, rebaseRates, weightedAssetRates } from './src/currency';
@@ -275,17 +275,91 @@ function Calendar({ accounts, plannedExpenses, debts, currencySettings, onAddExp
   </ScrollView>;
 }
 
-function Operations({ operations, accounts, onAdd }: { operations: FinancialOperation[]; accounts: Account[]; onAdd: () => void }) {
+const HISTORY_SOURCE_LABEL: Record<string, string> = { manual: 'Вручную', debt: 'Долг', interest: 'Проценты', sms: 'SMS', receipt: 'Чек', plan: 'План' };
+const HISTORY_STATUS_LABEL: Record<string, string> = { posted: 'Выполнено', reversed: 'Возвращено', planned: 'Запланировано', overdue: 'Просрочено', completed: 'Выполнено', cancelled: 'Отменено' };
+
+type HistoryRow = {
+  date: string; type: 'actual' | 'planned'; kind: CashFlowKind; currency: string; category: string;
+  accountId?: string; source: string; status: string;
+  operation?: FinancialOperation; occurrence?: PlannedOccurrence; flow?: PlannedExpense;
+};
+
+function Operations({ operations, plannedOccurrences, plannedExpenses, debts, accounts, onAdd, onOpenOccurrence, onOpenDebt, onOpenPlan }: {
+  operations: FinancialOperation[]; plannedOccurrences: PlannedOccurrence[]; plannedExpenses: PlannedExpense[]; debts: Debt[]; accounts: Account[];
+  onAdd: () => void; onOpenOccurrence: (occurrence: PlannedOccurrence, flow: PlannedExpense) => void;
+  onOpenDebt: (debt: Debt) => void; onOpenPlan: (flow: PlannedExpense) => void;
+}) {
   const [currency, setCurrency] = useState('ALL'); const [accountId, setAccountId] = useState('ALL'); const [category, setCategory] = useState('ALL');
+  const [type, setType] = useState<'ALL' | 'actual' | 'planned'>('ALL'); const [kind, setKind] = useState<'ALL' | CashFlowKind>('ALL');
+  const [source, setSource] = useState('ALL'); const [status, setStatus] = useState('ALL');
   const [fromDate, setFromDate] = useState(''); const [toDate, setToDate] = useState(''); const [dateTarget, setDateTarget] = useState<'from' | 'to' | null>(null);
-  const currencies = Array.from(new Set(operations.map((item) => item.currency))).sort(); const categories = Array.from(new Set(operations.map((item) => item.category))).sort();
-  const filtered = operations.filter((item) => (currency === 'ALL' || item.currency === currency) && (accountId === 'ALL' || item.accountId === accountId) && (category === 'ALL' || item.category === category) && (!fromDate || item.date >= fromDate) && (!toDate || item.date <= toDate));
-  return <ScrollView contentContainerStyle={s.page} showsVerticalScrollIndicator={false}><Header eyebrow="ДВИЖЕНИЕ ДЕНЕГ" title="Операции" /><Pressable style={s.planExpenseButton} onPress={onAdd}><Ionicons name="add-circle-outline" size={20} color="white" /><Text style={s.importAccountText}>Добавить операцию</Text></Pressable>
+  const today = localToday();
+  const flowById = new Map(plannedExpenses.map((flow) => [flow.id, flow]));
+  const executedOperationIds = new Set(operations.map((operation) => operation.id));
+  const visibleOccurrences = plannedOccurrences.filter((occurrence) => !(occurrence.status === 'completed' && occurrence.operationId && executedOperationIds.has(occurrence.operationId)));
+  const rows: HistoryRow[] = [
+    ...operations.map((operation): HistoryRow => ({
+      date: operation.date, type: 'actual', kind: operation.kind, currency: operation.currency, category: operation.category,
+      accountId: operation.accountId, source: operation.source, status: operation.status ?? 'posted', operation,
+    })),
+    ...visibleOccurrences.flatMap((occurrence): HistoryRow[] => {
+      const flow = flowById.get(occurrence.flowId);
+      if (!flow) return [];
+      const rowStatus = occurrence.status === 'planned' && occurrence.occurrenceDate < today ? 'overdue' : occurrence.status;
+      return [{ date: occurrence.occurrenceDate, type: 'planned', kind: flow.kind, currency: flow.currency, category: flow.category, accountId: flow.accountId, source: 'plan', status: rowStatus, occurrence, flow }];
+    }),
+  ].sort((a, b) => b.date.localeCompare(a.date));
+  const currencies = Array.from(new Set(rows.map((row) => row.currency))).sort();
+  const categories = Array.from(new Set(rows.map((row) => row.category))).sort();
+  const sources = Array.from(new Set(rows.map((row) => row.source)));
+  const statuses = Array.from(new Set(rows.map((row) => row.status)));
+  const filtered = rows.filter((row) =>
+    (currency === 'ALL' || row.currency === currency) && (accountId === 'ALL' || row.accountId === accountId) &&
+    (category === 'ALL' || row.category === category) && (type === 'ALL' || row.type === type) &&
+    (kind === 'ALL' || row.kind === kind) && (source === 'ALL' || row.source === source) && (status === 'ALL' || row.status === status) &&
+    (!fromDate || row.date >= fromDate) && (!toDate || row.date <= toDate));
+  const handlePress = (row: HistoryRow) => {
+    if (row.type === 'planned' && row.occurrence && row.flow) { onOpenOccurrence(row.occurrence, row.flow); return; }
+    if (row.operation?.debtId) { const debt = debts.find((item) => item.id === row.operation!.debtId); if (debt) onOpenDebt(debt); return; }
+    if (row.operation?.sourceOccurrenceId) {
+      const occurrence = plannedOccurrences.find((item) => item.id === row.operation!.sourceOccurrenceId);
+      const flow = occurrence && flowById.get(occurrence.flowId);
+      if (flow) onOpenPlan(flow);
+    }
+  };
+  return <ScrollView contentContainerStyle={s.page} showsVerticalScrollIndicator={false}><Header eyebrow="ИСТОРИЯ" title="Операции" /><Pressable style={s.planExpenseButton} onPress={onAdd}><Ionicons name="add-circle-outline" size={20} color="white" /><Text style={s.importAccountText}>Добавить операцию</Text></Pressable>
+    <Text style={s.fieldLabel}>ТИП</Text><ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={s.currencyRail}>{(['ALL', 'actual', 'planned'] as const).map((item) => <Pressable key={item} style={[s.currencyFilter, type === item && s.currencyFilterActive]} onPress={() => setType(item)}><Text style={[s.currencyFilterText, type === item && s.currencyFilterTextActive]}>{item === 'ALL' ? 'Все' : item === 'actual' ? 'Факт' : 'План'}</Text></Pressable>)}</ScrollView>
+    <Text style={s.fieldLabel}>НАПРАВЛЕНИЕ</Text><ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={s.currencyRail}>{(['ALL', 'income', 'expense'] as const).map((item) => <Pressable key={item} style={[s.currencyFilter, kind === item && s.currencyFilterActive]} onPress={() => setKind(item)}><Text style={[s.currencyFilterText, kind === item && s.currencyFilterTextActive]}>{item === 'ALL' ? 'Все' : item === 'income' ? 'Доход' : 'Расход'}</Text></Pressable>)}</ScrollView>
     <Text style={s.fieldLabel}>ВАЛЮТА</Text><ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={s.currencyRail}>{['ALL', ...currencies].map((item) => <Pressable key={item} style={[s.currencyFilter, currency === item && s.currencyFilterActive]} onPress={() => setCurrency(item)}><Text style={[s.currencyFilterText, currency === item && s.currencyFilterTextActive]}>{item === 'ALL' ? 'Все' : item}</Text></Pressable>)}</ScrollView>
     <Text style={s.fieldLabel}>СЧЁТ</Text><ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={s.currencyRail}>{['ALL', ...accounts.map((item) => item.id)].map((id) => { const account = accounts.find((item) => item.id === id); return <Pressable key={id} style={[s.currencyFilter, accountId === id && s.currencyFilterActive]} onPress={() => setAccountId(id)}><Text style={[s.currencyFilterText, accountId === id && s.currencyFilterTextActive]}>{id === 'ALL' ? 'Все' : account?.name}</Text></Pressable>; })}</ScrollView>
     <Text style={s.fieldLabel}>КАТЕГОРИЯ</Text><ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={s.currencyRail}>{['ALL', ...categories].map((item) => <Pressable key={item} style={[s.currencyFilter, category === item && s.currencyFilterActive]} onPress={() => setCategory(item)}><Text style={[s.currencyFilterText, category === item && s.currencyFilterTextActive]}>{item === 'ALL' ? 'Все' : item}</Text></Pressable>)}</ScrollView>
+    <Text style={s.fieldLabel}>ИСТОЧНИК</Text><ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={s.currencyRail}>{['ALL', ...sources].map((item) => <Pressable key={item} style={[s.currencyFilter, source === item && s.currencyFilterActive]} onPress={() => setSource(item)}><Text style={[s.currencyFilterText, source === item && s.currencyFilterTextActive]}>{item === 'ALL' ? 'Все' : HISTORY_SOURCE_LABEL[item] ?? item}</Text></Pressable>)}</ScrollView>
+    <Text style={s.fieldLabel}>СТАТУС</Text><ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={s.currencyRail}>{['ALL', ...statuses].map((item) => <Pressable key={item} style={[s.currencyFilter, status === item && s.currencyFilterActive]} onPress={() => setStatus(item)}><Text style={[s.currencyFilterText, status === item && s.currencyFilterTextActive]}>{item === 'ALL' ? 'Все' : HISTORY_STATUS_LABEL[item] ?? item}</Text></Pressable>)}</ScrollView>
     <Text style={s.fieldLabel}>ПЕРИОД</Text><View style={s.twoColumns}><View style={{ flex: 1 }}><DateField value={fromDate} onPress={() => setDateTarget('from')} placeholder="С даты" /></View><View style={{ flex: 1 }}><DateField value={toDate} onPress={() => setDateTarget('to')} placeholder="По дату" /></View></View>{(fromDate || toDate) && <Pressable onPress={() => { setFromDate(''); setToDate(''); }}><Text style={s.link}>Сбросить период</Text></Pressable>}
-    <SectionTitle title={`Найдено: ${filtered.length}`} />{filtered.length ? <View style={s.card}>{filtered.map((operation, index) => { const account = accounts.find((item) => item.id === operation.accountId); const cancelled = operation.status === 'reversed'; return <View key={operation.id}><View style={[s.eventRow, cancelled && { opacity: .55 }]}><View style={[s.roundIcon, { backgroundColor: operation.kind === 'income' ? C.sageSoft : C.redSoft }]}><Ionicons name={operation.relatedOperationId ? 'return-down-back-outline' : operation.kind === 'income' ? 'arrow-down-outline' : 'arrow-up-outline'} size={19} color={operation.kind === 'income' ? C.green : C.red} /></View><View style={{ flex: 1 }}><Text style={[s.rowTitle, cancelled && { textDecorationLine: 'line-through' }]}>{operation.title}</Text><Text style={s.rowSub}>{operation.date} · {operation.category} · {account?.name ?? 'Счёт удалён'}{cancelled ? ' · отменено' : operation.relatedOperationId ? ' · обратная проводка' : ''}</Text></View><Text style={operation.kind === 'income' ? s.income : s.expense}>{operation.kind === 'income' ? '+' : '−'}{money(operation.amount, false, operation.currency)}</Text></View>{index < filtered.length - 1 && <View style={s.divider} />}</View>; })}</View> : <View style={s.emptyCard}><Ionicons name="receipt-outline" size={24} color={C.blue} /><Text style={s.emptyTitle}>Операции не найдены</Text><Text style={s.emptyText}>Измените фильтры или добавьте новую операцию</Text></View>}
+    <SectionTitle title={`Найдено: ${filtered.length}`} />{filtered.length ? <View style={s.card}>{filtered.map((row, index) => {
+      const account = accounts.find((item) => item.id === row.accountId);
+      const key = row.operation?.id ?? row.occurrence!.id;
+      const muted = row.status === 'reversed' || row.status === 'cancelled' || row.status === 'planned' || row.status === 'overdue';
+      const title = row.operation?.title ?? row.flow!.title;
+      const amount = row.operation?.amount ?? row.flow!.amount;
+      const icon = row.type === 'planned'
+        ? (row.status === 'cancelled' ? 'close-circle-outline' : row.status === 'overdue' ? 'alert-circle-outline' : 'time-outline')
+        : (row.operation?.relatedOperationId ? 'return-down-back-outline' : row.kind === 'income' ? 'arrow-down-outline' : 'arrow-up-outline');
+      const iconColor = row.type === 'planned' && row.status === 'overdue' ? C.red : row.kind === 'income' ? C.green : C.red;
+      const iconBg = row.type === 'planned' && row.status === 'overdue' ? C.redSoft : row.kind === 'income' ? C.sageSoft : C.redSoft;
+      const statusSuffix = row.type === 'actual'
+        ? (row.status === 'reversed' ? ' · отменено' : row.operation?.relatedOperationId ? ' · обратная проводка' : row.operation?.sourceOccurrenceId ? ' · по плану' : '')
+        : ` · ${HISTORY_STATUS_LABEL[row.status] ?? row.status}`.toLowerCase();
+      return <Pressable key={key} onPress={() => handlePress(row)}>
+        <View style={[s.eventRow, muted && { opacity: .55 }]}>
+          <View style={[s.roundIcon, { backgroundColor: iconBg }]}><Ionicons name={icon} size={19} color={iconColor} /></View>
+          <View style={{ flex: 1 }}><Text style={[s.rowTitle, row.status === 'reversed' && { textDecorationLine: 'line-through' }]}>{title}</Text>
+            <Text style={s.rowSub}>{row.date} · {row.category} · {account?.name ?? (row.accountId ? 'Счёт удалён' : 'Без счёта')}{statusSuffix}</Text></View>
+          <Text style={row.kind === 'income' ? s.income : s.expense}>{row.kind === 'income' ? '+' : '−'}{money(amount, false, row.currency)}</Text>
+        </View>
+        {index < filtered.length - 1 && <View style={s.divider} />}
+      </Pressable>;
+    })}</View> : <View style={s.emptyCard}><Ionicons name="receipt-outline" size={24} color={C.blue} /><Text style={s.emptyTitle}>Ничего не найдено</Text><Text style={s.emptyText}>Измените фильтры или добавьте новую операцию</Text></View>}
     <DatePickerModal visible={dateTarget !== null} value={dateTarget === 'to' ? toDate : fromDate} onClose={() => setDateTarget(null)} onSelect={(value) => dateTarget === 'to' ? setToDate(value) : setFromDate(value)} />
   </ScrollView>;
 }
@@ -795,6 +869,40 @@ function PlannedExpenseEditor({ visible, expense, initialDate, accounts, currenc
   </SafeAreaView></Modal>;
 }
 
+function ExecuteOccurrenceModal({ visible, occurrence, flow, accounts, onClose, onExecute }: {
+  visible: boolean; occurrence: PlannedOccurrence | null; flow: PlannedExpense | null; accounts: Account[];
+  onClose: () => void; onExecute: (input: PlannedExecutionInput) => Promise<void>;
+}) {
+  const [title, setTitle] = useState(''); const [category, setCategory] = useState('');
+  const [amount, setAmount] = useState<number | undefined>(); const [date, setDate] = useState(localToday());
+  const [accountId, setAccountId] = useState<string | undefined>(); const [saving, setSaving] = useState(false);
+  const [dateTarget, setDateTarget] = useState(false);
+  useEffect(() => {
+    if (!visible || !flow || !occurrence) return;
+    setTitle(flow.title); setCategory(flow.category); setAmount(flow.amount);
+    setDate(occurrence.occurrenceDate); setAccountId(flow.accountId); setSaving(false);
+  }, [visible, flow, occurrence]);
+  if (!flow || !occurrence) return null;
+  const submit = async () => {
+    if (!title.trim() || !amount || amount <= 0) { Alert.alert('Укажите название и сумму'); return; }
+    setSaving(true);
+    try { await onExecute({ title: title.trim(), category: category.trim() || 'Другое', amount, currency: flow.currency, accountId, date, kind: flow.kind }); }
+    finally { setSaving(false); }
+  };
+  return <Modal visible={visible} animationType="slide" presentationStyle="pageSheet" onRequestClose={onClose}><SafeAreaView style={s.modal} edges={['top', 'bottom']}>
+    <View style={s.modalHead}><Pressable onPress={onClose} style={s.close}><Ionicons name="close" size={22} color={C.ink} /></Pressable><Text style={s.modalTitle}>Провести плановое событие</Text><View style={{ width: 40 }} /></View>
+    <KeyboardAvoidingView style={{ flex: 1 }} behavior={Platform.OS === 'ios' ? 'padding' : 'height'}><ScrollView contentContainerStyle={s.formBody} keyboardShouldPersistTaps="handled" keyboardDismissMode="on-drag" automaticallyAdjustKeyboardInsets>
+      <Text style={s.fieldLabel}>НАЗВАНИЕ</Text><TextInput value={title} onChangeText={setTitle} style={s.input} />
+      <Text style={s.fieldLabel}>КАТЕГОРИЯ</Text><TextInput value={category} onChangeText={setCategory} style={s.input} />
+      <Text style={s.fieldLabel}>СУММА · {flow.currency}</Text><DecimalInput value={amount} onChange={setAmount} placeholder="0,00" />
+      <Text style={s.fieldLabel}>ДАТА</Text><DateField value={date} onPress={() => setDateTarget(true)} />
+      <Text style={s.fieldLabel}>{flow.kind === 'income' ? 'СЧЁТ ЗАЧИСЛЕНИЯ' : 'СЧЁТ СПИСАНИЯ'}</Text>
+      <View style={s.targetList}>{accounts.map((item) => <Pressable key={item.id} style={[s.targetAccount, accountId === item.id && s.targetAccountActive]} onPress={() => setAccountId(item.id)}><Text style={s.targetAccountText}>{item.name} · {item.currency}</Text><Text style={s.rowSub}>{money(item.balance, false, item.currency)}</Text></Pressable>)}<Pressable style={[s.targetAccount, !accountId && s.targetAccountActive]} onPress={() => setAccountId(undefined)}><Text style={s.targetAccountText}>Без движения по счёту</Text></Pressable></View>
+      <Pressable style={[s.primaryButton, saving && { opacity: .6 }]} disabled={saving} onPress={submit}><Text style={s.primaryText}>{saving ? 'Проводим…' : 'Провести'}</Text></Pressable>
+    </ScrollView></KeyboardAvoidingView><DatePickerModal visible={dateTarget} value={date} onClose={() => setDateTarget(false)} onSelect={(value) => { setDate(value); setDateTarget(false); }} />
+  </SafeAreaView></Modal>;
+}
+
 function LegacyImportModal({ visible, onClose }: { visible: boolean; onClose: () => void }) {
   const [imageUri, setImageUri] = useState<string | null>(null);
   const [confirmed, setConfirmed] = useState(false);
@@ -943,6 +1051,7 @@ function AppContent({ userId }: { userId: string }) {
   const [operations, setOperations] = useState<FinancialOperation[]>([]);
   const [userBudgets, setUserBudgets] = useState<Budget[]>([]);
   const [financialGoals, setFinancialGoals] = useState<FinancialGoal[]>([]);
+  const [plannedOccurrences, setPlannedOccurrences] = useState<PlannedOccurrence[]>([]);
   const [currencySettings, setCurrencySettings] = useState<CurrencySettings>({ baseCurrency: 'UZS', rates: { UZS: 1 }, autoUpdate: true });
   const [databaseReady, setDatabaseReady] = useState(false);
 
@@ -956,6 +1065,7 @@ function AppContent({ userId }: { userId: string }) {
   const reloadOperations = async () => setOperations(await listOperations());
   const reloadBudgets = async () => setUserBudgets(await listBudgets());
   const reloadGoals = async () => setFinancialGoals(await listFinancialGoals());
+  const reloadPlannedOccurrences = async () => setPlannedOccurrences(await listPlannedOccurrences());
 
   useEffect(() => {
     initializeDatabase().then(async () => {
@@ -968,7 +1078,8 @@ function AppContent({ userId }: { userId: string }) {
         );
       }
       await synchronizeInterestPostings();
-      await Promise.all([reloadAccounts(), reloadExpenses(), reloadDebts(), reloadOperations(), reloadBudgets(), reloadGoals()]);
+      await synchronizePlannedOccurrences();
+      await Promise.all([reloadAccounts(), reloadExpenses(), reloadDebts(), reloadOperations(), reloadBudgets(), reloadGoals(), reloadPlannedOccurrences()]);
       const stored = await getCurrencySettings(); setCurrencySettings(stored);
       const today = localToday();
       if (stored.autoUpdate !== false && stored.lastUpdated?.slice(0, 10) !== today) {
@@ -986,7 +1097,7 @@ function AppContent({ userId }: { userId: string }) {
       uploadLocalDataToCloud(userId).catch(() => { /* Offline changes remain queued in SQLite. */ });
     }, 1200);
     return () => clearTimeout(timer);
-  }, [databaseReady, userId, userAccounts, plannedExpenses, debts, operations, userBudgets, financialGoals, currencySettings]);
+  }, [databaseReady, userId, userAccounts, plannedExpenses, debts, operations, userBudgets, financialGoals, currencySettings, plannedOccurrences]);
   useEffect(() => {
     let knownDate = localToday();
     const timer = setInterval(async () => {
@@ -994,7 +1105,8 @@ function AppContent({ userId }: { userId: string }) {
       if (currentDate === knownDate) return;
       knownDate = currentDate;
       await synchronizeInterestPostings(currentDate);
-      await Promise.all([reloadAccounts(), reloadOperations(), reloadDebts()]);
+      await synchronizePlannedOccurrences(currentDate);
+      await Promise.all([reloadAccounts(), reloadOperations(), reloadDebts(), reloadPlannedOccurrences()]);
     }, 60_000);
     return () => clearInterval(timer);
   }, []);
@@ -1058,6 +1170,33 @@ function AppContent({ userId }: { userId: string }) {
   const handleDebtOverdue = async () => { if (editingDebt) { await markDebtOverdue(editingDebt.id); await refreshOpenDebt(); } };
   const handleCurrencySettings = async (settings: CurrencySettings) => { await saveCurrencySettings(settings); await reloadCurrencySettings(); setCurrencySettingsOpen(false); };
   const handleCreateOperation = async (input: FinancialOperationInput) => { await createOperation(input); await Promise.all([reloadOperations(), reloadAccounts()]); setOperationEditorOpen(false); };
+  const [executingOccurrence, setExecutingOccurrence] = useState<{ occurrence: PlannedOccurrence; flow: PlannedExpense } | null>(null);
+  const handleExecuteOccurrence = async (input: PlannedExecutionInput) => {
+    if (!executingOccurrence) return;
+    await executePlannedOccurrence(executingOccurrence.occurrence.id, input);
+    await Promise.all([reloadPlannedOccurrences(), reloadOperations(), reloadAccounts()]);
+    setExecutingOccurrence(null);
+  };
+  const handleCancelOccurrence = (occurrence: PlannedOccurrence) => {
+    Alert.alert('Отменить плановое событие?', 'Событие останется в истории со статусом «Отменено». Баланс счёта не меняется.', [
+      { text: 'Не отменять', style: 'cancel' },
+      { text: 'Отменить', style: 'destructive', onPress: async () => { await cancelPlannedOccurrence(occurrence.id); await reloadPlannedOccurrences(); } },
+    ]);
+  };
+  const handleOpenOccurrence = (occurrence: PlannedOccurrence, flow: PlannedExpense) => {
+    if (occurrence.status !== 'planned') { openExpense(flow); return; }
+    const overdue = occurrence.occurrenceDate < localToday();
+    Alert.alert(
+      flow.title,
+      `${occurrence.occurrenceDate} · ${money(flow.amount, false, flow.currency)}${overdue ? ' · просрочено' : ''}`,
+      [
+        { text: 'Провести', onPress: () => setExecutingOccurrence({ occurrence, flow }) },
+        { text: 'Отменить событие', style: 'destructive', onPress: () => handleCancelOccurrence(occurrence) },
+        { text: 'Открыть план', onPress: () => openExpense(flow) },
+        { text: 'Закрыть', style: 'cancel' },
+      ],
+    );
+  };
   const openNewBudget = () => { setEditingBudget(null); setBudgetEditorOpen(true); };
   const openBudget = (budget: Budget) => { setEditingBudget(budget); setBudgetEditorOpen(true); };
   const handleSaveBudget = async (input: BudgetInput) => { await saveBudget(input, editingBudget?.id); await reloadBudgets(); setBudgetEditorOpen(false); };
@@ -1071,7 +1210,7 @@ function AppContent({ userId }: { userId: string }) {
   const screen = useMemo(() => {
     if (tab === 'accounts') return <Accounts accounts={userAccounts} onAdd={openNewAccount} onImport={() => setImportOpen(true)} onEdit={openAccount} debts={debts} onAddDebt={openNewDebt} onOpenDebt={openDebt} currencySettings={currencySettings} onCurrencySettings={() => setCurrencySettingsOpen(true)} />;
     if (tab === 'calendar') return <Calendar accounts={userAccounts} plannedExpenses={plannedExpenses} debts={debts} currencySettings={currencySettings} onAddExpense={openNewExpense} onEditExpense={openExpense} />;
-    if (tab === 'operations') return <Operations operations={operations} accounts={userAccounts} onAdd={() => setOperationEditorOpen(true)} />;
+    if (tab === 'operations') return <Operations operations={operations} plannedOccurrences={plannedOccurrences} plannedExpenses={plannedExpenses} debts={debts} accounts={userAccounts} onAdd={() => setOperationEditorOpen(true)} onOpenOccurrence={handleOpenOccurrence} onOpenDebt={openDebt} onOpenPlan={openExpense} />;
     if (tab === 'analytics') return <Analytics accounts={userAccounts} plannedExpenses={plannedExpenses} debts={debts} currencySettings={currencySettings} operations={operations} userBudgets={userBudgets} financialGoals={financialGoals} onAddBudget={openNewBudget} onEditBudget={openBudget} onAddGoal={openNewGoal} onEditGoal={openGoal} />;
     return <Home onImport={() => setImportOpen(true)} go={setTab} accounts={userAccounts} plannedExpenses={plannedExpenses} debts={debts} currencySettings={currencySettings} onCurrencySettings={() => setCurrencySettingsOpen(true)} />;
   }, [tab, userAccounts, plannedExpenses, debts, currencySettings, operations, userBudgets, financialGoals]);
@@ -1082,6 +1221,7 @@ function AppContent({ userId }: { userId: string }) {
     <ImportModal visible={importOpen} onClose={() => setImportOpen(false)} accounts={userAccounts} onAccountSaved={async (input) => { await saveAccount(input); await synchronizeInterestPostings(); await Promise.all([reloadAccounts(), reloadOperations()]); }} />
     <AccountEditor visible={accountEditorOpen} account={editingAccount} accounts={userAccounts} onClose={() => setAccountEditorOpen(false)} onSave={handleSaveAccount} onDelete={handleDeleteAccount} />
     <PlannedExpenseEditor visible={expenseEditorOpen} expense={editingExpense} initialDate={newExpenseInitialDate} accounts={userAccounts} currencySettings={currencySettings} onClose={() => setExpenseEditorOpen(false)} onSave={handleSaveExpense} onDelete={handleDeleteExpense} />
+    <ExecuteOccurrenceModal visible={!!executingOccurrence} occurrence={executingOccurrence?.occurrence ?? null} flow={executingOccurrence?.flow ?? null} accounts={userAccounts} onClose={() => setExecutingOccurrence(null)} onExecute={handleExecuteOccurrence} />
     <DebtEditor visible={debtEditorOpen} debt={editingDebt} history={debtHistory} accounts={userAccounts} currencySettings={currencySettings} onClose={() => setDebtEditorOpen(false)} onCreate={handleCreateDebt} onUpdate={handleUpdateDebt} onPayment={handleDebtPayment} onReversePayment={handleReverseDebtPayment} onExtend={handleDebtExtension} onOverdue={handleDebtOverdue} />
     <CurrencySettingsEditor visible={currencySettingsOpen} currencies={usedCurrencies} settings={currencySettings} onClose={() => setCurrencySettingsOpen(false)} onSave={handleCurrencySettings} />
     <OperationEditor visible={operationEditorOpen} accounts={userAccounts} onClose={() => setOperationEditorOpen(false)} onSave={handleCreateOperation} />

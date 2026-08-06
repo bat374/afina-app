@@ -66,6 +66,7 @@ async function runUpload(userId: string): Promise<SyncResult> {
     repeat_interval: flow.repeatInterval ?? 1, repeat_unit: flow.repeatUnit ?? null,
     weekdays: flow.weekdays ?? null, exchange_rate: flow.exchangeRate ?? null,
     source_transaction_id: flow.sourceTransactionId ?? null,
+    occurrences_tracking_from: flow.occurrencesTrackingFrom ?? null,
   })));
   await upsertOwnedTable('debts', userId, snapshot.debts.map((debt) => ({
     id: debt.id, person: debt.person, title: debt.title, direction: debt.direction,
@@ -79,7 +80,11 @@ async function runUpload(userId: string): Promise<SyncResult> {
     kind: operation.kind, source: operation.source, debt_id: operation.debtId ?? null,
     related_operation_id: operation.relatedOperationId ?? null,
     account_amount: operation.accountAmount ?? null, account_currency: operation.accountCurrency ?? null,
-    status: operation.status ?? 'posted',
+    status: operation.status ?? 'posted', source_occurrence_id: operation.sourceOccurrenceId ?? null,
+  })));
+  await upsertOwnedTable('planned_occurrences', userId, snapshot.plannedOccurrences.map((occurrence) => ({
+    id: occurrence.id, flow_id: occurrence.flowId, occurrence_date: occurrence.occurrenceDate,
+    status: occurrence.status, operation_id: occurrence.operationId ?? null,
   })));
   await upsertOwnedTable('debt_history', userId, snapshot.debtHistory.map((event) => ({
     id: event.id, debt_id: event.debtId, type: event.type, amount: event.amount ?? null,
@@ -113,6 +118,7 @@ async function runUpload(userId: string): Promise<SyncResult> {
     if (error) throw error;
   }
   // Delete in dependency order so foreign keys can never leave half-synchronized data.
+  await deleteMissingOwnedRows('planned_occurrences', snapshot.plannedOccurrences.map((row) => row.id));
   await deleteMissingOwnedRows('debt_history', snapshot.debtHistory.map((row) => row.id));
   await deleteMissingOwnedRows('financial_goals', snapshot.goals.map((row) => row.id));
   await deleteMissingOwnedRows('operations', snapshot.operations.map((row) => row.id));
@@ -128,7 +134,7 @@ const numberOrUndefined = (value: unknown) => value === null || value === undefi
 export async function downloadCloudData(userId: string): Promise<LocalSnapshot> {
   if (!supabase) throw new Error('Supabase is not configured');
   const client = supabase;
-  const tableNames = ['accounts', 'scheduled_flows', 'debts', 'operations', 'debt_history', 'budgets', 'financial_goals'] as const;
+  const tableNames = ['accounts', 'scheduled_flows', 'debts', 'operations', 'debt_history', 'budgets', 'financial_goals', 'planned_occurrences'] as const;
   const results = await Promise.all(tableNames.map((table) => client.from(table).select('*').is('deleted_at', null)));
   const failed = results.find((result) => result.error);
   if (failed?.error) throw failed.error;
@@ -139,6 +145,7 @@ export async function downloadCloudData(userId: string): Promise<LocalSnapshot> 
   const historyRows = results[4]?.data ?? [];
   const budgetRows = results[5]?.data ?? [];
   const goalRows = results[6]?.data ?? [];
+  const occurrenceRows = results[7]?.data ?? [];
   const { data: settings, error: settingsError } = await client.from('user_settings').select('*').eq('user_id', userId).single();
   if (settingsError) throw settingsError;
   const { data: rateRows, error: ratesError } = await client.from('user_currency_rates').select('*');
@@ -167,6 +174,11 @@ export async function downloadCloudData(userId: string): Promise<LocalSnapshot> 
       repeat: row.repeat_rule, kind: row.kind, repeatInterval: row.repeat_interval,
       repeatUnit: row.repeat_unit ?? undefined, weekdays: row.weekdays ?? undefined,
       exchangeRate: numberOrUndefined(row.exchange_rate), sourceTransactionId: row.source_transaction_id ?? undefined,
+      occurrencesTrackingFrom: row.occurrences_tracking_from ?? undefined,
+    })),
+    plannedOccurrences: occurrenceRows.map((row) => ({
+      id: row.id, flowId: row.flow_id, occurrenceDate: row.occurrence_date, status: row.status,
+      operationId: row.operation_id ?? undefined,
     })),
     debts: debtRows.map((row) => ({
       id: row.id, person: row.person, title: row.title, direction: row.direction,
@@ -179,7 +191,7 @@ export async function downloadCloudData(userId: string): Promise<LocalSnapshot> 
       accountId: row.account_id, date: row.date, kind: row.kind, source: row.source,
       debtId: row.debt_id ?? undefined, relatedOperationId: row.related_operation_id ?? undefined,
       accountAmount: numberOrUndefined(row.account_amount), accountCurrency: row.account_currency ?? undefined,
-      status: row.status,
+      status: row.status, sourceOccurrenceId: row.source_occurrence_id ?? undefined,
     })),
     debtHistory: historyRows.map((row) => ({
       id: row.id, debtId: row.debt_id, type: row.type, amount: numberOrUndefined(row.amount),
