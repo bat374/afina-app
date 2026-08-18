@@ -66,6 +66,7 @@ async function runUpload(userId: string): Promise<SyncResult> {
     repeat_interval: flow.repeatInterval ?? 1, repeat_unit: flow.repeatUnit ?? null,
     weekdays: flow.weekdays ?? null, exchange_rate: flow.exchangeRate ?? null,
     source_transaction_id: flow.sourceTransactionId ?? null,
+    occurrences_tracking_from: flow.occurrencesTrackingFrom ?? null,
   })));
   await upsertOwnedTable('transfers', userId, snapshot.transfers.map((transfer) => ({
     id: transfer.id, from_account_id: transfer.fromAccountId, to_account_id: transfer.toAccountId,
@@ -87,11 +88,19 @@ async function runUpload(userId: string): Promise<SyncResult> {
     related_operation_id: operation.relatedOperationId ?? null,
     account_amount: operation.accountAmount ?? null, account_currency: operation.accountCurrency ?? null,
     status: operation.status ?? 'posted',
+    source_occurrence_id: operation.sourceOccurrenceId ?? null,
+    planned_amount: operation.plannedAmount ?? null, planned_currency: operation.plannedCurrency ?? null,
   })));
   // Must come after 'operations': interest_postings.operation_id references it.
   await upsertOwnedTable('interest_postings', userId, snapshot.interestPostings.map((posting) => ({
     id: posting.id, account_id: posting.accountId, payout_date: posting.payoutDate, amount: posting.amount,
     destination_account_id: posting.destinationAccountId ?? null, operation_id: posting.operationId ?? null,
+  })));
+  // Must come after 'scheduled_flows' and 'operations': references both.
+  await upsertOwnedTable('planned_occurrences', userId, snapshot.plannedOccurrences.map((occurrence) => ({
+    id: occurrence.id, flow_id: occurrence.flowId, occurrence_date: occurrence.occurrenceDate,
+    amount: occurrence.amount, currency: occurrence.currency, status: occurrence.status,
+    operation_id: occurrence.operationId ?? null,
   })));
   await upsertOwnedTable('debt_history', userId, snapshot.debtHistory.map((event) => ({
     id: event.id, debt_id: event.debtId, type: event.type, amount: event.amount ?? null,
@@ -126,7 +135,9 @@ async function runUpload(userId: string): Promise<SyncResult> {
     if (error) throw error;
   }
   // Delete in dependency order so foreign keys can never leave half-synchronized data.
-  // interest_postings.operation_id references operations, so it must be pruned first.
+  // planned_occurrences references both operations and scheduled_flows, so it goes first;
+  // interest_postings.operation_id references operations, so it must be pruned before operations too.
+  await deleteMissingOwnedRows('planned_occurrences', snapshot.plannedOccurrences.map((row) => row.id));
   await deleteMissingOwnedRows('interest_postings', snapshot.interestPostings.map((row) => row.id));
   await deleteMissingOwnedRows('debt_history', snapshot.debtHistory.map((row) => row.id));
   await deleteMissingOwnedRows('financial_goals', snapshot.goals.map((row) => row.id));
@@ -144,7 +155,7 @@ const numberOrUndefined = (value: unknown) => value === null || value === undefi
 export async function downloadCloudData(userId: string): Promise<LocalSnapshot> {
   if (!supabase) throw new Error('Supabase is not configured');
   const client = supabase;
-  const tableNames = ['accounts', 'scheduled_flows', 'debts', 'operations', 'debt_history', 'budgets', 'financial_goals', 'interest_postings', 'transfers'] as const;
+  const tableNames = ['accounts', 'scheduled_flows', 'debts', 'operations', 'debt_history', 'budgets', 'financial_goals', 'interest_postings', 'transfers', 'planned_occurrences'] as const;
   const results = await Promise.all(tableNames.map((table) => client.from(table).select('*').is('deleted_at', null)));
   const failed = results.find((result) => result.error);
   if (failed?.error) throw failed.error;
@@ -157,6 +168,7 @@ export async function downloadCloudData(userId: string): Promise<LocalSnapshot> 
   const goalRows = results[6]?.data ?? [];
   const interestPostingRows = results[7]?.data ?? [];
   const transferRows = results[8]?.data ?? [];
+  const plannedOccurrenceRows = results[9]?.data ?? [];
   const { data: settings, error: settingsError } = await client.from('user_settings').select('*').eq('user_id', userId).single();
   if (settingsError) throw settingsError;
   const { data: rateRows, error: ratesError } = await client.from('user_currency_rates').select('*');
@@ -185,6 +197,7 @@ export async function downloadCloudData(userId: string): Promise<LocalSnapshot> 
       repeat: row.repeat_rule, kind: row.kind, repeatInterval: row.repeat_interval,
       repeatUnit: row.repeat_unit ?? undefined, weekdays: row.weekdays ?? undefined,
       exchangeRate: numberOrUndefined(row.exchange_rate), sourceTransactionId: row.source_transaction_id ?? undefined,
+      occurrencesTrackingFrom: row.occurrences_tracking_from ?? undefined,
     })),
     debts: debtRows.map((row) => ({
       id: row.id, person: row.person, title: row.title, direction: row.direction,
@@ -198,6 +211,8 @@ export async function downloadCloudData(userId: string): Promise<LocalSnapshot> 
       debtId: row.debt_id ?? undefined, relatedOperationId: row.related_operation_id ?? undefined,
       accountAmount: numberOrUndefined(row.account_amount), accountCurrency: row.account_currency ?? undefined,
       status: row.status,
+      sourceOccurrenceId: row.source_occurrence_id ?? undefined,
+      plannedAmount: numberOrUndefined(row.planned_amount), plannedCurrency: row.planned_currency ?? undefined,
     })),
     debtHistory: historyRows.map((row) => ({
       id: row.id, debtId: row.debt_id, type: row.type, amount: numberOrUndefined(row.amount),
@@ -221,6 +236,11 @@ export async function downloadCloudData(userId: string): Promise<LocalSnapshot> 
       toAmount: Number(row.to_amount), toCurrency: row.to_currency,
       exchangeRate: numberOrUndefined(row.exchange_rate), note: row.note ?? undefined,
       date: row.date, status: row.status,
+    })),
+    plannedOccurrences: plannedOccurrenceRows.map((row) => ({
+      id: row.id, flowId: row.flow_id, occurrenceDate: row.occurrence_date,
+      amount: Number(row.amount), currency: row.currency, status: row.status,
+      operationId: row.operation_id ?? undefined,
     })),
     currencySettings: {
       baseCurrency: settings.base_currency,

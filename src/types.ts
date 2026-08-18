@@ -71,6 +71,31 @@ export type PlannedExpense = {
   weekdays?: number[];
   exchangeRate?: number;
   sourceTransactionId?: string;
+  occurrencesTrackingFrom?: string;
+};
+
+export type PlannedOccurrenceStatus = 'planned' | 'completed' | 'cancelled';
+
+// A materialized, dated instance of a recurring PlannedExpense. amount/currency are a snapshot
+// taken when the occurrence was generated, not a live read of the (possibly since-edited) flow —
+// so a plan/fact deviation always compares against what was actually planned for that date.
+export type PlannedOccurrence = {
+  id: string;
+  flowId: string;
+  occurrenceDate: string;
+  amount: number;
+  currency: string;
+  status: PlannedOccurrenceStatus;
+  operationId?: string;
+};
+
+export type PlannedExecutionInput = {
+  title: string;
+  category: string;
+  amount: number;
+  currency: string;
+  accountId?: string;
+  date: string;
 };
 
 export type Debt = {
@@ -124,6 +149,14 @@ export type FinancialOperation = {
   accountAmount?: number;
   accountCurrency?: string;
   status?: 'posted' | 'reversed';
+  // Set only when this operation was created from a PlannedOccurrence. plannedAmount/plannedCurrency
+  // are that occurrence's snapshot (what was planned), kept alongside the operation's own
+  // amount/currency (what actually happened) so a plan/fact deviation can be shown without
+  // recomputing anything — distinct from accountAmount/accountCurrency, which is a separate
+  // concept (a debt-currency operation's amount in the settling account's currency).
+  sourceOccurrenceId?: string;
+  plannedAmount?: number;
+  plannedCurrency?: string;
 };
 
 export type InterestPosting = {

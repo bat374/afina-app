@@ -1,4 +1,4 @@
-import { Account, CurrencySettings, Debt, PlannedExpense } from './types';
+import { Account, CurrencySettings, Debt, PlannedExpense, PlannedOccurrence } from './types';
 import { localToday, parseLocalDate } from './date';
 import { occursOn } from './recurrence';
 
@@ -50,7 +50,14 @@ export const flowAmountInCurrency = (flow: PlannedExpense, account: Account | un
   return sourceRate && targetRate ? flow.amount * sourceRate / targetRate : null;
 };
 
-export function buildMonthProjection(accounts: Account[], currency: string, year: number, month: number, plannedExpenses: PlannedExpense[] = [], debts: Debt[] = [], settings?: CurrencySettings, today = localToday()) {
+export function buildMonthProjection(accounts: Account[], currency: string, year: number, month: number, plannedExpenses: PlannedExpense[] = [], debts: Debt[] = [], settings?: CurrencySettings, today = localToday(), plannedOccurrences: PlannedOccurrence[] = []) {
+  // A flow's occurrence for "today" can already be resolved (executed or cancelled) by the time
+  // this projection runs — "today" itself doesn't count as `past` below, so without this the same
+  // flow would otherwise be counted once as a real operation (already in account.balance) and a
+  // second time here as a still-pending projected event.
+  const resolvedOccurrenceKeys = new Set(
+    plannedOccurrences.filter((occurrence) => occurrence.status !== 'planned').map((occurrence) => `${occurrence.flowId}|${occurrence.occurrenceDate}`),
+  );
   const count = new Date(year, month + 1, 0).getDate();
   const relevant = accounts.filter((account) => account.currency === currency);
   const trackedIds = new Set(relevant.map((account) => account.id));
@@ -118,6 +125,7 @@ export function buildMonthProjection(accounts: Account[], currency: string, year
     }
     let expenseTotal = scheduledCreditPayment;
     if (!past) for (const expense of plannedExpenses) {
+      if (resolvedOccurrenceKeys.has(`${expense.id}|${date}`)) continue;
       const linkedAccount = accounts.find((item) => item.id === expense.accountId);
       const amount = flowAmountInCurrency(expense, linkedAccount, currency, settings);
       if (amount === null || !occursOn(expense, current)) continue;
