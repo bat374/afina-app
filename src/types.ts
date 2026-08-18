@@ -126,6 +126,15 @@ export type FinancialOperation = {
   status?: 'posted' | 'reversed';
 };
 
+export type InterestPosting = {
+  id: string;
+  accountId: string;
+  payoutDate: string;
+  amount: number;
+  destinationAccountId?: string;
+  operationId?: string;
+};
+
 export type Budget = {
   id: string;
   category: string;
@@ -144,6 +153,10 @@ export type FinancialGoal = {
   deadline: string;
   accountId?: string;
   debtId?: string;
+  // Only meaningful for type 'balance' when accountId is unset (i.e. "all accounts"):
+  // true = every account, other currencies converted into `currency`;
+  // false/undefined = only accounts already denominated in `currency`, no conversion.
+  includeAllCurrencies?: boolean;
 };
 
 export type Goal = {

@@ -81,6 +81,11 @@ async function runUpload(userId: string): Promise<SyncResult> {
     account_amount: operation.accountAmount ?? null, account_currency: operation.accountCurrency ?? null,
     status: operation.status ?? 'posted',
   })));
+  // Must come after 'operations': interest_postings.operation_id references it.
+  await upsertOwnedTable('interest_postings', userId, snapshot.interestPostings.map((posting) => ({
+    id: posting.id, account_id: posting.accountId, payout_date: posting.payoutDate, amount: posting.amount,
+    destination_account_id: posting.destinationAccountId ?? null, operation_id: posting.operationId ?? null,
+  })));
   await upsertOwnedTable('debt_history', userId, snapshot.debtHistory.map((event) => ({
     id: event.id, debt_id: event.debtId, type: event.type, amount: event.amount ?? null,
     from_date: event.fromDate ?? null, to_date: event.toDate ?? null, occurred_at: event.occurredAt,
@@ -93,6 +98,7 @@ async function runUpload(userId: string): Promise<SyncResult> {
   await upsertOwnedTable('financial_goals', userId, snapshot.goals.map((goal) => ({
     id: goal.id, title: goal.title, type: goal.type, target: goal.target, currency: goal.currency,
     deadline: goal.deadline, account_id: goal.accountId ?? null, debt_id: goal.debtId ?? null,
+    include_other_currencies: goal.includeAllCurrencies === undefined ? null : goal.includeAllCurrencies,
   })));
 
   const { error: settingsError } = await supabase.from('user_settings').upsert({
@@ -113,6 +119,8 @@ async function runUpload(userId: string): Promise<SyncResult> {
     if (error) throw error;
   }
   // Delete in dependency order so foreign keys can never leave half-synchronized data.
+  // interest_postings.operation_id references operations, so it must be pruned first.
+  await deleteMissingOwnedRows('interest_postings', snapshot.interestPostings.map((row) => row.id));
   await deleteMissingOwnedRows('debt_history', snapshot.debtHistory.map((row) => row.id));
   await deleteMissingOwnedRows('financial_goals', snapshot.goals.map((row) => row.id));
   await deleteMissingOwnedRows('operations', snapshot.operations.map((row) => row.id));
@@ -128,7 +136,7 @@ const numberOrUndefined = (value: unknown) => value === null || value === undefi
 export async function downloadCloudData(userId: string): Promise<LocalSnapshot> {
   if (!supabase) throw new Error('Supabase is not configured');
   const client = supabase;
-  const tableNames = ['accounts', 'scheduled_flows', 'debts', 'operations', 'debt_history', 'budgets', 'financial_goals'] as const;
+  const tableNames = ['accounts', 'scheduled_flows', 'debts', 'operations', 'debt_history', 'budgets', 'financial_goals', 'interest_postings'] as const;
   const results = await Promise.all(tableNames.map((table) => client.from(table).select('*').is('deleted_at', null)));
   const failed = results.find((result) => result.error);
   if (failed?.error) throw failed.error;
@@ -139,6 +147,7 @@ export async function downloadCloudData(userId: string): Promise<LocalSnapshot> 
   const historyRows = results[4]?.data ?? [];
   const budgetRows = results[5]?.data ?? [];
   const goalRows = results[6]?.data ?? [];
+  const interestPostingRows = results[7]?.data ?? [];
   const { data: settings, error: settingsError } = await client.from('user_settings').select('*').eq('user_id', userId).single();
   if (settingsError) throw settingsError;
   const { data: rateRows, error: ratesError } = await client.from('user_currency_rates').select('*');
@@ -191,6 +200,11 @@ export async function downloadCloudData(userId: string): Promise<LocalSnapshot> 
     goals: goalRows.map((row) => ({
       id: row.id, title: row.title, type: row.type, target: Number(row.target), currency: row.currency,
       deadline: row.deadline, accountId: row.account_id ?? undefined, debtId: row.debt_id ?? undefined,
+      includeAllCurrencies: row.include_other_currencies ?? undefined,
+    })),
+    interestPostings: interestPostingRows.map((row) => ({
+      id: row.id, accountId: row.account_id, payoutDate: row.payout_date, amount: Number(row.amount),
+      destinationAccountId: row.destination_account_id ?? undefined, operationId: row.operation_id ?? undefined,
     })),
     currencySettings: {
       baseCurrency: settings.base_currency,

@@ -1,4 +1,14 @@
-import { Account, CurrencySettings, Debt } from './types';
+import { Account, CurrencySettings, Debt, FinancialOperation } from './types';
+
+// Some operations (e.g. cross-currency debt payments) record the amount that actually moved
+// the account balance, fixed at the historical exchange rate, alongside the operation's own
+// nominal amount/currency (e.g. the debt's currency). Analytics/goals must use that historical,
+// already-converted value instead of re-converting the nominal amount at today's rate — otherwise
+// a past operation's reported value drifts every time currency rates change.
+export const operationConversionBasis = (operation: FinancialOperation) =>
+  operation.accountAmount !== undefined && operation.accountCurrency !== undefined
+    ? { amount: operation.accountAmount, currency: operation.accountCurrency }
+    : { amount: operation.amount, currency: operation.currency };
 
 export const convertToBase = (amount: number, currency: string, settings: CurrencySettings) => {
   const rate = currency === settings.baseCurrency ? 1 : settings.rates[currency];

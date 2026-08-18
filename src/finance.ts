@@ -97,10 +97,9 @@ export function buildMonthProjection(accounts: Account[], currency: string, year
         amount = principal * (account.rate / 100) / 365;
         if (account.interestDestination === 'same') runningPrincipal.set(account.id, principal + amount);
       } else if (account.interestSchedule === 'monthly') {
-        const nextInterest = parseLocalDate(account.nextInterestDate);
-        const preferredDay = nextInterest?.getDate() ?? start.getDate();
+        const preferredDay = start.getDate();
         const paymentDate = monthlyPaymentDate(year, month, preferredDay);
-        const isDue = sameDay(current, paymentDate) && (!nextInterest || current >= nextInterest);
+        const isDue = sameDay(current, paymentDate);
         if (isDue) {
           const previousPayment = monthlyPaymentDate(year, month - 1, preferredDay);
           const periodStart = previousPayment < start ? start : previousPayment;

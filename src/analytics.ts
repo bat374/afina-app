@@ -1,4 +1,4 @@
-import { convertCurrency } from './currency';
+import { convertCurrency, operationConversionBasis } from './currency';
 import { addLocalDays, localToday, parseLocalDate, toLocalIso } from './date';
 import { flowAmountInCurrency } from './finance';
 import { occursOn } from './recurrence';
@@ -30,8 +30,9 @@ export function summarizeOperations(operations: FinancialOperation[], currency: 
   const reversedIds = new Set(operations.filter((operation) => operation.status === 'reversed').map((operation) => operation.id));
   for (const operation of operations) {
     if (operation.status === 'reversed' || (operation.relatedOperationId && reversedIds.has(operation.relatedOperationId)) || operation.date < range.from || operation.date > range.to) continue;
-    const converted = convertCurrency(operation.amount, operation.currency, currency, settings);
-    if (converted === null) { missing.add(operation.currency); continue; }
+    const basis = operationConversionBasis(operation);
+    const converted = convertCurrency(basis.amount, basis.currency, currency, settings);
+    if (converted === null) { missing.add(basis.currency); continue; }
     if (operation.kind === 'income') income += converted; else expense += converted;
     if (operation.kind === 'income' && operation.source === 'interest') {
       passive += converted;

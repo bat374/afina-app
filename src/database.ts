@@ -1,5 +1,5 @@
 import * as SQLite from 'expo-sqlite';
-import { Account, AccountType, Budget, CashFlowKind, CurrencySettings, Debt, DebtDirection, DebtHistory, DebtHistoryType, DebtStatus, ExpenseRepeat, FinancialGoal, FinancialOperation, GoalType, InterestDestination, InterestSchedule, PlannedExpense, RecurrenceUnit, WithdrawalPolicy } from './types';
+import { Account, AccountType, Budget, CashFlowKind, CurrencySettings, Debt, DebtDirection, DebtHistory, DebtHistoryType, DebtStatus, ExpenseRepeat, FinancialGoal, FinancialOperation, GoalType, InterestDestination, InterestPosting, InterestSchedule, PlannedExpense, RecurrenceUnit, WithdrawalPolicy } from './types';
 import { addLocalDays, daysBetween, localToday, nextBusinessMonday, nextMonthlyDate, parseLocalDate, previousMonthlyDate, toLocalIso } from './date';
 
 type AccountRow = {
@@ -79,6 +79,7 @@ export type LocalSnapshot = {
   budgets: Budget[];
   goals: FinancialGoal[];
   currencySettings: CurrencySettings;
+  interestPostings: InterestPosting[];
 };
 
 let database: Promise<SQLite.SQLiteDatabase> | null = null;
@@ -239,6 +240,7 @@ async function initializeDatabaseCore() {
       deadline TEXT NOT NULL,
       account_id TEXT,
       debt_id TEXT,
+      include_other_currencies INTEGER,
       created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
       updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
     );
@@ -396,6 +398,47 @@ async function initializeDatabaseCore() {
       ALTER TABLE debt_history_v2 RENAME TO debt_history;
       COMMIT;
     `);
+  }
+  const repairFlag = await db.getFirstAsync<{ value: string }>("SELECT value FROM app_settings WHERE key = 'repair_v1_orphan_interest_postings'");
+  if (!repairFlag) {
+    // Older builds could write an interest_postings row (blocked only from crediting money) before
+    // realizing the destination account was missing — see synchronizeInterestPostings. Such orphans
+    // (no operation was ever created, no destination was ever resolved) block that period forever via
+    // UNIQUE(account_id, payout_date). Clear them once so the period becomes retryable; rows that did
+    // result in a real operation are left untouched.
+    await db.withTransactionAsync(async () => {
+      const affectedAccountIds = (await db.getAllAsync<{ account_id: string }>(
+        'SELECT DISTINCT account_id FROM interest_postings WHERE operation_id IS NULL AND destination_account_id IS NULL',
+      )).map((row) => row.account_id);
+      await db.runAsync('DELETE FROM interest_postings WHERE operation_id IS NULL AND destination_account_id IS NULL');
+      for (const accountId of affectedAccountIds) {
+        const account = await db.getFirstAsync<{ start_date: string | null; interest_tracking_from: string | null }>(
+          'SELECT start_date, interest_tracking_from FROM accounts WHERE id = ?', accountId,
+        );
+        if (!account) continue;
+        const remainingMax = (await db.getFirstAsync<{ max_payout: string | null }>(
+          'SELECT MAX(payout_date) as max_payout FROM interest_postings WHERE account_id = ?', accountId,
+        ))?.max_payout;
+        // Never fall back to start_date here: the legacy bug advanced interest_tracking_from past
+        // every date it processed regardless of whether it actually credited money, so the current
+        // (pre-repair) cursor is already at or beyond the last real posting. Resetting to start_date
+        // for an account with zero surviving postings would re-accrue its entire history on top of
+        // an already-current balance — real money duplication, worse than the narrow "one orphaned
+        // period between two credited ones can't be retried" limitation this leaves in place.
+        const restoredTrackingFrom = remainingMax ?? account.interest_tracking_from ?? account.start_date;
+        await db.runAsync('UPDATE accounts SET interest_tracking_from = ? WHERE id = ?', restoredTrackingFrom, accountId);
+      }
+      await db.runAsync("INSERT OR REPLACE INTO app_settings (key, value) VALUES ('repair_v1_orphan_interest_postings', '1')");
+    });
+  }
+  const goalColumns = await db.getAllAsync<{ name: string }>('PRAGMA table_info(financial_goals)');
+  if (!goalColumns.some((column) => column.name === 'include_other_currencies')) {
+    await db.execAsync('ALTER TABLE financial_goals ADD COLUMN include_other_currencies INTEGER;');
+    // Before this fix, a 'balance' goal with no specific account silently converted every
+    // account regardless of currency. Preserve that exact number for existing goals rather than
+    // changing what they already show — new goals default to "same currency only" (matching what
+    // the old UI label claimed but the old code never actually did).
+    await db.runAsync("UPDATE financial_goals SET include_other_currencies = 1 WHERE type = 'balance' AND account_id IS NULL");
   }
   await db.execAsync('PRAGMA user_version = 5;');
 }
@@ -886,6 +929,17 @@ export function synchronizeInterestPostings(today = localToday()) {
      AND interest_tracking_from IS NOT NULL`,
     );
     for (const account of accounts) {
+      // Resolve the destination once, before touching any dates: a period must never be
+      // marked processed (interest_postings row + tracking-cursor advance) unless the
+      // interest can actually be credited somewhere. Otherwise the UNIQUE(account_id,
+      // payout_date) constraint would make that period permanently unrecoverable even
+      // after the user fixes the destination.
+      const destinationId = account.interest_destination === 'same' ? account.id : account.destination_account_id;
+      if (!destinationId) continue;
+      const destination = await db.getFirstAsync<{ currency: string }>('SELECT currency FROM accounts WHERE id = ?', destinationId);
+      if (!destination) continue;
+      const destinationCurrency = destination.currency;
+
       const trackingFrom = account.interest_tracking_from ?? today;
       const finalDate = account.maturity_date && !account.auto_renewal && account.maturity_date < today ? account.maturity_date : today;
       let dates: string[] = [];
@@ -898,43 +952,40 @@ export function synchronizeInterestPostings(today = localToday()) {
         if (payoutDate <= today) dates = [payoutDate];
       }
       let previousDate = trackingFrom; let lastProcessedDate = trackingFrom;
+      let blocked = false;
       for (const payoutDate of dates) {
         const source = await db.getFirstAsync<{ balance: number; currency: string }>('SELECT balance, currency FROM accounts WHERE id = ?', account.id);
         if (!source) break;
         const periodDays = account.interest_schedule === 'daily' ? 1 : Math.max(1, daysBetween(parseLocalDate(previousDate)!, parseLocalDate(payoutDate)!));
         const amount = source.balance * ((account.rate ?? 0) / 100) * periodDays / 365;
-        const destinationId = account.interest_destination === 'same' ? account.id : account.destination_account_id;
-        let creditedAmount = amount; let creditedCurrency = source.currency;
-        if (destinationId) {
-          const destination = await db.getFirstAsync<{ currency: string }>('SELECT currency FROM accounts WHERE id = ?', destinationId);
-          if (!destination) continue;
-          creditedCurrency = destination.currency;
-          if (destination.currency !== source.currency) {
-            const base = await db.getFirstAsync<{ value: string }>("SELECT value FROM app_settings WHERE key = 'base_currency'");
-            const sourceRate = source.currency === base?.value ? 1 : (await db.getFirstAsync<{ rate_to_base: number }>('SELECT rate_to_base FROM currency_rates WHERE currency = ?', source.currency))?.rate_to_base;
-            const targetRate = destination.currency === base?.value ? 1 : (await db.getFirstAsync<{ rate_to_base: number }>('SELECT rate_to_base FROM currency_rates WHERE currency = ?', destination.currency))?.rate_to_base;
-            if (!sourceRate || !targetRate) continue;
-            creditedAmount = amount * sourceRate / targetRate;
-          }
+        let creditedAmount: number;
+        try {
+          creditedAmount = await convertUsingStoredRates(db, amount, source.currency, destinationCurrency);
+        } catch {
+          // Missing FX rate for this leg: stop here without marking the period processed,
+          // so it is retried once the rate is available. Do not touch other accounts.
+          blocked = true;
+          break;
         }
         await db.withTransactionAsync(async () => {
           const postingId = makeId();
           const inserted = await db.runAsync(
             'INSERT OR IGNORE INTO interest_postings (id, account_id, payout_date, amount, destination_account_id) VALUES (?, ?, ?, ?, ?)',
-            postingId, account.id, payoutDate, amount, destinationId ?? null,
+            postingId, account.id, payoutDate, amount, destinationId,
           );
-          if (!inserted.changes || !destinationId) return;
+          if (!inserted.changes) return;
           const operationId = makeId();
           await db.runAsync('UPDATE accounts SET balance = balance + ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?', creditedAmount, destinationId);
           await db.runAsync(
             `INSERT INTO operations (id, title, category, amount, currency, account_id, date, kind, source)
            VALUES (?, ?, 'Проценты', ?, ?, ?, ?, 'income', 'interest')`,
-            operationId, `Проценты · ${account.name}`, creditedAmount, creditedCurrency, destinationId, payoutDate,
+            operationId, `Проценты · ${account.name}`, creditedAmount, destinationCurrency, destinationId, payoutDate,
           );
           await db.runAsync('UPDATE interest_postings SET operation_id = ? WHERE id = ?', operationId, postingId);
         });
         previousDate = payoutDate; lastProcessedDate = payoutDate;
       }
+      if (blocked) continue;
       let effectiveStart = account.start_date;
       let effectiveMaturity = account.maturity_date;
       if (account.auto_renewal && effectiveStart && effectiveMaturity && nextBusinessMonday(effectiveMaturity) <= today) {
@@ -946,7 +997,9 @@ export function synchronizeInterestPostings(today = localToday()) {
         await db.runAsync('UPDATE accounts SET start_date = ?, maturity_date = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?', effectiveStart, effectiveMaturity, account.id);
       }
       const nextTrackingFrom = lastProcessedDate !== trackingFrom ? lastProcessedDate : (account.interest_schedule === 'daily' && !dates.length ? today : trackingFrom);
-      const monthlyAnchor = account.next_interest_date ?? effectiveStart;
+      // Monthly due-date anchor is always the account's own start_date (see monthlyDueDates),
+      // never next_interest_date — that field is display-only and must not drift from it.
+      const monthlyAnchor = effectiveStart;
       const automaticNext = account.interest_schedule === 'monthly' && monthlyAnchor ? nextMonthlyDate(monthlyAnchor, today) : null;
       await db.runAsync('UPDATE accounts SET interest_tracking_from = ?, next_interest_date = COALESCE(?, next_interest_date), updated_at = CURRENT_TIMESTAMP WHERE id = ?', nextTrackingFrom, automaticNext ?? null, account.id);
     }
@@ -1004,9 +1057,13 @@ async function listFinancialGoalsCore(): Promise<FinancialGoal[]> {
   const db = await getDatabase();
   const rows = await db.getAllAsync<{
     id: string; title: string; type: GoalType; target: number; currency: string;
-    deadline: string; account_id: string | null; debt_id: string | null;
-  }>('SELECT id, title, type, target, currency, deadline, account_id, debt_id FROM financial_goals ORDER BY deadline ASC');
-  return rows.map((row) => ({ id: row.id, title: row.title, type: row.type, target: row.target, currency: row.currency, deadline: row.deadline, accountId: row.account_id ?? undefined, debtId: row.debt_id ?? undefined }));
+    deadline: string; account_id: string | null; debt_id: string | null; include_other_currencies: number | null;
+  }>('SELECT id, title, type, target, currency, deadline, account_id, debt_id, include_other_currencies FROM financial_goals ORDER BY deadline ASC');
+  return rows.map((row) => ({
+    id: row.id, title: row.title, type: row.type, target: row.target, currency: row.currency, deadline: row.deadline,
+    accountId: row.account_id ?? undefined, debtId: row.debt_id ?? undefined,
+    includeAllCurrencies: row.include_other_currencies === null ? undefined : row.include_other_currencies === 1,
+  }));
 }
 
 export function listFinancialGoals(): Promise<FinancialGoal[]> {
@@ -1016,17 +1073,18 @@ export function listFinancialGoals(): Promise<FinancialGoal[]> {
 export function saveFinancialGoal(input: FinancialGoalInput, id?: string) {
   return enqueue(async () => {
     const db = await getDatabase();
+    const includeOtherCurrencies = input.includeAllCurrencies === undefined ? null : input.includeAllCurrencies ? 1 : 0;
     if (id) {
       await db.runAsync(
-        'UPDATE financial_goals SET title = ?, type = ?, target = ?, currency = ?, deadline = ?, account_id = ?, debt_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?',
-        input.title, input.type, input.target, input.currency, input.deadline, input.accountId ?? null, input.debtId ?? null, id,
+        'UPDATE financial_goals SET title = ?, type = ?, target = ?, currency = ?, deadline = ?, account_id = ?, debt_id = ?, include_other_currencies = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?',
+        input.title, input.type, input.target, input.currency, input.deadline, input.accountId ?? null, input.debtId ?? null, includeOtherCurrencies, id,
       );
       return id;
     }
     const goalId = makeId();
     await db.runAsync(
-      'INSERT INTO financial_goals (id, title, type, target, currency, deadline, account_id, debt_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-      goalId, input.title, input.type, input.target, input.currency, input.deadline, input.accountId ?? null, input.debtId ?? null,
+      'INSERT INTO financial_goals (id, title, type, target, currency, deadline, account_id, debt_id, include_other_currencies) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+      goalId, input.title, input.type, input.target, input.currency, input.deadline, input.accountId ?? null, input.debtId ?? null, includeOtherCurrencies,
     );
     return goalId;
   });
@@ -1037,6 +1095,21 @@ export function deleteFinancialGoal(id: string) {
     const db = await getDatabase();
     await db.runAsync('DELETE FROM financial_goals WHERE id = ?', id);
   });
+}
+
+async function listInterestPostingsCore(): Promise<InterestPosting[]> {
+  const db = await getDatabase();
+  const rows = await db.getAllAsync<{ id: string; account_id: string; payout_date: string; amount: number; destination_account_id: string | null; operation_id: string | null }>(
+    'SELECT id, account_id, payout_date, amount, destination_account_id, operation_id FROM interest_postings',
+  );
+  return rows.map((row) => ({
+    id: row.id,
+    accountId: row.account_id,
+    payoutDate: row.payout_date,
+    amount: row.amount,
+    destinationAccountId: row.destination_account_id ?? undefined,
+    operationId: row.operation_id ?? undefined,
+  }));
 }
 
 export function exportLocalSnapshot(): Promise<LocalSnapshot> {
@@ -1050,6 +1123,7 @@ export function exportLocalSnapshot(): Promise<LocalSnapshot> {
     const budgets = await listBudgetsCore();
     const goals = await listFinancialGoalsCore();
     const currencySettings = await getCurrencySettingsCore();
+    const interestPostings = await listInterestPostingsCore();
     const debtHistory: DebtHistory[] = [];
     for (const debt of debts) debtHistory.push(...(await listDebtHistoryCore(debt.id)));
     return {
@@ -1063,6 +1137,7 @@ export function exportLocalSnapshot(): Promise<LocalSnapshot> {
       budgets,
       goals,
       currencySettings,
+      interestPostings,
     };
   });
 }
@@ -1098,6 +1173,17 @@ export function replaceLocalSnapshot(snapshot: LocalSnapshot) {
       DELETE FROM accounts;
       DELETE FROM currency_rates;
     `);
+      // Interest already paid out on another device is recorded in interestPostings, not in a
+      // synced interest_tracking_from (that cursor is local-only). Restoring it as "start_date"
+      // would make the very next sync re-accrue the account's entire history a second time — real
+      // money duplication. Resume from the last known payout instead; if none was ever synced
+      // (pre-fix data), resume from today rather than from history, since under-accruing an
+      // offline gap is a safe, visible, and correctable error, unlike creating money from nothing.
+      const maxPayoutByAccount = new Map<string, string>();
+      for (const posting of snapshot.interestPostings) {
+        const existing = maxPayoutByAccount.get(posting.accountId);
+        if (!existing || posting.payoutDate > existing) maxPayoutByAccount.set(posting.accountId, posting.payoutDate);
+      }
       for (const account of snapshot.accounts) {
         await db.runAsync(
           `INSERT INTO accounts (id, name, subtitle, type, balance, currency, rate, rate_caption,
@@ -1115,7 +1201,7 @@ export function replaceLocalSnapshot(snapshot: LocalSnapshot) {
           account.minimumBalance ?? null, account.replenishmentAllowed === undefined ? null : account.replenishmentAllowed ? 1 : 0,
           account.creditLimit ?? null, account.statementDay ?? null, account.paymentDueDay ?? null,
           account.gracePeriodDays ?? null, account.minimumPaymentPercent ?? null, account.accent,
-          account.startDate ?? localToday(),
+          maxPayoutByAccount.get(account.id) ?? localToday(),
         );
       }
       for (const flow of snapshot.scheduledFlows) {
@@ -1148,6 +1234,13 @@ export function replaceLocalSnapshot(snapshot: LocalSnapshot) {
           operation.accountCurrency ?? null, operation.status ?? 'posted',
         );
       }
+      for (const posting of snapshot.interestPostings) {
+        await db.runAsync(
+          'INSERT INTO interest_postings (id, account_id, payout_date, amount, destination_account_id, operation_id) VALUES (?, ?, ?, ?, ?, ?)',
+          posting.id, posting.accountId, posting.payoutDate, posting.amount,
+          posting.destinationAccountId ?? null, posting.operationId ?? null,
+        );
+      }
       for (const event of snapshot.debtHistory) {
         await db.runAsync(
           `INSERT INTO debt_history (id, debt_id, type, amount, from_date, to_date, occurred_at, note,
@@ -1163,9 +1256,10 @@ export function replaceLocalSnapshot(snapshot: LocalSnapshot) {
       }
       for (const goal of snapshot.goals) {
         await db.runAsync(
-          'INSERT INTO financial_goals (id, title, type, target, currency, deadline, account_id, debt_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+          'INSERT INTO financial_goals (id, title, type, target, currency, deadline, account_id, debt_id, include_other_currencies) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
           goal.id, goal.title, goal.type, goal.target, goal.currency, goal.deadline,
           goal.accountId ?? null, goal.debtId ?? null,
+          goal.includeAllCurrencies === undefined ? null : goal.includeAllCurrencies ? 1 : 0,
         );
       }
       await db.runAsync("INSERT OR REPLACE INTO app_settings (key, value) VALUES ('base_currency', ?)", snapshot.currencySettings.baseCurrency);
