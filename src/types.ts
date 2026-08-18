@@ -135,6 +135,30 @@ export type InterestPosting = {
   operationId?: string;
 };
 
+export type Transfer = {
+  id: string;
+  fromAccountId: string;
+  toAccountId: string;
+  fromAmount: number;
+  fromCurrency: string;
+  toAmount: number;
+  toCurrency: string;
+  exchangeRate?: number;
+  note?: string;
+  date: string;
+  status: 'posted' | 'reversed';
+};
+
+export type TransferInput = {
+  fromAccountId: string;
+  toAccountId: string;
+  fromAmount: number;
+  toAmount: number;
+  exchangeRate?: number;
+  note?: string;
+  date: string;
+};
+
 export type Budget = {
   id: string;
   category: string;

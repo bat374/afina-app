@@ -1,5 +1,5 @@
 import * as SQLite from 'expo-sqlite';
-import { Account, AccountType, Budget, CashFlowKind, CurrencySettings, Debt, DebtDirection, DebtHistory, DebtHistoryType, DebtStatus, ExpenseRepeat, FinancialGoal, FinancialOperation, GoalType, InterestDestination, InterestPosting, InterestSchedule, PlannedExpense, RecurrenceUnit, WithdrawalPolicy } from './types';
+import { Account, AccountType, Budget, CashFlowKind, CurrencySettings, Debt, DebtDirection, DebtHistory, DebtHistoryType, DebtStatus, ExpenseRepeat, FinancialGoal, FinancialOperation, GoalType, InterestDestination, InterestPosting, InterestSchedule, PlannedExpense, RecurrenceUnit, Transfer, TransferInput, WithdrawalPolicy } from './types';
 import { addLocalDays, daysBetween, localToday, nextBusinessMonday, nextMonthlyDate, parseLocalDate, previousMonthlyDate, toLocalIso } from './date';
 
 type AccountRow = {
@@ -80,6 +80,7 @@ export type LocalSnapshot = {
   goals: FinancialGoal[];
   currencySettings: CurrencySettings;
   interestPostings: InterestPosting[];
+  transfers: Transfer[];
 };
 
 let database: Promise<SQLite.SQLiteDatabase> | null = null;
@@ -254,6 +255,21 @@ async function initializeDatabaseCore() {
       created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
       UNIQUE(account_id, payout_date),
       FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE
+    );
+    CREATE TABLE IF NOT EXISTS transfers (
+      id TEXT PRIMARY KEY NOT NULL,
+      from_account_id TEXT NOT NULL,
+      to_account_id TEXT NOT NULL,
+      from_amount REAL NOT NULL CHECK(from_amount > 0),
+      from_currency TEXT NOT NULL,
+      to_amount REAL NOT NULL CHECK(to_amount > 0),
+      to_currency TEXT NOT NULL,
+      exchange_rate REAL,
+      note TEXT,
+      date TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'posted' CHECK(status IN ('posted', 'reversed')),
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
     );
     INSERT OR IGNORE INTO scheduled_flows
       (id, title, category, amount, currency, account_id, start_date, end_date, repeat_rule, kind,
@@ -822,6 +838,67 @@ export function reverseDebtPayment(debtId: string, historyId: string, fallbackAc
   });
 }
 
+type TransferRow = {
+  id: string; from_account_id: string; to_account_id: string; from_amount: number; from_currency: string;
+  to_amount: number; to_currency: string; exchange_rate: number | null; note: string | null; date: string;
+  status: 'posted' | 'reversed';
+};
+
+const mapTransferRow = (row: TransferRow): Transfer => ({
+  id: row.id, fromAccountId: row.from_account_id, toAccountId: row.to_account_id,
+  fromAmount: row.from_amount, fromCurrency: row.from_currency, toAmount: row.to_amount, toCurrency: row.to_currency,
+  exchangeRate: row.exchange_rate ?? undefined, note: row.note ?? undefined, date: row.date, status: row.status,
+});
+
+async function listTransfersCore(): Promise<Transfer[]> {
+  const db = await getDatabase();
+  const rows = await db.getAllAsync<TransferRow>('SELECT * FROM transfers ORDER BY date DESC, created_at DESC');
+  return rows.map(mapTransferRow);
+}
+
+export function listTransfers(): Promise<Transfer[]> {
+  return enqueue(listTransfersCore);
+}
+
+export function recordTransfer(input: TransferInput) {
+  return enqueue(async () => {
+    const db = await getDatabase();
+    if (input.fromAccountId === input.toAccountId) throw new Error('Счета списания и зачисления должны различаться');
+    if (!Number.isFinite(input.fromAmount) || input.fromAmount <= 0) throw new Error('Сумма списания должна быть больше нуля');
+    if (!Number.isFinite(input.toAmount) || input.toAmount <= 0) throw new Error('Сумма зачисления должна быть больше нуля');
+    const fromAccount = await db.getFirstAsync<{ currency: string }>('SELECT currency FROM accounts WHERE id = ?', input.fromAccountId);
+    const toAccount = await db.getFirstAsync<{ currency: string }>('SELECT currency FROM accounts WHERE id = ?', input.toAccountId);
+    if (!fromAccount) throw new Error('Счёт списания не найден');
+    if (!toAccount) throw new Error('Счёт зачисления не найден');
+    const id = makeId();
+    await db.withTransactionAsync(async () => {
+      await db.runAsync('UPDATE accounts SET balance = balance - ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?', input.fromAmount, input.fromAccountId);
+      await db.runAsync('UPDATE accounts SET balance = balance + ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?', input.toAmount, input.toAccountId);
+      await db.runAsync(
+        `INSERT INTO transfers (id, from_account_id, to_account_id, from_amount, from_currency, to_amount, to_currency, exchange_rate, note, date, status)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'posted')`,
+        id, input.fromAccountId, input.toAccountId, input.fromAmount, fromAccount.currency, input.toAmount, toAccount.currency,
+        input.exchangeRate ?? null, input.note ?? null, input.date,
+      );
+    });
+    return id;
+  });
+}
+
+export function reverseTransfer(transferId: string) {
+  return enqueue(async () => {
+    const db = await getDatabase();
+    const transfer = await db.getFirstAsync<TransferRow>('SELECT * FROM transfers WHERE id = ?', transferId);
+    if (!transfer) throw new Error('Перевод не найден');
+    if (transfer.status === 'reversed') throw new Error('Этот перевод уже отменён');
+    await db.withTransactionAsync(async () => {
+      await db.runAsync('UPDATE accounts SET balance = balance + ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?', transfer.from_amount, transfer.from_account_id);
+      await db.runAsync('UPDATE accounts SET balance = balance - ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?', transfer.to_amount, transfer.to_account_id);
+      await db.runAsync("UPDATE transfers SET status = 'reversed', updated_at = CURRENT_TIMESTAMP WHERE id = ?", transferId);
+    });
+  });
+}
+
 export function extendDebt(debtId: string, newDueDate: string, note?: string) {
   return enqueue(async () => {
     const db = await getDatabase();
@@ -1124,6 +1201,7 @@ export function exportLocalSnapshot(): Promise<LocalSnapshot> {
     const goals = await listFinancialGoalsCore();
     const currencySettings = await getCurrencySettingsCore();
     const interestPostings = await listInterestPostingsCore();
+    const transfers = await listTransfersCore();
     const debtHistory: DebtHistory[] = [];
     for (const debt of debts) debtHistory.push(...(await listDebtHistoryCore(debt.id)));
     return {
@@ -1138,6 +1216,7 @@ export function exportLocalSnapshot(): Promise<LocalSnapshot> {
       goals,
       currencySettings,
       interestPostings,
+      transfers,
     };
   });
 }
@@ -1164,6 +1243,7 @@ export function replaceLocalSnapshot(snapshot: LocalSnapshot) {
       await db.execAsync(`
       DELETE FROM debt_history;
       DELETE FROM interest_postings;
+      DELETE FROM transfers;
       DELETE FROM operations;
       DELETE FROM scheduled_flows;
       DELETE FROM planned_expenses;
@@ -1202,6 +1282,15 @@ export function replaceLocalSnapshot(snapshot: LocalSnapshot) {
           account.creditLimit ?? null, account.statementDay ?? null, account.paymentDueDay ?? null,
           account.gracePeriodDays ?? null, account.minimumPaymentPercent ?? null, account.accent,
           maxPayoutByAccount.get(account.id) ?? localToday(),
+        );
+      }
+      for (const transfer of snapshot.transfers) {
+        await db.runAsync(
+          `INSERT INTO transfers (id, from_account_id, to_account_id, from_amount, from_currency, to_amount, to_currency, exchange_rate, note, date, status)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          transfer.id, transfer.fromAccountId, transfer.toAccountId, transfer.fromAmount, transfer.fromCurrency,
+          transfer.toAmount, transfer.toCurrency, transfer.exchangeRate ?? null, transfer.note ?? null,
+          transfer.date, transfer.status,
         );
       }
       for (const flow of snapshot.scheduledFlows) {

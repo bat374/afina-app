@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator, Alert, Image, KeyboardAvoidingView, Modal, Platform, Pressable, ScrollView,
   StyleSheet, Text, TextInput, View,
@@ -9,8 +9,8 @@ import { Ionicons } from '@expo/vector-icons';
 import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
 import { budgets, calendarDays, goals, transactions } from './src/data';
 import { money, percent } from './src/format';
-import { Account, AccountType, Budget, CashFlowKind, CurrencySettings, Debt, DebtDirection, DebtHistory, ExpenseRepeat, FinancialGoal, FinancialOperation, GoalType, InterestSchedule, PlannedExpense, RecurrenceUnit, WithdrawalPolicy } from './src/types';
-import { AccountInput, BudgetInput, createDebt, createOperation, DebtInput, deleteAccount, deleteBudget, deleteFinancialGoal, deletePlannedExpense, extendDebt, FinancialGoalInput, FinancialOperationInput, getCurrencySettings, initializeDatabase, listAccounts, listBudgets, listDebtHistory, listDebts, listFinancialGoals, listOperations, listPlannedExpenses, markDebtOverdue, PlannedExpenseInput, recordDebtPayment, reverseDebtPayment, saveAccount, saveBudget, saveCurrencySettings, saveFinancialGoal, savePlannedExpense, synchronizeInterestPostings, updateDebt } from './src/database';
+import { Account, AccountType, Budget, CashFlowKind, CurrencySettings, Debt, DebtDirection, DebtHistory, ExpenseRepeat, FinancialGoal, FinancialOperation, GoalType, InterestSchedule, PlannedExpense, RecurrenceUnit, Transfer, TransferInput, WithdrawalPolicy } from './src/types';
+import { AccountInput, BudgetInput, createDebt, createOperation, DebtInput, deleteAccount, deleteBudget, deleteFinancialGoal, deletePlannedExpense, extendDebt, FinancialGoalInput, FinancialOperationInput, getCurrencySettings, initializeDatabase, listAccounts, listBudgets, listDebtHistory, listDebts, listFinancialGoals, listOperations, listPlannedExpenses, listTransfers, markDebtOverdue, PlannedExpenseInput, recordDebtPayment, recordTransfer, reverseDebtPayment, reverseTransfer, saveAccount, saveBudget, saveCurrencySettings, saveFinancialGoal, savePlannedExpense, synchronizeInterestPostings, updateDebt } from './src/database';
 import { DetectedAccount, recognizeAccountScreenshot } from './src/ocr';
 import { annualPassiveIncome, buildMonthProjection, getCurrencyTotals } from './src/finance';
 import { consolidatedNetWorth, convertToBase, fetchOfficialCurrencyRates, operationConversionBasis, rebaseRates, weightedAssetRates } from './src/currency';
@@ -275,17 +275,51 @@ function Calendar({ accounts, plannedExpenses, debts, currencySettings, onAddExp
   </ScrollView>;
 }
 
-function Operations({ operations, accounts, onAdd }: { operations: FinancialOperation[]; accounts: Account[]; onAdd: () => void }) {
+type OperationFeedRow = { key: string; date: string; kind: 'operation'; operation: FinancialOperation } | { key: string; date: string; kind: 'transfer'; transfer: Transfer };
+
+function Operations({ operations, transfers, accounts, onAdd, onTransfer, onReverseTransfer }: {
+  operations: FinancialOperation[]; transfers: Transfer[]; accounts: Account[];
+  onAdd: () => void; onTransfer: () => void; onReverseTransfer: (transfer: Transfer) => void;
+}) {
   const [currency, setCurrency] = useState('ALL'); const [accountId, setAccountId] = useState('ALL'); const [category, setCategory] = useState('ALL');
   const [fromDate, setFromDate] = useState(''); const [toDate, setToDate] = useState(''); const [dateTarget, setDateTarget] = useState<'from' | 'to' | null>(null);
-  const currencies = Array.from(new Set(operations.map((item) => item.currency))).sort(); const categories = Array.from(new Set(operations.map((item) => item.category))).sort();
+  const currencies = Array.from(new Set([...operations.map((item) => item.currency), ...transfers.flatMap((item) => [item.fromCurrency, item.toCurrency])])).sort(); const categories = Array.from(new Set(operations.map((item) => item.category))).sort();
   const filtered = operations.filter((item) => (currency === 'ALL' || item.currency === currency) && (accountId === 'ALL' || item.accountId === accountId) && (category === 'ALL' || item.category === category) && (!fromDate || item.date >= fromDate) && (!toDate || item.date <= toDate));
-  return <ScrollView contentContainerStyle={s.page} showsVerticalScrollIndicator={false}><Header eyebrow="ДВИЖЕНИЕ ДЕНЕГ" title="Операции" /><Pressable style={s.planExpenseButton} onPress={onAdd}><Ionicons name="add-circle-outline" size={20} color="white" /><Text style={s.importAccountText}>Добавить операцию</Text></Pressable>
+  // Transfers have no category of their own, so a category filter (which only makes sense for
+  // income/expense) hides them rather than showing them under an unrelated category.
+  const filteredTransfers = category === 'ALL' ? transfers.filter((item) => (currency === 'ALL' || item.fromCurrency === currency || item.toCurrency === currency) && (accountId === 'ALL' || item.fromAccountId === accountId || item.toAccountId === accountId) && (!fromDate || item.date >= fromDate) && (!toDate || item.date <= toDate)) : [];
+  const feed: OperationFeedRow[] = [
+    ...filtered.map((operation) => ({ key: `op-${operation.id}`, date: operation.date, kind: 'operation' as const, operation })),
+    ...filteredTransfers.map((transfer) => ({ key: `tr-${transfer.id}`, date: transfer.date, kind: 'transfer' as const, transfer })),
+  ].sort((a, b) => b.date.localeCompare(a.date));
+  const confirmReverseTransfer = (transfer: Transfer) => {
+    const fromAccount = accounts.find((item) => item.id === transfer.fromAccountId);
+    const toAccount = accounts.find((item) => item.id === transfer.toAccountId);
+    const partialWarning = !fromAccount || !toAccount
+      ? '\n\nОдин из счетов этого перевода удалён — отмена вернёт деньги только на оставшийся счёт.'
+      : '';
+    Alert.alert('Отменить перевод?', `${fromAccount?.name ?? 'Счёт удалён'} → ${toAccount?.name ?? 'Счёт удалён'}, ${money(transfer.fromAmount, false, transfer.fromCurrency)}${partialWarning}`, [
+      { text: 'Не отменять', style: 'cancel' },
+      { text: 'Отменить перевод', style: 'destructive', onPress: () => onReverseTransfer(transfer) },
+    ]);
+  };
+  return <ScrollView contentContainerStyle={s.page} showsVerticalScrollIndicator={false}><Header eyebrow="ДВИЖЕНИЕ ДЕНЕГ" title="Операции" />
+    <View style={s.twoColumns}>
+      <Pressable style={[s.planExpenseButton, { flex: 1 }]} onPress={onAdd}><Ionicons name="add-circle-outline" size={20} color="white" /><Text style={s.importAccountText}>Добавить операцию</Text></Pressable>
+      <Pressable style={[s.planExpenseButton, { flex: 1, backgroundColor: C.blue }]} onPress={onTransfer}><Ionicons name="swap-horizontal-outline" size={20} color="white" /><Text style={s.importAccountText}>Перевод</Text></Pressable>
+    </View>
     <Text style={s.fieldLabel}>ВАЛЮТА</Text><ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={s.currencyRail}>{['ALL', ...currencies].map((item) => <Pressable key={item} style={[s.currencyFilter, currency === item && s.currencyFilterActive]} onPress={() => setCurrency(item)}><Text style={[s.currencyFilterText, currency === item && s.currencyFilterTextActive]}>{item === 'ALL' ? 'Все' : item}</Text></Pressable>)}</ScrollView>
     <Text style={s.fieldLabel}>СЧЁТ</Text><ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={s.currencyRail}>{['ALL', ...accounts.map((item) => item.id)].map((id) => { const account = accounts.find((item) => item.id === id); return <Pressable key={id} style={[s.currencyFilter, accountId === id && s.currencyFilterActive]} onPress={() => setAccountId(id)}><Text style={[s.currencyFilterText, accountId === id && s.currencyFilterTextActive]}>{id === 'ALL' ? 'Все' : account?.name}</Text></Pressable>; })}</ScrollView>
     <Text style={s.fieldLabel}>КАТЕГОРИЯ</Text><ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={s.currencyRail}>{['ALL', ...categories].map((item) => <Pressable key={item} style={[s.currencyFilter, category === item && s.currencyFilterActive]} onPress={() => setCategory(item)}><Text style={[s.currencyFilterText, category === item && s.currencyFilterTextActive]}>{item === 'ALL' ? 'Все' : item}</Text></Pressable>)}</ScrollView>
     <Text style={s.fieldLabel}>ПЕРИОД</Text><View style={s.twoColumns}><View style={{ flex: 1 }}><DateField value={fromDate} onPress={() => setDateTarget('from')} placeholder="С даты" /></View><View style={{ flex: 1 }}><DateField value={toDate} onPress={() => setDateTarget('to')} placeholder="По дату" /></View></View>{(fromDate || toDate) && <Pressable onPress={() => { setFromDate(''); setToDate(''); }}><Text style={s.link}>Сбросить период</Text></Pressable>}
-    <SectionTitle title={`Найдено: ${filtered.length}`} />{filtered.length ? <View style={s.card}>{filtered.map((operation, index) => { const account = accounts.find((item) => item.id === operation.accountId); const cancelled = operation.status === 'reversed'; return <View key={operation.id}><View style={[s.eventRow, cancelled && { opacity: .55 }]}><View style={[s.roundIcon, { backgroundColor: operation.kind === 'income' ? C.sageSoft : C.redSoft }]}><Ionicons name={operation.relatedOperationId ? 'return-down-back-outline' : operation.kind === 'income' ? 'arrow-down-outline' : 'arrow-up-outline'} size={19} color={operation.kind === 'income' ? C.green : C.red} /></View><View style={{ flex: 1 }}><Text style={[s.rowTitle, cancelled && { textDecorationLine: 'line-through' }]}>{operation.title}</Text><Text style={s.rowSub}>{operation.date} · {operation.category} · {account?.name ?? 'Счёт удалён'}{cancelled ? ' · отменено' : operation.relatedOperationId ? ' · обратная проводка' : ''}</Text></View><Text style={operation.kind === 'income' ? s.income : s.expense}>{operation.kind === 'income' ? '+' : '−'}{money(operation.amount, false, operation.currency)}</Text></View>{index < filtered.length - 1 && <View style={s.divider} />}</View>; })}</View> : <View style={s.emptyCard}><Ionicons name="receipt-outline" size={24} color={C.blue} /><Text style={s.emptyTitle}>Операции не найдены</Text><Text style={s.emptyText}>Измените фильтры или добавьте новую операцию</Text></View>}
+    <SectionTitle title={`Найдено: ${feed.length}`} />{feed.length ? <View style={s.card}>{feed.map((row, index) => {
+      if (row.kind === 'transfer') {
+        const transfer = row.transfer; const fromAccount = accounts.find((item) => item.id === transfer.fromAccountId); const toAccount = accounts.find((item) => item.id === transfer.toAccountId); const cancelled = transfer.status === 'reversed';
+        return <Pressable key={row.key} disabled={cancelled} onPress={() => confirmReverseTransfer(transfer)}><View style={[s.eventRow, cancelled && { opacity: .55 }]}><View style={[s.roundIcon, { backgroundColor: `${C.blue}18` }]}><Ionicons name="swap-horizontal-outline" size={19} color={C.blue} /></View><View style={{ flex: 1 }}><Text style={[s.rowTitle, cancelled && { textDecorationLine: 'line-through' }]}>{fromAccount?.name ?? 'Счёт удалён'} → {toAccount?.name ?? 'Счёт удалён'}</Text><Text style={s.rowSub}>{transfer.date} · Перевод{transfer.note ? ` · ${transfer.note}` : ''}{cancelled ? ' · отменено' : ''}</Text></View><Text style={{ color: C.blue, fontWeight: '600' }}>{transfer.fromCurrency === transfer.toCurrency ? money(transfer.fromAmount, false, transfer.fromCurrency) : `${money(transfer.fromAmount, false, transfer.fromCurrency)} → ${money(transfer.toAmount, false, transfer.toCurrency)}`}</Text></View>{index < feed.length - 1 && <View style={s.divider} />}</Pressable>;
+      }
+      const operation = row.operation; const account = accounts.find((item) => item.id === operation.accountId); const cancelled = operation.status === 'reversed';
+      return <View key={row.key}><View style={[s.eventRow, cancelled && { opacity: .55 }]}><View style={[s.roundIcon, { backgroundColor: operation.kind === 'income' ? C.sageSoft : C.redSoft }]}><Ionicons name={operation.relatedOperationId ? 'return-down-back-outline' : operation.kind === 'income' ? 'arrow-down-outline' : 'arrow-up-outline'} size={19} color={operation.kind === 'income' ? C.green : C.red} /></View><View style={{ flex: 1 }}><Text style={[s.rowTitle, cancelled && { textDecorationLine: 'line-through' }]}>{operation.title}</Text><Text style={s.rowSub}>{operation.date} · {operation.category} · {account?.name ?? 'Счёт удалён'}{cancelled ? ' · отменено' : operation.relatedOperationId ? ' · обратная проводка' : ''}</Text></View><Text style={operation.kind === 'income' ? s.income : s.expense}>{operation.kind === 'income' ? '+' : '−'}{money(operation.amount, false, operation.currency)}</Text></View>{index < feed.length - 1 && <View style={s.divider} />}</View>;
+    })}</View> : <View style={s.emptyCard}><Ionicons name="receipt-outline" size={24} color={C.blue} /><Text style={s.emptyTitle}>Операции не найдены</Text><Text style={s.emptyText}>Измените фильтры или добавьте новую операцию</Text></View>}
     <DatePickerModal visible={dateTarget !== null} value={dateTarget === 'to' ? toDate : fromDate} onClose={() => setDateTarget(null)} onSelect={(value) => dateTarget === 'to' ? setToDate(value) : setFromDate(value)} />
   </ScrollView>;
 }
@@ -619,6 +653,96 @@ function OperationEditor({ visible, accounts, onClose, onSave }: { visible: bool
   </ScrollView></KeyboardAvoidingView><DatePickerModal visible={dateOpen} value={date} onClose={() => setDateOpen(false)} onSelect={setDate} /></SafeAreaView></Modal>;
 }
 
+function TransferModal({ visible, accounts, currencySettings, onClose, onSave }: {
+  visible: boolean; accounts: Account[]; currencySettings: CurrencySettings;
+  onClose: () => void; onSave: (input: TransferInput) => Promise<void>;
+}) {
+  const [fromAccountId, setFromAccountId] = useState<string | undefined>();
+  const [toAccountId, setToAccountId] = useState<string | undefined>();
+  const [fromAmount, setFromAmount] = useState<number | undefined>();
+  const [toAmount, setToAmount] = useState<number | undefined>();
+  const [rate, setRate] = useState<number | undefined>();
+  const [date, setDate] = useState(localToday());
+  const [note, setNote] = useState('');
+  const [dateOpen, setDateOpen] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [toAmountTouched, setToAmountTouched] = useState(false);
+  const submitLock = useRef(false);
+
+  useEffect(() => {
+    if (!visible) return;
+    const first = accounts[0]?.id;
+    setFromAccountId(first);
+    setToAccountId(accounts.find((item) => item.id !== first)?.id);
+    setFromAmount(undefined); setToAmount(undefined); setRate(undefined); setToAmountTouched(false);
+    setDate(localToday()); setNote(''); setSaving(false); submitLock.current = false;
+  }, [visible]);
+  // A stale rate/amount from a previous account pair must not silently carry over —
+  // if either side's currency changes, the conversion has to be re-entered.
+  useEffect(() => { setToAmount(undefined); setRate(undefined); setToAmountTouched(false); }, [fromAccountId, toAccountId]);
+
+  const fromAccount = accounts.find((item) => item.id === fromAccountId);
+  const toAccount = accounts.find((item) => item.id === toAccountId);
+  const sameCurrency = !!fromAccount && !!toAccount && fromAccount.currency === toAccount.currency;
+  const sourceRate = fromAccount?.currency === currencySettings.baseCurrency ? 1 : fromAccount ? currencySettings.rates[fromAccount.currency] : undefined;
+  const targetRate = toAccount?.currency === currencySettings.baseCurrency ? 1 : toAccount ? currencySettings.rates[toAccount.currency] : undefined;
+  const automaticRate = !sameCurrency && sourceRate && targetRate ? sourceRate / targetRate : undefined;
+  const round = (value: number) => Math.round(value * 1e6) / 1e6;
+
+  const changeFromAmount = (value?: number) => {
+    setFromAmount(value);
+    if (sameCurrency) { setToAmount(value); return; }
+    // Don't overwrite an amount the user typed directly into "сумма зачисления" — that can
+    // happen if they filled it in before this field, and clobbering it would silently save a
+    // different number than what they last entered.
+    if (toAmountTouched) return;
+    const effectiveRate = rate ?? automaticRate;
+    if (value !== undefined && effectiveRate) setToAmount(round(value * effectiveRate));
+  };
+  const changeToAmount = (value?: number) => {
+    setToAmount(value);
+    setToAmountTouched(true);
+    if (sameCurrency) { setFromAmount(value); return; }
+    if (value !== undefined && fromAmount) setRate(round(value / fromAmount));
+  };
+  const changeRate = (value?: number) => {
+    setRate(value);
+    setToAmountTouched(false);
+    if (value !== undefined && fromAmount !== undefined) setToAmount(round(fromAmount * value));
+  };
+
+  const submit = async () => {
+    if (submitLock.current) return;
+    if (!fromAccountId || !toAccountId) { Alert.alert('Выберите счета списания и зачисления'); return; }
+    if (!fromAmount || fromAmount <= 0) { Alert.alert('Укажите сумму списания'); return; }
+    const finalToAmount = sameCurrency ? fromAmount : toAmount;
+    if (!finalToAmount || finalToAmount <= 0) { Alert.alert('Укажите курс или сумму зачисления'); return; }
+    submitLock.current = true;
+    setSaving(true);
+    try {
+      await onSave({
+        fromAccountId, toAccountId, fromAmount, toAmount: finalToAmount,
+        exchangeRate: sameCurrency ? undefined : rate ?? automaticRate, note: note.trim() || undefined, date,
+      });
+    } finally { setSaving(false); submitLock.current = false; }
+  };
+
+  return <Modal visible={visible} animationType="slide" presentationStyle="pageSheet" onRequestClose={onClose}><SafeAreaView style={s.modal} edges={['top', 'bottom']}><View style={s.modalHead}><Pressable onPress={onClose} style={s.close}><Ionicons name="close" size={22} color={C.ink} /></Pressable><Text style={s.modalTitle}>Перевод между счетами</Text><View style={{ width: 40 }} /></View><KeyboardAvoidingView style={{ flex: 1 }} behavior={Platform.OS === 'ios' ? 'padding' : 'height'}><ScrollView contentContainerStyle={s.formBody} keyboardShouldPersistTaps="handled" keyboardDismissMode="on-drag" automaticallyAdjustKeyboardInsets>
+    <Text style={s.fieldLabel}>СЧЁТ СПИСАНИЯ</Text><View style={s.targetList}>{accounts.map((item) => <Pressable key={item.id} style={[s.targetAccount, fromAccountId === item.id && s.targetAccountActive]} onPress={() => { setFromAccountId(item.id); if (item.id === toAccountId) setToAccountId(undefined); }}><Text style={s.targetAccountText}>{item.name} · {item.currency}</Text><Text style={s.rowSub}>{money(item.balance, false, item.currency)}</Text></Pressable>)}</View>
+    <Text style={s.fieldLabel}>СЧЁТ ЗАЧИСЛЕНИЯ</Text><View style={s.targetList}>{accounts.filter((item) => item.id !== fromAccountId).map((item) => <Pressable key={item.id} style={[s.targetAccount, toAccountId === item.id && s.targetAccountActive]} onPress={() => setToAccountId(item.id)}><Text style={s.targetAccountText}>{item.name} · {item.currency}</Text><Text style={s.rowSub}>{money(item.balance, false, item.currency)}</Text></Pressable>)}</View>
+    <Text style={s.fieldLabel}>СУММА СПИСАНИЯ{fromAccount ? ` · ${fromAccount.currency}` : ''}</Text><DecimalInput value={fromAmount} onChange={changeFromAmount} placeholder="0,00" />
+    {!sameCurrency && fromAccount && toAccount && <>
+      <Text style={s.fieldLabel}>КУРС · 1 {fromAccount.currency} В {toAccount.currency}</Text>
+      <DecimalInput value={rate} onChange={changeRate} placeholder={automaticRate ? `Автоматически: ${automaticRate.toFixed(6)}` : 'Введите курс'} />
+      <Text style={s.helperText}>{rate ? 'Используется указанный вручную курс.' : automaticRate ? `Будет использован сохранённый курс: 1 ${fromAccount.currency} = ${automaticRate.toFixed(6)} ${toAccount.currency}.` : 'Для пересчёта нужен курс — введите его или сумму зачисления вручную.'}</Text>
+      <Text style={s.fieldLabel}>СУММА ЗАЧИСЛЕНИЯ · {toAccount.currency}</Text><DecimalInput value={toAmount} onChange={changeToAmount} placeholder="0,00" />
+    </>}
+    <Text style={s.fieldLabel}>ДАТА</Text><DateField value={date} onPress={() => setDateOpen(true)} />
+    <Text style={s.fieldLabel}>ЗАМЕТКА</Text><TextInput value={note} onChangeText={setNote} placeholder="Необязательно" placeholderTextColor="#9BA9AF" style={s.input} />
+    <Pressable style={[s.primaryButton, saving && { opacity: .6 }]} disabled={saving} onPress={submit}><Text style={s.primaryText}>{saving ? 'Сохраняем…' : 'Перевести'}</Text></Pressable>
+  </ScrollView></KeyboardAvoidingView><DatePickerModal visible={dateOpen} value={date} onClose={() => setDateOpen(false)} onSelect={setDate} /></SafeAreaView></Modal>;
+}
+
 function BudgetEditor({ visible, budget, currencies, onClose, onSave, onDelete }: { visible: boolean; budget: Budget | null; currencies: string[]; onClose: () => void; onSave: (input: BudgetInput) => Promise<void>; onDelete: (budget: Budget) => void }) {
   const [category, setCategory] = useState(''); const [currency, setCurrency] = useState('UZS'); const [limit, setLimit] = useState<number | undefined>();
   useEffect(() => { if (visible) { setCategory(budget?.category ?? ''); setCurrency(budget?.currency ?? currencies[0] ?? 'UZS'); setLimit(budget?.limit); } }, [visible, budget]);
@@ -933,6 +1057,7 @@ function AppContent({ userId }: { userId: string }) {
   const [debtEditorOpen, setDebtEditorOpen] = useState(false);
   const [currencySettingsOpen, setCurrencySettingsOpen] = useState(false);
   const [operationEditorOpen, setOperationEditorOpen] = useState(false);
+  const [transferModalOpen, setTransferModalOpen] = useState(false);
   const [budgetEditorOpen, setBudgetEditorOpen] = useState(false);
   const [goalEditorOpen, setGoalEditorOpen] = useState(false);
   const [editingAccount, setEditingAccount] = useState<Account | null>(null);
@@ -946,6 +1071,7 @@ function AppContent({ userId }: { userId: string }) {
   const [plannedExpenses, setPlannedExpenses] = useState<PlannedExpense[]>([]);
   const [debts, setDebts] = useState<Debt[]>([]);
   const [operations, setOperations] = useState<FinancialOperation[]>([]);
+  const [transfers, setTransfers] = useState<Transfer[]>([]);
   const [userBudgets, setUserBudgets] = useState<Budget[]>([]);
   const [financialGoals, setFinancialGoals] = useState<FinancialGoal[]>([]);
   const [currencySettings, setCurrencySettings] = useState<CurrencySettings>({ baseCurrency: 'UZS', rates: { UZS: 1 }, autoUpdate: true });
@@ -959,6 +1085,7 @@ function AppContent({ userId }: { userId: string }) {
   };
   const reloadCurrencySettings = async () => setCurrencySettings(await getCurrencySettings());
   const reloadOperations = async () => setOperations(await listOperations());
+  const reloadTransfers = async () => setTransfers(await listTransfers());
   const reloadBudgets = async () => setUserBudgets(await listBudgets());
   const reloadGoals = async () => setFinancialGoals(await listFinancialGoals());
 
@@ -973,7 +1100,7 @@ function AppContent({ userId }: { userId: string }) {
         );
       }
       await synchronizeInterestPostings();
-      await Promise.all([reloadAccounts(), reloadExpenses(), reloadDebts(), reloadOperations(), reloadBudgets(), reloadGoals()]);
+      await Promise.all([reloadAccounts(), reloadExpenses(), reloadDebts(), reloadOperations(), reloadTransfers(), reloadBudgets(), reloadGoals()]);
       const stored = await getCurrencySettings(); setCurrencySettings(stored);
       const today = localToday();
       if (stored.autoUpdate !== false && stored.lastUpdated?.slice(0, 10) !== today) {
@@ -994,7 +1121,7 @@ function AppContent({ userId }: { userId: string }) {
       uploadLocalDataToCloud(userId).catch(() => { /* Offline changes remain queued in SQLite. */ });
     }, 1200);
     return () => clearTimeout(timer);
-  }, [databaseReady, userId, userAccounts, plannedExpenses, debts, operations, userBudgets, financialGoals, currencySettings]);
+  }, [databaseReady, userId, userAccounts, plannedExpenses, debts, operations, transfers, userBudgets, financialGoals, currencySettings]);
   useEffect(() => {
     let knownDate = localToday();
     const timer = setInterval(async () => {
@@ -1066,6 +1193,14 @@ function AppContent({ userId }: { userId: string }) {
   const handleDebtOverdue = async () => { if (editingDebt) { await markDebtOverdue(editingDebt.id); await refreshOpenDebt(); } };
   const handleCurrencySettings = async (settings: CurrencySettings) => { await saveCurrencySettings(settings); await reloadCurrencySettings(); setCurrencySettingsOpen(false); };
   const handleCreateOperation = async (input: FinancialOperationInput) => { await createOperation(input); await Promise.all([reloadOperations(), reloadAccounts()]); setOperationEditorOpen(false); };
+  const handleCreateTransfer = async (input: TransferInput) => {
+    try { await recordTransfer(input); await Promise.all([reloadTransfers(), reloadAccounts()]); setTransferModalOpen(false); }
+    catch (error) { Alert.alert('Не удалось выполнить перевод', error instanceof Error ? error.message : 'Проверьте счета и суммы.'); }
+  };
+  const handleReverseTransfer = async (transfer: Transfer) => {
+    try { await reverseTransfer(transfer.id); await Promise.all([reloadTransfers(), reloadAccounts()]); }
+    catch (error) { Alert.alert('Не удалось отменить перевод', error instanceof Error ? error.message : 'Попробуйте ещё раз.'); }
+  };
   const openNewBudget = () => { setEditingBudget(null); setBudgetEditorOpen(true); };
   const openBudget = (budget: Budget) => { setEditingBudget(budget); setBudgetEditorOpen(true); };
   const handleSaveBudget = async (input: BudgetInput) => { await saveBudget(input, editingBudget?.id); await reloadBudgets(); setBudgetEditorOpen(false); };
@@ -1079,7 +1214,7 @@ function AppContent({ userId }: { userId: string }) {
   const screen = useMemo(() => {
     if (tab === 'accounts') return <Accounts accounts={userAccounts} onAdd={openNewAccount} onImport={() => setImportOpen(true)} onEdit={openAccount} debts={debts} onAddDebt={openNewDebt} onOpenDebt={openDebt} currencySettings={currencySettings} onCurrencySettings={() => setCurrencySettingsOpen(true)} />;
     if (tab === 'calendar') return <Calendar accounts={userAccounts} plannedExpenses={plannedExpenses} debts={debts} currencySettings={currencySettings} onAddExpense={openNewExpense} onEditExpense={openExpense} />;
-    if (tab === 'operations') return <Operations operations={operations} accounts={userAccounts} onAdd={() => setOperationEditorOpen(true)} />;
+    if (tab === 'operations') return <Operations operations={operations} transfers={transfers} accounts={userAccounts} onAdd={() => setOperationEditorOpen(true)} onTransfer={() => setTransferModalOpen(true)} onReverseTransfer={handleReverseTransfer} />;
     if (tab === 'analytics') return <Analytics accounts={userAccounts} plannedExpenses={plannedExpenses} debts={debts} currencySettings={currencySettings} operations={operations} userBudgets={userBudgets} financialGoals={financialGoals} onAddBudget={openNewBudget} onEditBudget={openBudget} onAddGoal={openNewGoal} onEditGoal={openGoal} />;
     return <Home onImport={() => setImportOpen(true)} go={setTab} accounts={userAccounts} plannedExpenses={plannedExpenses} debts={debts} currencySettings={currencySettings} onCurrencySettings={() => setCurrencySettingsOpen(true)} />;
   }, [tab, userAccounts, plannedExpenses, debts, currencySettings, operations, userBudgets, financialGoals]);
@@ -1093,6 +1228,7 @@ function AppContent({ userId }: { userId: string }) {
     <DebtEditor visible={debtEditorOpen} debt={editingDebt} history={debtHistory} accounts={userAccounts} currencySettings={currencySettings} onClose={() => setDebtEditorOpen(false)} onCreate={handleCreateDebt} onUpdate={handleUpdateDebt} onPayment={handleDebtPayment} onReversePayment={handleReverseDebtPayment} onExtend={handleDebtExtension} onOverdue={handleDebtOverdue} />
     <CurrencySettingsEditor visible={currencySettingsOpen} currencies={usedCurrencies} settings={currencySettings} onClose={() => setCurrencySettingsOpen(false)} onSave={handleCurrencySettings} />
     <OperationEditor visible={operationEditorOpen} accounts={userAccounts} onClose={() => setOperationEditorOpen(false)} onSave={handleCreateOperation} />
+    <TransferModal visible={transferModalOpen} accounts={userAccounts} currencySettings={currencySettings} onClose={() => setTransferModalOpen(false)} onSave={handleCreateTransfer} />
     <BudgetEditor visible={budgetEditorOpen} budget={editingBudget} currencies={usedCurrencies} onClose={() => setBudgetEditorOpen(false)} onSave={handleSaveBudget} onDelete={handleDeleteBudget} />
     <GoalEditor visible={goalEditorOpen} goal={editingGoal} accounts={userAccounts} debts={debts} onClose={() => setGoalEditorOpen(false)} onSave={handleSaveGoal} onDelete={handleDeleteGoal} />
   </SafeAreaView>;
