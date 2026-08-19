@@ -6,6 +6,13 @@ type SyncResult = { uploaded: boolean; reason?: string };
 const compact = <T extends Record<string, unknown>>(row: T) =>
   Object.fromEntries(Object.entries(row).filter(([, value]) => value !== undefined));
 
+// A nullable date field can end up as '' in local SQLite (a plain TEXT column, so nothing
+// stops it) from data entered by an older app version or an edge case that skipped the '' →
+// undefined sanitizing the current UI does before saving. Postgres 'date' columns reject ''
+// outright ("invalid input syntax for type date"), which fails the entire sync — not just that
+// one row — so this is applied at the sync boundary regardless of where the '' came from.
+const dateOrNull = (value?: string | null) => (value ? value : null);
+
 async function upsertOwnedTable(table: string, userId: string, rows: Record<string, unknown>[]) {
   if (!supabase) throw new Error('Supabase is not configured');
   const normalized = rows.map((row) => compact({ ...row, user_id: userId }));
@@ -30,11 +37,11 @@ async function deleteMissingOwnedRows(table: string, localIds: string[]) {
 const accountRows = (snapshot: LocalSnapshot) => snapshot.accounts.map((account) => ({
   id: account.id, name: account.name, subtitle: account.subtitle, type: account.type,
   balance: account.balance, currency: account.currency, rate: account.rate ?? null,
-  rate_caption: account.rateCaption ?? null, start_date: account.startDate ?? null,
-  maturity_date: account.maturityDate ?? null, interest_schedule: account.interestSchedule ?? null,
+  rate_caption: account.rateCaption ?? null, start_date: dateOrNull(account.startDate),
+  maturity_date: dateOrNull(account.maturityDate), interest_schedule: account.interestSchedule ?? null,
   interest_destination: account.interestDestination ?? null,
   destination_account_id: account.destinationAccountId ?? null,
-  next_interest_date: account.nextInterestDate ?? null, auto_renewal: account.autoRenewal ?? false,
+  next_interest_date: dateOrNull(account.nextInterestDate), auto_renewal: account.autoRenewal ?? false,
   rate_review_reminder: account.rateReviewReminder ?? true,
   withdrawal_policy: account.withdrawalPolicy ?? null, minimum_balance: account.minimumBalance ?? null,
   replenishment_allowed: account.replenishmentAllowed ?? null, credit_limit: account.creditLimit ?? null,
@@ -62,11 +69,11 @@ async function runUpload(userId: string): Promise<SyncResult> {
   await upsertOwnedTable('scheduled_flows', userId, snapshot.scheduledFlows.map((flow) => ({
     id: flow.id, title: flow.title, category: flow.category, amount: flow.amount,
     currency: flow.currency, account_id: flow.accountId ?? null, start_date: flow.startDate,
-    end_date: flow.endDate ?? null, repeat_rule: flow.repeat, kind: flow.kind,
+    end_date: dateOrNull(flow.endDate), repeat_rule: flow.repeat, kind: flow.kind,
     repeat_interval: flow.repeatInterval ?? 1, repeat_unit: flow.repeatUnit ?? null,
     weekdays: flow.weekdays ?? null, exchange_rate: flow.exchangeRate ?? null,
     source_transaction_id: flow.sourceTransactionId ?? null,
-    occurrences_tracking_from: flow.occurrencesTrackingFrom ?? null,
+    occurrences_tracking_from: dateOrNull(flow.occurrencesTrackingFrom),
   })));
   await upsertOwnedTable('transfers', userId, snapshot.transfers.map((transfer) => ({
     id: transfer.id, from_account_id: transfer.fromAccountId, to_account_id: transfer.toAccountId,
@@ -104,7 +111,7 @@ async function runUpload(userId: string): Promise<SyncResult> {
   })));
   await upsertOwnedTable('debt_history', userId, snapshot.debtHistory.map((event) => ({
     id: event.id, debt_id: event.debtId, type: event.type, amount: event.amount ?? null,
-    from_date: event.fromDate ?? null, to_date: event.toDate ?? null, occurred_at: event.occurredAt,
+    from_date: dateOrNull(event.fromDate), to_date: dateOrNull(event.toDate), occurred_at: event.occurredAt,
     note: event.note ?? null, operation_id: event.operationId ?? null,
     related_history_id: event.relatedHistoryId ?? null,
   })));

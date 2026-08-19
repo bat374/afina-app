@@ -30,6 +30,17 @@ const C = {
   redSoft: '#F9E8E4', navy: '#263C4A', sageSoft: '#E9EEE8',
 };
 
+// Supabase/PostgREST errors are plain objects ({message, code, details, hint}), not instances of
+// the native Error class, so `error instanceof Error` misses them and silently hides the actual
+// cause of a failed cloud operation. This covers both shapes.
+const describeError = (error: unknown): string | undefined => {
+  if (error instanceof Error) return error.message;
+  if (error && typeof error === 'object' && 'message' in error && typeof (error as { message: unknown }).message === 'string') {
+    return (error as { message: string }).message;
+  }
+  return undefined;
+};
+
 const iconForType: Record<AccountType, keyof typeof Ionicons.glyphMap> = {
   card: 'card-outline', credit_card: 'card-outline', savings: 'leaf-outline', deposit: 'time-outline', cash: 'wallet-outline',
 };
@@ -1166,9 +1177,10 @@ function AppContent({ userId }: { userId: string }) {
       try {
         await initializeCloudData(userId);
       } catch (error) {
+        const message = describeError(error);
         Alert.alert(
           'Облако временно недоступно',
-          `Данные на телефоне сохранены. Афина повторит синхронизацию позже.${error instanceof Error ? `\n\n${error.message}` : ''}`,
+          `Данные на телефоне сохранены. Афина повторит синхронизацию позже.${message ? `\n\n${message}` : ''}`,
         );
       }
       await synchronizeInterestPostings();
@@ -1185,7 +1197,7 @@ function AppContent({ userId }: { userId: string }) {
       setDatabaseReady(true);
     }).catch((error) => Alert.alert(
       'Не удалось открыть локальную базу',
-      `Перезапустите приложение и попробуйте снова. Если не помогает — проверьте свободное место на устройстве.${error instanceof Error ? `\n\n${error.message}` : ''}`,
+      `Перезапустите приложение и попробуйте снова. Если не помогает — проверьте свободное место на устройстве.${describeError(error) ? `\n\n${describeError(error)}` : ''}`,
     ));
   }, [userId]);
   useEffect(() => {
@@ -1246,7 +1258,7 @@ function AppContent({ userId }: { userId: string }) {
   const handleDebtPayment = async (amount: number, date: string, accountId?: string, exchangeRate?: number, note?: string) => {
     if (!editingDebt) return;
     if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) { Alert.alert('Проверьте дату погашения'); return; }
-    const execute = async () => { try { await recordDebtPayment(editingDebt.id, amount, date, accountId ?? null, exchangeRate, note); await refreshOpenDebt(); } catch (error) { Alert.alert('Не удалось записать погашение', error instanceof Error ? error.message : 'Проверьте валютные курсы.'); } };
+    const execute = async () => { try { await recordDebtPayment(editingDebt.id, amount, date, accountId ?? null, exchangeRate, note); await refreshOpenDebt(); } catch (error) { Alert.alert('Не удалось записать погашение', describeError(error) ?? 'Проверьте валютные курсы.'); } };
     if (Math.abs(amount - editingDebt.currentBalance) < 0.000001) {
       const account = userAccounts.find((item) => item.id === accountId);
       Alert.alert('Полностью погасить долг?', `${money(amount, false, editingDebt.currency)}${account ? ` · ${account.name}` : ' · без движения по счёту'}`, [{ text: 'Отмена', style: 'cancel' }, { text: 'Погасить', onPress: execute }]);
@@ -1256,7 +1268,7 @@ function AppContent({ userId }: { userId: string }) {
     if (!editingDebt || event.amount === undefined) return;
     Alert.alert('Отменить погашение?', `${money(event.amount, false, editingDebt.currency)} вернётся в остаток долга. Баланс связанного счёта будет исправлен обратной проводкой.`, [
       { text: 'Не отменять', style: 'cancel' },
-      { text: 'Отменить погашение', style: 'destructive', onPress: async () => { try { await reverseDebtPayment(editingDebt.id, event.id, fallbackAccountId); await refreshOpenDebt(); } catch (error) { Alert.alert('Не удалось отменить погашение', error instanceof Error ? error.message : 'Проверьте данные операции.'); } } },
+      { text: 'Отменить погашение', style: 'destructive', onPress: async () => { try { await reverseDebtPayment(editingDebt.id, event.id, fallbackAccountId); await refreshOpenDebt(); } catch (error) { Alert.alert('Не удалось отменить погашение', describeError(error) ?? 'Проверьте данные операции.'); } } },
     ]);
   };
   const handleDebtExtension = async (date: string, note?: string) => {
@@ -1269,11 +1281,11 @@ function AppContent({ userId }: { userId: string }) {
   const handleCreateOperation = async (input: FinancialOperationInput) => { await createOperation(input); await Promise.all([reloadOperations(), reloadAccounts()]); setOperationEditorOpen(false); };
   const handleCreateTransfer = async (input: TransferInput) => {
     try { await recordTransfer(input); await Promise.all([reloadTransfers(), reloadAccounts()]); setTransferModalOpen(false); }
-    catch (error) { Alert.alert('Не удалось выполнить перевод', error instanceof Error ? error.message : 'Проверьте счета и суммы.'); }
+    catch (error) { Alert.alert('Не удалось выполнить перевод', describeError(error) ?? 'Проверьте счета и суммы.'); }
   };
   const handleReverseTransfer = async (transfer: Transfer) => {
     try { await reverseTransfer(transfer.id); await Promise.all([reloadTransfers(), reloadAccounts()]); }
-    catch (error) { Alert.alert('Не удалось отменить перевод', error instanceof Error ? error.message : 'Попробуйте ещё раз.'); }
+    catch (error) { Alert.alert('Не удалось отменить перевод', describeError(error) ?? 'Попробуйте ещё раз.'); }
   };
   const handleOpenOccurrence = (occurrence: PlannedOccurrence, flow: PlannedExpense) => setExecutingOccurrence({ occurrence, flow });
   const handleExecuteOccurrence = async (input: PlannedExecutionInput) => {
@@ -1282,7 +1294,7 @@ function AppContent({ userId }: { userId: string }) {
       await executePlannedOccurrence(executingOccurrence.occurrence.id, input);
       await Promise.all([reloadPlannedOccurrences(), reloadOperations(), reloadAccounts()]);
       setExecutingOccurrence(null);
-    } catch (error) { Alert.alert('Не удалось провести событие', error instanceof Error ? error.message : 'Попробуйте ещё раз.'); }
+    } catch (error) { Alert.alert('Не удалось провести событие', describeError(error) ?? 'Попробуйте ещё раз.'); }
   };
   const handleCancelOccurrence = (occurrence: PlannedOccurrence) => {
     Alert.alert('Отменить плановое событие?', 'Операция создана не будет.', [
