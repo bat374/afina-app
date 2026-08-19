@@ -10,6 +10,8 @@ outputs/
 *.keystore
 *.p12
 *.mobileprovision
+credentials.json
+credentials/
 *.db
 *.db-*
 *.sqlite

@@ -1,9 +1,12 @@
 name: Build Android APK
 
-# Free alternative to EAS Build: runs entirely on GitHub's own Ubuntu runners
-# (no macOS needed for Android), produces a debug-signed APK installable by
-# sideloading directly on a phone. Trigger manually from the Actions tab, or
-# it runs automatically on every push to main.
+# Free alternative to EAS Build's cloud queue: runs `eas build --local` on GitHub's own Ubuntu
+# runners (no macOS needed for Android). This still uses the project's real EAS-managed signing
+# keystore (fetched live via EXPO_TOKEN, same identity as any past `eas build`), so the result
+# installs as a normal update over an existing install instead of requiring an uninstall — unlike
+# a bare `expo prebuild` + `gradlew assembleDebug`, which signs with a throwaway debug key that
+# can never match a real install. Local execution isn't billed against EAS Build's cloud quota.
+# Trigger manually from the Actions tab, or it runs automatically on every push to main.
 on:
   workflow_dispatch:
   push:
@@ -15,6 +18,7 @@ jobs:
     env:
       EXPO_PUBLIC_SUPABASE_URL: ${{ secrets.EXPO_PUBLIC_SUPABASE_URL }}
       EXPO_PUBLIC_SUPABASE_ANON_KEY: ${{ secrets.EXPO_PUBLIC_SUPABASE_ANON_KEY }}
+      EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
     steps:
       - uses: actions/checkout@v4
 
@@ -49,20 +53,19 @@ jobs:
           key: gradle-${{ hashFiles('android/gradle/wrapper/gradle-wrapper.properties') }}
           restore-keys: gradle-
 
-      # Managed (CNG) project: no android/ directory is committed, so it's
-      # generated fresh on every run from app.json + the installed plugins.
-      - name: Generate native Android project
-        run: npx expo prebuild --platform android --no-install
-
-      - name: Build debug APK
-        working-directory: android
-        run: ./gradlew assembleDebug --no-daemon
+      - name: Build signed APK (eas build --local)
+        run: |
+          if [ -z "$EXPO_TOKEN" ]; then
+            echo "EXPO_TOKEN not set — cannot fetch signing credentials. Add it as a repo secret."
+            exit 1
+          fi
+          npx eas-cli build --local --platform android --profile preview --non-interactive --output ./afina.apk
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: afina-debug-apk
-          path: android/app/build/outputs/apk/debug/app-debug.apk
+          name: afina-apk
+          path: afina.apk
           retention-days: 30
 
       # OTA (expo-updates): pushes JS/asset-only changes to already-installed apps without a new
@@ -72,7 +75,6 @@ jobs:
       # harmlessly if it isn't set yet.
       - name: Publish OTA update
         env:
-          EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
           # Passed as an env var, not interpolated directly into the script: a commit message can
           # contain newlines or shell metacharacters, and ${{ }} expressions are substituted
           # textually before bash ever sees the line — that's a known script-injection vector, and
