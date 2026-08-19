@@ -36,7 +36,12 @@ export function summarizeOperations(operations: FinancialOperation[], currency: 
     if (operation.kind === 'income') income += converted; else expense += converted;
     if (operation.kind === 'income' && operation.source === 'interest') {
       passive += converted;
-      byInterestAccount[operation.accountId] = (byInterestAccount[operation.accountId] ?? 0) + converted;
+      // Attribute to the account that actually earned the interest, not the one that received
+      // it — for interestDestination='other' those differ, and the receiving account's own rate
+      // has nothing to do with this income. Falls back to accountId for operations recorded
+      // before this field existed.
+      const earningAccountId = operation.interestSourceAccountId ?? operation.accountId;
+      byInterestAccount[earningAccountId] = (byInterestAccount[earningAccountId] ?? 0) + converted;
     }
   }
   return { income, expense, passive, byInterestAccount, missing: [...missing] };

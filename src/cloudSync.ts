@@ -97,6 +97,7 @@ async function runUpload(userId: string): Promise<SyncResult> {
     status: operation.status ?? 'posted',
     source_occurrence_id: operation.sourceOccurrenceId ?? null,
     planned_amount: operation.plannedAmount ?? null, planned_currency: operation.plannedCurrency ?? null,
+    interest_source_account_id: operation.interestSourceAccountId ?? null,
   })));
   // Must come after 'operations': interest_postings.operation_id references it.
   await upsertOwnedTable('interest_postings', userId, snapshot.interestPostings.map((posting) => ({
@@ -220,6 +221,7 @@ export async function downloadCloudData(userId: string): Promise<LocalSnapshot> 
       status: row.status,
       sourceOccurrenceId: row.source_occurrence_id ?? undefined,
       plannedAmount: numberOrUndefined(row.planned_amount), plannedCurrency: row.planned_currency ?? undefined,
+      interestSourceAccountId: row.interest_source_account_id ?? undefined,
     })),
     debtHistory: historyRows.map((row) => ({
       id: row.id, debtId: row.debt_id, type: row.type, amount: numberOrUndefined(row.amount),

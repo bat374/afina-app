@@ -157,6 +157,12 @@ export type FinancialOperation = {
   sourceOccurrenceId?: string;
   plannedAmount?: number;
   plannedCurrency?: string;
+  // Set only when source === 'interest': the deposit/savings account the interest was actually
+  // earned on — accountId is where the money landed, which for interestDestination='other' is a
+  // different account entirely. Attribution (which account "owns" this income, at what rate)
+  // must follow this field, not accountId, or a payout card ends up mislabeled with its own 0%
+  // rate next to money it merely received.
+  interestSourceAccountId?: string;
 };
 
 export type InterestPosting = {

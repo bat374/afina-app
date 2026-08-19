@@ -410,6 +410,7 @@ async function initializeDatabaseCore() {
     ['debt_id', 'TEXT'], ['related_operation_id', 'TEXT'], ['account_amount', 'REAL'],
     ['account_currency', 'TEXT'], ["status", "TEXT NOT NULL DEFAULT 'posted'"],
     ['source_occurrence_id', 'TEXT'], ['planned_amount', 'REAL'], ['planned_currency', 'TEXT'],
+    ['interest_source_account_id', 'TEXT'],
   ] as const;
   for (const [name, sqlType] of operationExtras) {
     if (!operationColumns.some((column) => column.name === name)) await db.execAsync(`ALTER TABLE operations ADD COLUMN ${name} ${sqlType};`);
@@ -1011,6 +1012,7 @@ async function listOperationsCore(): Promise<FinancialOperation[]> {
     debt_id: string | null; related_operation_id: string | null; account_amount: number | null;
     account_currency: string | null; status: 'posted' | 'reversed' | null;
     source_occurrence_id: string | null; planned_amount: number | null; planned_currency: string | null;
+    interest_source_account_id: string | null;
   }>('SELECT * FROM operations ORDER BY date DESC, created_at DESC');
   return rows.map((row) => ({
     id: row.id, title: row.title, category: row.category, amount: row.amount, currency: row.currency,
@@ -1020,6 +1022,7 @@ async function listOperationsCore(): Promise<FinancialOperation[]> {
     status: row.status ?? 'posted',
     sourceOccurrenceId: row.source_occurrence_id ?? undefined,
     plannedAmount: row.planned_amount ?? undefined, plannedCurrency: row.planned_currency ?? undefined,
+    interestSourceAccountId: row.interest_source_account_id ?? undefined,
   }));
 }
 
@@ -1096,9 +1099,9 @@ export function synchronizeInterestPostings(today = localToday()) {
           const operationId = makeId();
           await db.runAsync('UPDATE accounts SET balance = balance + ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?', creditedAmount, destinationId);
           await db.runAsync(
-            `INSERT INTO operations (id, title, category, amount, currency, account_id, date, kind, source)
-           VALUES (?, ?, 'Проценты', ?, ?, ?, ?, 'income', 'interest')`,
-            operationId, `Проценты · ${account.name}`, creditedAmount, destinationCurrency, destinationId, payoutDate,
+            `INSERT INTO operations (id, title, category, amount, currency, account_id, date, kind, source, interest_source_account_id)
+           VALUES (?, ?, 'Проценты', ?, ?, ?, ?, 'income', 'interest', ?)`,
+            operationId, `Проценты · ${account.name}`, creditedAmount, destinationCurrency, destinationId, payoutDate, account.id,
           );
           await db.runAsync('UPDATE interest_postings SET operation_id = ? WHERE id = ?', operationId, postingId);
         });
@@ -1480,13 +1483,14 @@ export function replaceLocalSnapshot(snapshot: LocalSnapshot) {
         await db.runAsync(
           `INSERT INTO operations (id, title, category, amount, currency, account_id, date, kind, source,
           debt_id, related_operation_id, account_amount, account_currency, status,
-          source_occurrence_id, planned_amount, planned_currency)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          source_occurrence_id, planned_amount, planned_currency, interest_source_account_id)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           operation.id, operation.title, operation.category, operation.amount, operation.currency,
           operation.accountId, operation.date, operation.kind, operation.source, operation.debtId ?? null,
           operation.relatedOperationId ?? null, operation.accountAmount ?? null,
           operation.accountCurrency ?? null, operation.status ?? 'posted',
           operation.sourceOccurrenceId ?? null, operation.plannedAmount ?? null, operation.plannedCurrency ?? null,
+          operation.interestSourceAccountId ?? null,
         );
       }
       for (const occurrence of snapshot.plannedOccurrences) {

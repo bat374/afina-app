@@ -13,7 +13,7 @@ import { Account, AccountType, Budget, CashFlowKind, CurrencySettings, Debt, Deb
 import { AccountInput, BudgetInput, cancelPlannedOccurrence, createDebt, createOperation, DebtInput, deleteAccount, deleteBudget, deleteFinancialGoal, deletePlannedExpense, executePlannedOccurrence, extendDebt, FinancialGoalInput, FinancialOperationInput, getCurrencySettings, initializeDatabase, listAccounts, listBudgets, listDebtHistory, listDebts, listFinancialGoals, listOperations, listPlannedExpenses, listPlannedOccurrences, listTransfers, markDebtOverdue, PlannedExpenseInput, recordDebtPayment, recordTransfer, reverseDebtPayment, reverseTransfer, saveAccount, saveBudget, saveCurrencySettings, saveFinancialGoal, savePlannedExpense, synchronizeInterestPostings, synchronizePlannedOccurrences, updateDebt } from './src/database';
 import { DetectedAccount, recognizeAccountScreenshot } from './src/ocr';
 import { annualPassiveIncome, buildMonthProjection, getCurrencyTotals } from './src/finance';
-import { consolidatedNetWorth, convertToBase, fetchOfficialCurrencyRates, operationConversionBasis, rebaseRates, weightedAssetRates } from './src/currency';
+import { consolidatedNetWorth, convertCurrency, convertToBase, fetchOfficialCurrencyRates, operationConversionBasis, rebaseRates, weightedAssetRates } from './src/currency';
 import { calculateGoalProgress } from './src/goals';
 import { localToday, nextMonthlyDate, toLocalIso } from './src/date';
 import { recurrenceLabel } from './src/recurrence';
@@ -781,27 +781,44 @@ function TransferModal({ visible, accounts, currencySettings, onClose, onSave }:
   </ScrollView></KeyboardAvoidingView><DatePickerModal visible={dateOpen} value={date} onClose={() => setDateOpen(false)} onSelect={setDate} /></SafeAreaView></Modal>;
 }
 
-function ExecuteOccurrenceModal({ visible, occurrence, flow, accounts, onClose, onExecute }: {
-  visible: boolean; occurrence: PlannedOccurrence | null; flow: PlannedExpense | null; accounts: Account[];
+function ExecuteOccurrenceModal({ visible, occurrence, flow, accounts, currencySettings, onClose, onExecute }: {
+  visible: boolean; occurrence: PlannedOccurrence | null; flow: PlannedExpense | null; accounts: Account[]; currencySettings: CurrencySettings;
   onClose: () => void; onExecute: (input: PlannedExecutionInput) => Promise<void>;
 }) {
   const [title, setTitle] = useState(''); const [category, setCategory] = useState('');
   const [amount, setAmount] = useState<number | undefined>(); const [currency, setCurrency] = useState('UZS');
   const [date, setDate] = useState(localToday()); const [accountId, setAccountId] = useState<string | undefined>();
   const [saving, setSaving] = useState(false); const [dateOpen, setDateOpen] = useState(false);
+  // Defaulting the fact amount to the plan's raw number when the fact currency differs (e.g. a
+  // plan in USD executed into a RUB account) would silently treat 1 USD as 1 RUB — convert using
+  // the current stored rate instead, and only fall back to the unconverted number when no rate is
+  // available at all, so the user is never shown a default that quietly assumes parity.
+  const defaultAmountFor = (targetCurrency: string) => {
+    if (!occurrence) return undefined;
+    if (targetCurrency === occurrence.currency) return occurrence.amount;
+    const converted = convertCurrency(occurrence.amount, occurrence.currency, targetCurrency, currencySettings);
+    return converted === null ? occurrence.amount : Math.round(converted * 100) / 100;
+  };
   useEffect(() => {
     if (!visible || !flow || !occurrence) return;
     const initialAccount = accounts.find((item) => item.id === flow.accountId);
-    setTitle(flow.title); setCategory(flow.category); setAmount(occurrence.amount);
     // The fact currency always follows the selected account, never the plan's currency — that's
     // the actual point of this feature (the two are allowed to differ), and it's what keeps a
     // cross-currency mismatch from ever reaching the balance update in executePlannedOccurrence.
-    setCurrency(initialAccount?.currency ?? occurrence.currency);
+    const initialCurrency = initialAccount?.currency ?? occurrence.currency;
+    setTitle(flow.title); setCategory(flow.category);
+    setAmount(defaultAmountFor(initialCurrency));
+    setCurrency(initialCurrency);
     setDate(occurrence.occurrenceDate); setAccountId(flow.accountId); setSaving(false);
   }, [visible, flow, occurrence]);
   if (!flow || !occurrence) return null;
   const account = accounts.find((item) => item.id === accountId);
-  const selectAccount = (item: Account | undefined) => { setAccountId(item?.id); setCurrency(item?.currency ?? currency); };
+  const selectAccount = (item: Account | undefined) => {
+    setAccountId(item?.id);
+    const nextCurrency = item?.currency ?? currency;
+    setCurrency(nextCurrency);
+    setAmount(defaultAmountFor(nextCurrency));
+  };
   const submit = async () => {
     if (!title.trim() || !amount || amount <= 0) { Alert.alert('Укажите название и сумму'); return; }
     setSaving(true);
@@ -1330,7 +1347,7 @@ function AppContent({ userId }: { userId: string }) {
     <CurrencySettingsEditor visible={currencySettingsOpen} currencies={usedCurrencies} settings={currencySettings} onClose={() => setCurrencySettingsOpen(false)} onSave={handleCurrencySettings} />
     <OperationEditor visible={operationEditorOpen} accounts={userAccounts} onClose={() => setOperationEditorOpen(false)} onSave={handleCreateOperation} />
     <TransferModal visible={transferModalOpen} accounts={userAccounts} currencySettings={currencySettings} onClose={() => setTransferModalOpen(false)} onSave={handleCreateTransfer} />
-    <ExecuteOccurrenceModal visible={!!executingOccurrence} occurrence={executingOccurrence?.occurrence ?? null} flow={executingOccurrence?.flow ?? null} accounts={userAccounts} onClose={() => setExecutingOccurrence(null)} onExecute={handleExecuteOccurrence} />
+    <ExecuteOccurrenceModal visible={!!executingOccurrence} occurrence={executingOccurrence?.occurrence ?? null} flow={executingOccurrence?.flow ?? null} accounts={userAccounts} currencySettings={currencySettings} onClose={() => setExecutingOccurrence(null)} onExecute={handleExecuteOccurrence} />
     <BudgetEditor visible={budgetEditorOpen} budget={editingBudget} currencies={usedCurrencies} onClose={() => setBudgetEditorOpen(false)} onSave={handleSaveBudget} onDelete={handleDeleteBudget} />
     <GoalEditor visible={goalEditorOpen} goal={editingGoal} accounts={userAccounts} debts={debts} onClose={() => setGoalEditorOpen(false)} onSave={handleSaveGoal} onDelete={handleDeleteGoal} />
   </SafeAreaView>;
