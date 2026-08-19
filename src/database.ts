@@ -410,7 +410,7 @@ async function initializeDatabaseCore() {
     ['debt_id', 'TEXT'], ['related_operation_id', 'TEXT'], ['account_amount', 'REAL'],
     ['account_currency', 'TEXT'], ["status", "TEXT NOT NULL DEFAULT 'posted'"],
     ['source_occurrence_id', 'TEXT'], ['planned_amount', 'REAL'], ['planned_currency', 'TEXT'],
-    ['interest_source_account_id', 'TEXT'],
+    ['interest_source_account_id', 'TEXT'], ['receipt_photo_uri', 'TEXT'],
   ] as const;
   for (const [name, sqlType] of operationExtras) {
     if (!operationColumns.some((column) => column.name === name)) await db.execAsync(`ALTER TABLE operations ADD COLUMN ${name} ${sqlType};`);
@@ -1027,7 +1027,7 @@ async function listOperationsCore(): Promise<FinancialOperation[]> {
     debt_id: string | null; related_operation_id: string | null; account_amount: number | null;
     account_currency: string | null; status: 'posted' | 'reversed' | null;
     source_occurrence_id: string | null; planned_amount: number | null; planned_currency: string | null;
-    interest_source_account_id: string | null;
+    interest_source_account_id: string | null; receipt_photo_uri: string | null;
   }>('SELECT * FROM operations ORDER BY date DESC, created_at DESC');
   return rows.map((row) => ({
     id: row.id, title: row.title, category: row.category, amount: row.amount, currency: row.currency,
@@ -1038,6 +1038,7 @@ async function listOperationsCore(): Promise<FinancialOperation[]> {
     sourceOccurrenceId: row.source_occurrence_id ?? undefined,
     plannedAmount: row.planned_amount ?? undefined, plannedCurrency: row.planned_currency ?? undefined,
     interestSourceAccountId: row.interest_source_account_id ?? undefined,
+    receiptPhotoUri: row.receipt_photo_uri ?? undefined,
   }));
 }
 
@@ -1256,9 +1257,10 @@ export function createOperation(input: FinancialOperationInput) {
     const delta = input.kind === 'income' ? input.amount : -input.amount;
     await db.withTransactionAsync(async () => {
       await db.runAsync(
-        `INSERT INTO operations (id, title, category, amount, currency, account_id, date, kind, source)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'manual')`,
+        `INSERT INTO operations (id, title, category, amount, currency, account_id, date, kind, source, receipt_photo_uri)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'manual', ?)`,
         id, input.title, input.category, input.amount, input.currency, input.accountId, input.date, input.kind,
+        input.receiptPhotoUri ?? null,
       );
       await db.runAsync('UPDATE accounts SET balance = balance + ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?', delta, input.accountId);
     });

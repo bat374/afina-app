@@ -163,6 +163,10 @@ export type FinancialOperation = {
   // must follow this field, not accountId, or a payout card ends up mislabeled with its own 0%
   // rate next to money it merely received.
   interestSourceAccountId?: string;
+  // Local device file URI for an attached receipt photo. Not synced to Supabase — the path is only
+  // valid on the device that took the picture, and there's no Supabase Storage bucket configured
+  // to hold the actual image bytes yet (see BACKLOG.md R-01). Purely a local attachment for now.
+  receiptPhotoUri?: string;
 };
 
 export type InterestPosting = {

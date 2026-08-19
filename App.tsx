@@ -1,10 +1,12 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
-  ActivityIndicator, Alert, Image, KeyboardAvoidingView, Modal, Platform, Pressable, ScrollView,
-  StyleSheet, Text, TextInput, View,
+  ActivityIndicator, Alert, AppState, Image, KeyboardAvoidingView, Modal, Platform, Pressable, ScrollView,
+  StyleSheet, Switch, Text, TextInput, View,
 } from 'react-native';
 import { StatusBar } from 'expo-status-bar';
 import * as ImagePicker from 'expo-image-picker';
+import * as LocalAuthentication from 'expo-local-authentication';
+import * as SecureStore from 'expo-secure-store';
 import { Ionicons } from '@expo/vector-icons';
 import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
 import { budgets, calendarDays, goals, transactions } from './src/data';
@@ -24,7 +26,7 @@ import type { Session } from '@supabase/supabase-js';
 
 type Tab = 'home' | 'accounts' | 'calendar' | 'operations' | 'analytics' | 'profile';
 
-const APP_VERSION = '1.2.1';
+const APP_VERSION = '1.3.0';
 
 const C = {
   bg: '#EDF5F8', card: '#FFFFFF', ink: '#172A34', muted: '#718087',
@@ -329,6 +331,7 @@ function Operations({ operations, transfers, plannedOccurrences, plannedExpenses
   const [fromDate, setFromDate] = useState(''); const [toDate, setToDate] = useState(''); const [dateTarget, setDateTarget] = useState<'from' | 'to' | null>(null);
   const [filtersOpen, setFiltersOpen] = useState(false);
   const [expandedGroups, setExpandedGroups] = useState<Record<string, boolean>>({});
+  const [viewingReceipt, setViewingReceipt] = useState<string | null>(null);
   const currencies = Array.from(new Set([...operations.map((item) => item.currency), ...transfers.flatMap((item) => [item.fromCurrency, item.toCurrency])])).sort(); const categories = Array.from(new Set(operations.map((item) => item.category))).sort();
   const filtered = operations.filter((item) => (currency === 'ALL' || item.currency === currency) && (accountId === 'ALL' || item.accountId === accountId) && (category === 'ALL' || item.category === category) && (!fromDate || item.date >= fromDate) && (!toDate || item.date <= toDate));
   // Transfers have no category of their own, so a category filter (which only makes sense for
@@ -361,7 +364,7 @@ function Operations({ operations, transfers, plannedOccurrences, plannedExpenses
   const renderOperation = (operation: FinancialOperation) => {
     const account = accounts.find((item) => item.id === operation.accountId); const cancelled = operation.status === 'reversed';
     const deviates = operation.plannedAmount !== undefined && operation.plannedCurrency !== undefined && (Math.abs(operation.plannedAmount - operation.amount) > 0.005 || operation.plannedCurrency !== operation.currency);
-    return <View style={[s.eventRow, cancelled && { opacity: .55 }]}><View style={[s.roundIcon, { backgroundColor: operation.kind === 'income' ? C.sageSoft : C.redSoft }]}><Ionicons name={operation.relatedOperationId ? 'return-down-back-outline' : operation.sourceOccurrenceId ? 'checkmark-done-outline' : operation.kind === 'income' ? 'arrow-down-outline' : 'arrow-up-outline'} size={19} color={operation.kind === 'income' ? C.green : C.red} /></View><View style={{ flex: 1 }}><Text style={[s.rowTitle, cancelled && { textDecorationLine: 'line-through' }]}>{operation.title}</Text><Text style={s.rowSub}>{operation.date} · {operation.category} · {account?.name ?? 'Счёт удалён'}{cancelled ? ' · отменено' : operation.relatedOperationId ? ' · обратная проводка' : ''}</Text>{deviates && <Text style={s.rowSub}>план {money(operation.plannedAmount!, false, operation.plannedCurrency!)}</Text>}</View><Text style={operation.kind === 'income' ? s.income : s.expense}>{operation.kind === 'income' ? '+' : '−'}{money(operation.amount, false, operation.currency)}</Text></View>;
+    return <View style={[s.eventRow, cancelled && { opacity: .55 }]}><View style={[s.roundIcon, { backgroundColor: operation.kind === 'income' ? C.sageSoft : C.redSoft }]}><Ionicons name={operation.relatedOperationId ? 'return-down-back-outline' : operation.sourceOccurrenceId ? 'checkmark-done-outline' : operation.kind === 'income' ? 'arrow-down-outline' : 'arrow-up-outline'} size={19} color={operation.kind === 'income' ? C.green : C.red} /></View><View style={{ flex: 1 }}><Text style={[s.rowTitle, cancelled && { textDecorationLine: 'line-through' }]}>{operation.title}</Text><Text style={s.rowSub}>{operation.date} · {operation.category} · {account?.name ?? 'Счёт удалён'}{cancelled ? ' · отменено' : operation.relatedOperationId ? ' · обратная проводка' : ''}</Text>{deviates && <Text style={s.rowSub}>план {money(operation.plannedAmount!, false, operation.plannedCurrency!)}</Text>}</View><Text style={operation.kind === 'income' ? s.income : s.expense}>{operation.kind === 'income' ? '+' : '−'}{money(operation.amount, false, operation.currency)}</Text>{!!operation.receiptPhotoUri && <Pressable onPress={() => setViewingReceipt(operation.receiptPhotoUri!)} hitSlop={8} style={{ marginLeft: 8 }}><Ionicons name="receipt-outline" size={18} color={C.blue} /></Pressable>}</View>;
   };
   const confirmReverseTransfer = (transfer: Transfer) => {
     const fromAccount = accounts.find((item) => item.id === transfer.fromAccountId);
@@ -427,7 +430,18 @@ function Operations({ operations, transfers, plannedOccurrences, plannedExpenses
       </View>;
     })}</View> : <View style={s.emptyCard}><Ionicons name="receipt-outline" size={24} color={C.blue} /><Text style={s.emptyTitle}>Операции не найдены</Text><Text style={s.emptyText}>Измените фильтры или добавьте новую операцию</Text></View>}
     <DatePickerModal visible={dateTarget !== null} value={dateTarget === 'to' ? toDate : fromDate} onClose={() => setDateTarget(null)} onSelect={(value) => dateTarget === 'to' ? setToDate(value) : setFromDate(value)} />
+    <ReceiptViewerModal uri={viewingReceipt} onClose={() => setViewingReceipt(null)} />
   </ScrollView>;
+}
+
+function ReceiptViewerModal({ uri, onClose }: { uri: string | null; onClose: () => void }) {
+  return <Modal visible={!!uri} transparent animationType="fade" onRequestClose={onClose}>
+    <View style={s.receiptOverlay}>
+      <Pressable style={StyleSheet.absoluteFillObject} onPress={onClose} />
+      <Pressable style={[s.close, s.receiptClose]} onPress={onClose}><Ionicons name="close" size={22} color={C.ink} /></Pressable>
+      {!!uri && <Image source={{ uri }} style={s.receiptImage} resizeMode="contain" />}
+    </View>
+  </Modal>;
 }
 
 function LegacyAnalytics() {
@@ -514,6 +528,17 @@ function Analytics({ accounts, plannedExpenses, plannedOccurrences, debts, curre
 }
 
 function Profile({ email, currencySettings, onCurrencySettings, onBack }: { email?: string; currencySettings: CurrencySettings; onCurrencySettings: () => void; onBack: () => void }) {
+  const [lockEnabled, setLockEnabledState] = useState(false);
+  const [lockLoaded, setLockLoaded] = useState(false);
+  const [pinSetupOpen, setPinSetupOpen] = useState(false);
+  useEffect(() => { getLockEnabled().then((value) => { setLockEnabledState(value); setLockLoaded(true); }); }, []);
+  const handleToggleLock = (value: boolean) => {
+    if (value) { setPinSetupOpen(true); return; }
+    Alert.alert('Отключить вход по PIN/биометрии?', 'Приложение больше не будет запрашивать вход при открытии.', [
+      { text: 'Отмена', style: 'cancel' },
+      { text: 'Отключить', style: 'destructive', onPress: () => { Promise.all([setLockEnabledStored(false), setStoredPin(null)]).then(() => setLockEnabledState(false)); } },
+    ]);
+  };
   const handleSignOut = () => {
     Alert.alert('Выйти из аккаунта?', email ? `Вы выйдете из ${email} на этом устройстве.` : 'На этом устройстве понадобится войти заново.', [
       { text: 'Отмена', style: 'cancel' },
@@ -536,12 +561,22 @@ function Profile({ email, currencySettings, onCurrencySettings, onBack }: { emai
       <View style={{ flex: 1 }}><Text style={s.rowTitle}>Базовая валюта и курсы</Text><Text style={s.rowSub}>Сейчас: {currencySettings.baseCurrency}</Text></View>
       <Ionicons name="chevron-forward" size={19} color={C.muted} />
     </Pressable>
+    <SectionTitle title="Защита входа" />
+    <View style={s.card}>
+      <View style={s.eventRow}>
+        <View style={[s.roundIcon, { backgroundColor: `${C.blue}18` }]}><Ionicons name="lock-closed-outline" size={19} color={C.blue} /></View>
+        <View style={{ flex: 1 }}><Text style={s.rowTitle}>PIN-код и биометрия</Text><Text style={s.rowSub}>Запрашивать вход при каждом открытии</Text></View>
+        <Switch value={lockEnabled} onValueChange={handleToggleLock} disabled={!lockLoaded} trackColor={{ true: C.blue }} />
+      </View>
+      {lockEnabled && <><View style={s.divider} /><Pressable style={s.eventRow} onPress={() => setPinSetupOpen(true)}><View style={{ flex: 1 }}><Text style={s.rowTitle}>Изменить PIN-код</Text></View><Ionicons name="chevron-forward" size={19} color={C.muted} /></Pressable></>}
+    </View>
     <SectionTitle title="О приложении" />
     <View style={s.card}>
       <View style={s.eventRow}><View style={[s.roundIcon, { backgroundColor: C.sageSoft }]}><Ionicons name="sparkles-outline" size={19} color={C.green} /></View><View style={{ flex: 1 }}><Text style={s.rowTitle}>Афина</Text><Text style={s.rowSub}>Версия {APP_VERSION}</Text></View></View>
     </View>
     <Pressable style={s.deleteButton} onPress={handleSignOut}><Ionicons name="log-out-outline" size={18} color={C.red} /><Text style={s.deleteText}>Выйти из аккаунта</Text></Pressable>
     <View style={{ height: 20 }} />
+    <PinSetupModal visible={pinSetupOpen} onClose={() => setPinSetupOpen(false)} onSaved={() => { setLockEnabledState(true); setPinSetupOpen(false); }} />
   </ScrollView>;
 }
 
@@ -782,17 +817,33 @@ function OperationEditor({ visible, accounts, onClose, onSave }: { visible: bool
   const [kind, setKind] = useState<'income' | 'expense'>('expense'); const [title, setTitle] = useState(''); const [category, setCategory] = useState('Другое');
   const [amount, setAmount] = useState<number | undefined>(); const [accountId, setAccountId] = useState<string | undefined>();
   const [date, setDate] = useState(localIso(new Date())); const [dateOpen, setDateOpen] = useState(false); const [saving, setSaving] = useState(false);
-  useEffect(() => { if (visible) { setKind('expense'); setTitle(''); setCategory('Другое'); setAmount(undefined); setAccountId(accounts[0]?.id); setDate(localIso(new Date())); } }, [visible]);
+  const [receiptUri, setReceiptUri] = useState<string | undefined>();
+  useEffect(() => { if (visible) { setKind('expense'); setTitle(''); setCategory('Другое'); setAmount(undefined); setAccountId(accounts[0]?.id); setDate(localIso(new Date())); setReceiptUri(undefined); } }, [visible]);
   const account = accounts.find((item) => item.id === accountId);
+  const attachReceipt = async (fromCamera: boolean) => {
+    const result = fromCamera
+      ? await ImagePicker.launchCameraAsync({ mediaTypes: ['images'], quality: 0.7 })
+      : await ImagePicker.launchImageLibraryAsync({ mediaTypes: ['images'], quality: 0.7 });
+    if (!result.canceled && result.assets[0]?.uri) setReceiptUri(result.assets[0].uri);
+  };
   const submit = async () => {
     if (!account || !title.trim() || !amount || amount <= 0) { Alert.alert('Заполните счёт, название и сумму'); return; }
-    setSaving(true); try { await onSave({ title: title.trim(), category: category.trim() || 'Другое', amount, currency: account.currency, accountId: account.id, date, kind }); } finally { setSaving(false); }
+    setSaving(true); try { await onSave({ title: title.trim(), category: category.trim() || 'Другое', amount, currency: account.currency, accountId: account.id, date, kind, receiptPhotoUri: receiptUri }); } finally { setSaving(false); }
   };
   return <Modal visible={visible} animationType="slide" presentationStyle="pageSheet" onRequestClose={onClose}><SafeAreaView style={s.modal} edges={['top', 'bottom']}><View style={s.modalHead}><Pressable onPress={onClose} style={s.close}><Ionicons name="close" size={22} color={C.ink} /></Pressable><Text style={s.modalTitle}>Новая операция</Text><View style={{ width: 40 }} /></View><KeyboardAvoidingView style={{ flex: 1 }} behavior={Platform.OS === 'ios' ? 'padding' : 'height'}><ScrollView contentContainerStyle={s.formBody} keyboardShouldPersistTaps="handled" keyboardDismissMode="on-drag" automaticallyAdjustKeyboardInsets>
     <Text style={s.fieldLabel}>ТИП</Text><View style={s.choiceRow}><Pressable style={[s.choice, kind === 'expense' && s.choiceActive]} onPress={() => setKind('expense')}><Text style={[s.choiceText, kind === 'expense' && s.choiceTextActive]}>Расход</Text></Pressable><Pressable style={[s.choice, kind === 'income' && s.choiceActive]} onPress={() => setKind('income')}><Text style={[s.choiceText, kind === 'income' && s.choiceTextActive]}>Доход</Text></Pressable></View>
     <Text style={s.fieldLabel}>НАЗВАНИЕ</Text><TextInput value={title} onChangeText={setTitle} placeholder="Например, супермаркет" placeholderTextColor="#9BA9AF" style={s.input} /><Text style={s.fieldLabel}>КАТЕГОРИЯ</Text><TextInput value={category} onChangeText={setCategory} placeholder="Продукты, жильё…" placeholderTextColor="#9BA9AF" style={s.input} /><Text style={s.fieldLabel}>СУММА</Text><DecimalInput value={amount} onChange={setAmount} placeholder="0,00" />
     <Text style={s.fieldLabel}>СЧЁТ</Text><View style={s.targetList}>{accounts.map((item) => <Pressable key={item.id} style={[s.targetAccount, accountId === item.id && s.targetAccountActive]} onPress={() => setAccountId(item.id)}><Text style={s.targetAccountText}>{item.name} · {item.currency}</Text><Text style={s.rowSub}>{money(item.balance, false, item.currency)}</Text></Pressable>)}</View>
-    <Text style={s.fieldLabel}>ДАТА</Text><DateField value={date} onPress={() => setDateOpen(true)} /><Pressable style={s.primaryButton} disabled={saving} onPress={submit}><Text style={s.primaryText}>{saving ? 'Сохраняем…' : 'Добавить операцию'}</Text></Pressable>
+    <Text style={s.fieldLabel}>ДАТА</Text><DateField value={date} onPress={() => setDateOpen(true)} />
+    <Text style={s.fieldLabel}>ФОТО ЧЕКА · НЕОБЯЗАТЕЛЬНО</Text>
+    {receiptUri ? <View style={{ marginBottom: 12 }}>
+      <Image source={{ uri: receiptUri }} style={{ width: '100%', height: 160, borderRadius: 14, backgroundColor: '#DDD' }} resizeMode="cover" />
+      <Pressable style={[s.secondaryButton, { marginTop: 8 }]} onPress={() => setReceiptUri(undefined)}><Text style={s.secondaryText}>Убрать фото</Text></Pressable>
+    </View> : <View style={s.twoColumns}>
+      <Pressable style={[s.manualAccountButton, { flex: 1 }]} onPress={() => attachReceipt(true)}><Ionicons name="camera-outline" size={18} color={C.blue} /><Text style={s.manualAccountText}>Сделать фото</Text></Pressable>
+      <Pressable style={[s.manualAccountButton, { flex: 1 }]} onPress={() => attachReceipt(false)}><Ionicons name="images-outline" size={18} color={C.blue} /><Text style={s.manualAccountText}>Из галереи</Text></Pressable>
+    </View>}
+    <Pressable style={s.primaryButton} disabled={saving} onPress={submit}><Text style={s.primaryText}>{saving ? 'Сохраняем…' : 'Добавить операцию'}</Text></Pressable>
   </ScrollView></KeyboardAvoidingView><DatePickerModal visible={dateOpen} value={date} onClose={() => setDateOpen(false)} onSelect={setDate} /></SafeAreaView></Modal>;
 }
 
@@ -1506,6 +1557,127 @@ function AuthScreen() {
   </SafeAreaView>;
 }
 
+const LOCK_ENABLED_KEY = 'afina_lock_enabled';
+const LOCK_PIN_KEY = 'afina_lock_pin';
+const PIN_LENGTH = 4;
+
+const getLockEnabled = async () => (await SecureStore.getItemAsync(LOCK_ENABLED_KEY)) === '1';
+const setLockEnabledStored = (value: boolean) => SecureStore.setItemAsync(LOCK_ENABLED_KEY, value ? '1' : '0');
+const getStoredPin = () => SecureStore.getItemAsync(LOCK_PIN_KEY);
+const setStoredPin = (pin: string | null) => pin ? SecureStore.setItemAsync(LOCK_PIN_KEY, pin) : SecureStore.deleteItemAsync(LOCK_PIN_KEY);
+
+function PinDots({ length, filled }: { length: number; filled: number }) {
+  return <View style={s.pinDots}>{Array.from({ length }, (_, i) => <View key={i} style={[s.pinDot, i < filled && s.pinDotFilled]} />)}</View>;
+}
+
+function PinKeypad({ onDigit, onBackspace }: { onDigit: (digit: string) => void; onBackspace: () => void }) {
+  const rows = [['1', '2', '3'], ['4', '5', '6'], ['7', '8', '9'], ['', '0', '⌫']];
+  return <View style={{ gap: 14 }}>{rows.map((row, ri) => <View key={ri} style={s.pinRow}>{row.map((key, ki) => key ? <Pressable key={ki} style={s.pinKey} onPress={() => key === '⌫' ? onBackspace() : onDigit(key)}><Text style={s.pinKeyText}>{key}</Text></Pressable> : <View key={ki} style={s.pinKey} />)}</View>)}</View>;
+}
+
+// Lock is always backed by a PIN once enabled — biometric is an optional shortcut tried first,
+// never the sole gate, so a user who un-enrolls fingerprints/Face ID in OS settings can never be
+// locked out with no way back in.
+function PinUnlockPad({ onSuccess }: { onSuccess: () => void }) {
+  const [entry, setEntry] = useState('');
+  const [error, setError] = useState('');
+  const handleDigit = (digit: string) => {
+    if (entry.length >= PIN_LENGTH) return;
+    const next = entry + digit;
+    setEntry(next);
+    if (next.length === PIN_LENGTH) {
+      getStoredPin().then((stored) => {
+        if (stored && stored === next) { setError(''); setEntry(''); onSuccess(); }
+        else { setError('Неверный PIN-код'); setEntry(''); }
+      });
+    }
+  };
+  return <View>
+    <Text style={[s.rowSub, { textAlign: 'center' }]}>Введите PIN-код</Text>
+    <PinDots length={PIN_LENGTH} filled={entry.length} />
+    {!!error && <Text style={[s.authMessage, { textAlign: 'center' }]}>{error}</Text>}
+    <PinKeypad onDigit={handleDigit} onBackspace={() => setEntry((value) => value.slice(0, -1))} />
+  </View>;
+}
+
+function PinSetupModal({ visible, onClose, onSaved }: { visible: boolean; onClose: () => void; onSaved: () => void }) {
+  const [stage, setStage] = useState<'new' | 'confirm'>('new');
+  const [firstPin, setFirstPin] = useState('');
+  const [entry, setEntry] = useState('');
+  const [error, setError] = useState('');
+  useEffect(() => { if (visible) { setStage('new'); setFirstPin(''); setEntry(''); setError(''); } }, [visible]);
+  const handleDigit = (digit: string) => {
+    if (entry.length >= PIN_LENGTH) return;
+    const next = entry + digit;
+    setEntry(next);
+    if (next.length < PIN_LENGTH) return;
+    if (stage === 'new') { setFirstPin(next); setEntry(''); setStage('confirm'); return; }
+    if (next === firstPin) { Promise.all([setStoredPin(next), setLockEnabledStored(true)]).then(onSaved); }
+    else { setError('PIN-коды не совпадают, начните заново'); setStage('new'); setFirstPin(''); setEntry(''); }
+  };
+  return <Modal visible={visible} animationType="slide" onRequestClose={onClose}>
+    <SafeAreaView style={s.lockSafe}>
+      <View style={s.lockContent}>
+        <Pressable onPress={onClose} style={{ alignSelf: 'flex-start' }} hitSlop={10}><Ionicons name="close" size={24} color={C.ink} /></Pressable>
+        <View style={s.lockMark}><Ionicons name="keypad-outline" size={26} color={C.navy} /></View>
+        <Text style={s.lockTitle}>{stage === 'new' ? 'Придумайте PIN-код' : 'Повторите PIN-код'}</Text>
+        <PinDots length={PIN_LENGTH} filled={entry.length} />
+        {!!error && <Text style={[s.authMessage, { textAlign: 'center' }]}>{error}</Text>}
+        <PinKeypad onDigit={handleDigit} onBackspace={() => setEntry((value) => value.slice(0, -1))} />
+      </View>
+    </SafeAreaView>
+  </Modal>;
+}
+
+function AppLockGate({ children }: { children: React.ReactNode }) {
+  const [ready, setReady] = useState(false);
+  const [locked, setLocked] = useState(false);
+  const [biometricAvailable, setBiometricAvailable] = useState(false);
+  const appState = useRef(AppState.currentState);
+
+  const tryBiometric = async () => {
+    const result = await LocalAuthentication.authenticateAsync({ promptMessage: 'Войти в Афину', cancelLabel: 'Отмена' });
+    if (result.success) setLocked(false);
+  };
+
+  useEffect(() => {
+    (async () => {
+      const enabled = await getLockEnabled();
+      if (!enabled) { setReady(true); return; }
+      const hasHardware = await LocalAuthentication.hasHardwareAsync();
+      const enrolled = hasHardware && await LocalAuthentication.isEnrolledAsync();
+      setBiometricAvailable(enrolled);
+      setLocked(true);
+      setReady(true);
+      if (enrolled) tryBiometric();
+    })();
+  }, []);
+
+  useEffect(() => {
+    const subscription = AppState.addEventListener('change', (next) => {
+      if (appState.current === 'active' && next.match(/inactive|background/)) {
+        getLockEnabled().then((enabled) => { if (enabled) setLocked(true); });
+      }
+      appState.current = next;
+    });
+    return () => subscription.remove();
+  }, []);
+
+  if (!ready) return <View style={s.cloudLoading}><ActivityIndicator size="large" color={C.blue} /></View>;
+  if (!locked) return <>{children}</>;
+  return <SafeAreaView style={s.lockSafe}>
+    <View style={s.lockContent}>
+      <View style={s.lockMark}><Ionicons name="lock-closed" size={26} color={C.navy} /></View>
+      <Text style={s.lockTitle}>Афина заблокирована</Text>
+      {biometricAvailable && <Pressable style={s.scanButton} onPress={tryBiometric}>
+        <View style={s.scanIcon}><Ionicons name="finger-print-outline" size={22} color={C.navy} /></View>
+        <View style={{ flex: 1 }}><Text style={s.scanTitle}>Войти по биометрии</Text><Text style={s.scanSub}>Face ID или отпечаток пальца</Text></View>
+      </Pressable>}
+      <PinUnlockPad onSuccess={() => setLocked(false)} />
+    </View>
+  </SafeAreaView>;
+}
+
 function CloudGate() {
   const [session, setSession] = useState<Session | null>(null);
   const [loading, setLoading] = useState(true);
@@ -1518,7 +1690,7 @@ function CloudGate() {
   if (loading) return <View style={s.cloudLoading}><ActivityIndicator size="large" color={C.blue} /></View>;
   if (!isCloudConfigured || !supabase) return <View style={s.cloudLoading}><Text style={s.authMessage}>Облачное подключение не настроено.</Text></View>;
   if (!session) return <AuthScreen />;
-  return <AppContent userId={session.user.id} email={session.user.email} />;
+  return <AppLockGate><AppContent userId={session.user.id} email={session.user.email} /></AppLockGate>;
 }
 
 export default function App() { return <SafeAreaProvider><CloudGate /></SafeAreaProvider>; }
@@ -1530,6 +1702,17 @@ const s = StyleSheet.create({
   authSubtitle: { color: C.muted, fontSize: 14, lineHeight: 21, textAlign: 'center', marginTop: 7, marginBottom: 24 },
   authCard: { backgroundColor: C.card, borderRadius: 22, padding: 20 }, authMessage: { color: C.red, fontSize: 12, lineHeight: 17, marginBottom: 12 },
   cloudLoading: { flex: 1, alignItems: 'center', justifyContent: 'center', backgroundColor: C.bg, padding: 24 },
+  lockSafe: { flex: 1, backgroundColor: C.bg }, lockContent: { flex: 1, justifyContent: 'center', padding: 28 },
+  lockMark: { width: 56, height: 56, borderRadius: 20, backgroundColor: '#D7EAF2', alignItems: 'center', justifyContent: 'center', alignSelf: 'center', marginBottom: 14 },
+  lockTitle: { color: C.ink, fontSize: 20, fontWeight: '700', textAlign: 'center', marginBottom: 18 },
+  pinDots: { flexDirection: 'row', gap: 16, justifyContent: 'center', marginVertical: 20 },
+  pinDot: { width: 14, height: 14, borderRadius: 7, borderWidth: 1.5, borderColor: C.line },
+  pinDotFilled: { backgroundColor: C.navy, borderColor: C.navy },
+  pinRow: { flexDirection: 'row', gap: 18, justifyContent: 'center' },
+  pinKey: { width: 64, height: 64, borderRadius: 32, backgroundColor: C.card, alignItems: 'center', justifyContent: 'center' },
+  pinKeyText: { color: C.ink, fontSize: 22, fontWeight: '600' },
+  receiptOverlay: { flex: 1, backgroundColor: 'rgba(10,18,22,0.92)', alignItems: 'center', justifyContent: 'center' },
+  receiptClose: { position: 'absolute', top: 54, right: 20 }, receiptImage: { width: '92%', height: '80%' },
   safe: { flex: 1, backgroundColor: C.bg }, screen: { flex: 1 }, page: { padding: 20, paddingBottom: 24 },
   header: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 22 }, eyebrow: { fontSize: 11, letterSpacing: 1.6, color: C.muted, fontWeight: '700', marginBottom: 4 }, title: { fontSize: 28, fontWeight: '700', color: C.ink, letterSpacing: -.7 },
   avatar: { width: 42, height: 42, borderRadius: 21, backgroundColor: '#D8EAF2', alignItems: 'center', justifyContent: 'center' }, avatarText: { color: C.navy, fontSize: 17, fontWeight: '700' },

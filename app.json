@@ -2,7 +2,7 @@
   "expo": {
     "name": "Афина",
     "slug": "afinaapp",
-    "version": "1.2.1",
+    "version": "1.3.0",
     "icon": "./assets/icon-v2.png",
     "orientation": "portrait",
     "userInterfaceStyle": "light",
@@ -25,14 +25,21 @@
       [
         "expo-image-picker",
         {
-          "photosPermission": "Разрешите Афине выбрать скриншот для распознавания операций."
+          "photosPermission": "Разрешите Афине выбрать скриншот или фото чека для распознавания операций.",
+          "cameraPermission": "Разрешите Афине использовать камеру, чтобы сфотографировать чек."
         }
       ],
       "expo-asset",
       "expo-sqlite",
-      "expo-secure-store"
+      "expo-secure-store",
+      [
+        "expo-local-authentication",
+        {
+          "faceIDPermission": "Разрешите Афине использовать Face ID для входа в приложение."
+        }
+      ]
     ],
-    "runtimeVersion": "1.2.1",
+    "runtimeVersion": "1.3.0",
     "updates": {
       "url": "https://u.expo.dev/53ab750b-30b0-4e8f-abf6-75e0b537f801",
       "requestHeaders": {
