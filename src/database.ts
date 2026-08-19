@@ -481,6 +481,21 @@ async function initializeDatabaseCore() {
     // the old UI label claimed but the old code never actually did).
     await db.runAsync("UPDATE financial_goals SET include_other_currencies = 1 WHERE type = 'balance' AND account_id IS NULL");
   }
+  const interestSourceRepairFlag = await db.getFirstAsync<{ value: string }>("SELECT value FROM app_settings WHERE key = 'repair_v2_backfill_interest_source_account'");
+  if (!interestSourceRepairFlag) {
+    // interest_source_account_id didn't exist when older interest operations were created, so
+    // they still attribute to the receiving account. interest_postings already recorded the
+    // actual earning account for every one of them (account_id there is exactly this), linked via
+    // operation_id — no guessing needed, just join the fact that was already on hand.
+    await db.runAsync(`
+      UPDATE operations SET interest_source_account_id = (
+        SELECT account_id FROM interest_postings WHERE interest_postings.operation_id = operations.id
+      )
+      WHERE source = 'interest' AND interest_source_account_id IS NULL
+        AND id IN (SELECT operation_id FROM interest_postings WHERE operation_id IS NOT NULL)
+    `);
+    await db.runAsync("INSERT OR REPLACE INTO app_settings (key, value) VALUES ('repair_v2_backfill_interest_source_account', '1')");
+  }
   await db.execAsync('PRAGMA user_version = 5;');
 }
 
