@@ -32,9 +32,7 @@
       "expo-sqlite",
       "expo-secure-store"
     ],
-    "runtimeVersion": {
-      "policy": "appVersion"
-    },
+    "runtimeVersion": "1.2.1",
     "updates": {
       "url": "https://u.expo.dev/53ab750b-30b0-4e8f-abf6-75e0b537f801",
       "requestHeaders": {

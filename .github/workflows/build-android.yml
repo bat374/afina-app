@@ -78,5 +78,5 @@ jobs:
             echo "EXPO_TOKEN not set — skipping OTA publish. Add it as a repo secret to enable auto-updates."
             exit 0
           fi
-          npx eas-cli channel:create production --branch production --non-interactive || true
+          npx eas-cli channel:create production --non-interactive || true
           npx eas-cli update --branch production --message "${{ github.event.head_commit.message }}" --non-interactive
