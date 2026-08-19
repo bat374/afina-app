@@ -64,3 +64,19 @@ jobs:
           name: afina-debug-apk
           path: android/app/build/outputs/apk/debug/app-debug.apk
           retention-days: 30
+
+      # OTA (expo-updates): pushes JS/asset-only changes to already-installed apps without a new
+      # APK. Only takes effect once a build with expo-updates embedded has been installed on the
+      # phone — native/dependency changes still need a new APK from the job above regardless.
+      # Requires an EXPO_TOKEN repo secret (Expo account → Settings → Access tokens); skipped
+      # harmlessly if it isn't set yet.
+      - name: Publish OTA update
+        env:
+          EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
+        run: |
+          if [ -z "$EXPO_TOKEN" ]; then
+            echo "EXPO_TOKEN not set — skipping OTA publish. Add it as a repo secret to enable auto-updates."
+            exit 0
+          fi
+          npx eas-cli channel:create production --branch production --non-interactive || true
+          npx eas-cli update --branch production --message "${{ github.event.head_commit.message }}" --non-interactive

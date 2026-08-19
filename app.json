@@ -32,6 +32,15 @@
       "expo-sqlite",
       "expo-secure-store"
     ],
+    "runtimeVersion": {
+      "policy": "appVersion"
+    },
+    "updates": {
+      "url": "https://u.expo.dev/53ab750b-30b0-4e8f-abf6-75e0b537f801",
+      "requestHeaders": {
+        "expo-channel-name": "production"
+      }
+    },
     "extra": {
       "eas": {
         "projectId": "53ab750b-30b0-4e8f-abf6-75e0b537f801"
