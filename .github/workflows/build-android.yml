@@ -73,10 +73,15 @@ jobs:
       - name: Publish OTA update
         env:
           EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
+          # Passed as an env var, not interpolated directly into the script: a commit message can
+          # contain newlines or shell metacharacters, and ${{ }} expressions are substituted
+          # textually before bash ever sees the line — that's a known script-injection vector, and
+          # separately, a multi-line message here breaks the shell script's own quoting.
+          COMMIT_SHA: ${{ github.sha }}
         run: |
           if [ -z "$EXPO_TOKEN" ]; then
             echo "EXPO_TOKEN not set — skipping OTA publish. Add it as a repo secret to enable auto-updates."
             exit 0
           fi
           npx eas-cli channel:create production --non-interactive || true
-          npx eas-cli update --branch production --message "${{ github.event.head_commit.message }}" --non-interactive
+          npx eas-cli update --branch production --message "Auto-publish ${COMMIT_SHA:0:7}" --non-interactive
