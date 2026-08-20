@@ -12,7 +12,7 @@ import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
 import { budgets, calendarDays, goals, transactions } from './src/data';
 import { money, percent } from './src/format';
 import { Account, AccountType, Budget, CashFlowKind, CurrencySettings, Debt, DebtDirection, DebtHistory, ExpenseRepeat, FinancialGoal, FinancialOperation, GoalType, ImportDraft, InterestSchedule, PlannedExecutionInput, PlannedExpense, PlannedOccurrence, RecurrenceUnit, Transfer, TransferInput, WithdrawalPolicy } from './src/types';
-import { AccountInput, BudgetInput, cancelPlannedOccurrence, confirmImportDraft, countPendingImportDrafts, createDebt, createImportDraft, createOperation, DebtInput, deleteAccount, deleteBudget, deleteFinancialGoal, deletePlannedExpense, dismissImportDraft, executePlannedOccurrence, extendDebt, FinancialGoalInput, FinancialOperationInput, getCurrencySettings, getSmsScanWatermark, initializeDatabase, listAccounts, listBudgets, listDebtHistory, listDebts, listFinancialGoals, listImportDrafts, listOperations, listPlannedExpenses, listPlannedOccurrences, listTransfers, markDebtOverdue, PlannedExpenseInput, recordDebtPayment, recordTransfer, reverseDebtPayment, reverseTransfer, saveAccount, saveBudget, saveCurrencySettings, saveFinancialGoal, savePlannedExpense, setSmsScanWatermark, synchronizeInterestPostings, synchronizePlannedOccurrences, updateDebt } from './src/database';
+import { AccountInput, BudgetInput, cancelPlannedOccurrence, confirmImportDraft, countPendingImportDrafts, createDebt, createImportDraft, createOperation, DebtInput, deleteAccount, deleteBudget, deleteFinancialGoal, deletePlannedExpense, dismissImportDraft, executePlannedOccurrence, extendDebt, FinancialGoalInput, FinancialOperationInput, getCurrencySettings, getSmsScanWatermark, initializeDatabase, listAccounts, listBudgets, listDebtHistory, listDebts, listFinancialGoals, listImportDrafts, listOperations, listPlannedExpenses, listPlannedOccurrences, listTransfers, markDebtOverdue, PlannedExpenseInput, recordDebtPayment, recordTransfer, rematchImportDrafts, reverseDebtPayment, reverseTransfer, saveAccount, saveBudget, saveCurrencySettings, saveFinancialGoal, savePlannedExpense, setSmsScanWatermark, synchronizeInterestPostings, synchronizePlannedOccurrences, updateDebt } from './src/database';
 import { parsersForSender, parseSms } from './src/sms/registry';
 import { parsePush } from './src/push/registry';
 import { KNOWN_BANK_PACKAGES } from './src/push/packages';
@@ -127,7 +127,7 @@ function LegacyHome({ onImport, go, accounts }: { onImport: () => void; go: (tab
   </ScrollView>;
 }
 
-function Home({ onImport, go, accounts, plannedExpenses, plannedOccurrences, debts, currencySettings, onCurrencySettings, onProfile }: { onImport: () => void; go: (tab: Tab) => void; accounts: Account[]; plannedExpenses: PlannedExpense[]; plannedOccurrences: PlannedOccurrence[]; debts: Debt[]; currencySettings: CurrencySettings; onCurrencySettings: () => void; onProfile: () => void }) {
+function Home({ onImport, go, accounts, plannedExpenses, plannedOccurrences, debts, currencySettings, onCurrencySettings, onProfile, pendingImportDrafts }: { onImport: () => void; go: (tab: Tab) => void; accounts: Account[]; plannedExpenses: PlannedExpense[]; plannedOccurrences: PlannedOccurrence[]; debts: Debt[]; currencySettings: CurrencySettings; onCurrencySettings: () => void; onProfile: () => void; pendingImportDrafts: number }) {
   const now = new Date();
   const totals = getCurrencyTotals(accounts);
   const currencies = Array.from(new Set([currencySettings.baseCurrency, ...Object.keys(totals), ...plannedExpenses.map((item) => item.currency), ...debts.map((item) => item.currency)])).sort((a, b) => a === 'UZS' ? -1 : b === 'UZS' ? 1 : a.localeCompare(b));
@@ -160,6 +160,7 @@ function Home({ onImport, go, accounts, plannedExpenses, plannedOccurrences, deb
     <Pressable style={s.scanButton} onPress={onImport}><View style={s.scanIcon}><Ionicons name="scan-outline" size={22} color={C.navy} /></View><View style={{ flex: 1 }}><Text style={s.scanTitle}>Добавить скриншот</Text><Text style={s.scanSub}>Распознаем счёт и условия</Text></View><Ionicons name="arrow-forward" size={21} color={C.navy} /></Pressable>
 
     {risk && <View style={s.alert}><View style={s.alertIcon}><Ionicons name="warning-outline" size={20} color={C.red} /></View><View style={{ flex: 1 }}><Text style={s.alertTitle}>Риск кассового разрыва</Text><Text style={s.alertText}>{risk.day} числа прогнозный баланс станет отрицательным</Text></View><Pressable onPress={() => go('calendar')}><Ionicons name="chevron-forward" size={20} color={C.red} /></Pressable></View>}
+    {pendingImportDrafts > 0 && <Pressable style={[s.alert, { backgroundColor: C.sageSoft }]} onPress={onProfile}><View style={[s.alertIcon, { backgroundColor: `${C.green}22` }]}><Ionicons name="chatbox-ellipses-outline" size={20} color={C.green} /></View><View style={{ flex: 1 }}><Text style={[s.alertTitle, { color: C.green }]}>{pendingImportDrafts} {pendingImportDrafts === 1 ? 'операция ждёт' : 'операции ждут'} подтверждения</Text><Text style={[s.alertText, { color: C.green }]}>Найдено в SMS — Профиль → Автоматизация</Text></View><Ionicons name="chevron-forward" size={20} color={C.green} /></Pressable>}
 
     <SectionTitle title="Ближайшие события" action="Календарь" onAction={() => go('calendar')} />
     {events.length ? <View style={s.card}>{events.map((event, index) => { const outgoing = event.kind === 'expense' || event.kind === 'debt_expense' || event.kind === 'credit_payment'; const incoming = event.kind === 'interest' || event.kind === 'debt_income' || event.kind === 'planned_income'; return <View key={`${event.date}-${event.accountId}-${event.kind}`}><View style={s.eventRow}><View style={[s.dateTile, { backgroundColor: outgoing ? C.redSoft : event.kind === 'reminder' ? C.bg : C.sageSoft }]}><Text style={s.dateDay}>{String(event.day).padStart(2, '0')}</Text><Text style={s.dateMonth}>{now.toLocaleString('ru-RU', { month: 'short' }).toUpperCase()}</Text></View><View style={{ flex: 1 }}><Text style={s.rowTitle}>{event.title}</Text><Text style={s.rowSub}>{event.kind === 'planned_income' ? 'Запланированный доход' : event.kind === 'debt_income' ? 'Возврат долга' : event.kind === 'debt_expense' ? 'Погашение долга' : event.kind === 'credit_payment' ? 'Минимальный платёж по кредитной карте' : event.kind === 'expense' ? 'Запланированный расход' : event.kind === 'reminder' ? 'Напоминание' : `Пассивный доход${event.trackedInBalance ? '' : ' · счёт зачисления не выбран'}`}</Text></View>{incoming && <Text style={s.income}>+{money(event.amount, false, event.currency)}</Text>}{outgoing && <Text style={s.expense}>−{money(event.amount, false, event.currency)}</Text>}</View>{index < events.length - 1 && <View style={s.divider} />}</View>; })}</View> : <View style={s.emptyCard}><Ionicons name="calendar-outline" size={24} color={C.blue} /><Text style={s.emptyTitle}>Событий пока нет</Text><Text style={s.emptyText}>Запланируйте доход, расход или добавьте условия вклада</Text></View>}
@@ -492,7 +493,7 @@ function ImportDraftCard({ draft, accounts, onConfirm, onDismiss }: { draft: Imp
   return <View style={[s.card, { padding: 16 }]}>
     <View style={s.budgetTop}><Text style={s.rowTitle}>{draft.merchant || (draft.kind === 'income' ? 'Поступление' : 'Операция по карте')}</Text><Text style={draft.kind === 'income' ? s.income : s.expense}>{draft.kind === 'income' ? '+' : '−'}{money(draft.amount ?? 0, false, draft.currency)}</Text></View>
     <Text style={s.rowSub}>{sourceLabel} · {draft.occurredAt?.replace('T', ' ')}{draft.cardLast4 ? ` · карта •${draft.cardLast4}` : ''}</Text>
-    {!!draft.dedupOperationId && <Text style={[s.rowSub, { color: C.red, marginTop: 4 }]}>Похоже, уже добавлено вручную — проверьте перед подтверждением</Text>}
+    {!!draft.dedupOperationId && <Text style={[s.rowSub, { color: C.red, marginTop: 4 }]}>Похоже, эта операция уже учтена в Афине (вручную или автоматически, например проценты по вкладу) — проверьте перед подтверждением</Text>}
     <Text style={[s.fieldLabel, { marginTop: 10 }]}>СЧЁТ</Text>
     <View style={s.targetList}>{accounts.map((item) => <Pressable key={item.id} style={[s.targetAccount, accountId === item.id && s.targetAccountActive]} onPress={() => setAccountId(item.id)}><Text style={s.targetAccountText}>{item.name} · {item.currency}</Text></Pressable>)}</View>
     {!!draft.feeAmount && <Pressable style={[s.eventRow, { minHeight: 40 }]} onPress={() => setIncludeFee((value) => !value)}>
@@ -538,6 +539,15 @@ function ImportDraftsModal({ visible, accounts, onClose }: { visible: boolean; a
     await reload();
   };
   const handleDismiss = async (draft: ImportDraft) => { await dismissImportDraft(draft.id); await reload(); };
+  const [rematching, setRematching] = useState(false);
+  const handleRematch = async () => {
+    setRematching(true);
+    try {
+      const updated = await rematchImportDrafts();
+      await reload();
+      Alert.alert(updated > 0 ? 'Готово' : 'Нечего обновлять', updated > 0 ? `Счёт найден для ${updated} ${updated === 1 ? 'черновика' : 'черновиков'}.` : 'Черновиков без счёта, подходящих под добавленные карты, не найдено.');
+    } finally { setRematching(false); }
+  };
   return <Modal visible={visible} animationType="slide" presentationStyle="pageSheet" onRequestClose={onClose}>
     <SafeAreaView style={s.modal} edges={['top', 'bottom']}>
       <View style={s.modalHead}><Pressable onPress={onClose} style={s.close}><Ionicons name="close" size={22} color={C.ink} /></Pressable><Text style={s.modalTitle}>Импорт SMS и push (тест)</Text><View style={{ width: 40 }} /></View>
@@ -563,7 +573,10 @@ function ImportDraftsModal({ visible, accounts, onClose }: { visible: boolean; a
             <TextInput value={body} onChangeText={setBody} placeholder="Вставьте текст сюда" placeholderTextColor="#9BA9AF" multiline style={[s.input, { minHeight: 100, paddingTop: 12, textAlignVertical: 'top' }]} />
           </>}
           <Pressable style={s.primaryButton} disabled={loading || !body.trim()} onPress={handleParse}><Text style={s.primaryText}>{loading ? 'Разбираем…' : 'Разобрать'}</Text></Pressable>
-          <Text style={[s.sectionTitle, { marginTop: 26, marginBottom: 10 }]}>Черновики</Text>
+          <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginTop: 26, marginBottom: 10 }}>
+            <Text style={s.sectionTitle}>Черновики</Text>
+            <Pressable onPress={handleRematch} disabled={rematching}><Text style={s.link}>{rematching ? 'Обновляем…' : 'Обновить счета по картам'}</Text></Pressable>
+          </View>
           {!drafts.length && <Text style={s.rowSub}>Пока пусто</Text>}
           {drafts.map((draft) => <View key={draft.id} style={{ marginBottom: 10 }}><ImportDraftCard draft={draft} accounts={accounts} onConfirm={(accountId, includeFee) => handleConfirm(draft, accountId, includeFee)} onDismiss={() => handleDismiss(draft)} /></View>)}
         </ScrollView>
@@ -1659,7 +1672,7 @@ function AppContent({ userId, email }: { userId: string; email?: string }) {
     if (tab === 'calendar') return <Calendar accounts={userAccounts} plannedExpenses={plannedExpenses} plannedOccurrences={plannedOccurrences} debts={debts} currencySettings={currencySettings} onAddExpense={openNewExpense} onEditExpense={openExpense} onExecuteOccurrence={handleOpenOccurrence} onCancelOccurrence={handleCancelOccurrence} onProfile={onProfile} />;
     if (tab === 'operations') return <Operations operations={operations} transfers={transfers} plannedOccurrences={plannedOccurrences} plannedExpenses={plannedExpenses} accounts={userAccounts} onAdd={() => setOperationEditorOpen(true)} onTransfer={() => setTransferModalOpen(true)} onReverseTransfer={handleReverseTransfer} onExecuteOccurrence={handleOpenOccurrence} onCancelOccurrence={handleCancelOccurrence} onProfile={onProfile} />;
     if (tab === 'analytics') return <Analytics accounts={userAccounts} plannedExpenses={plannedExpenses} plannedOccurrences={plannedOccurrences} debts={debts} currencySettings={currencySettings} operations={operations} userBudgets={userBudgets} financialGoals={financialGoals} onAddBudget={openNewBudget} onEditBudget={openBudget} onAddGoal={openNewGoal} onEditGoal={openGoal} onProfile={onProfile} />;
-    return <Home onImport={() => setImportOpen(true)} go={setTab} accounts={userAccounts} plannedExpenses={plannedExpenses} plannedOccurrences={plannedOccurrences} debts={debts} currencySettings={currencySettings} onCurrencySettings={() => setCurrencySettingsOpen(true)} onProfile={onProfile} />;
+    return <Home onImport={() => setImportOpen(true)} go={setTab} accounts={userAccounts} plannedExpenses={plannedExpenses} plannedOccurrences={plannedOccurrences} debts={debts} currencySettings={currencySettings} onCurrencySettings={() => setCurrencySettingsOpen(true)} onProfile={onProfile} pendingImportDrafts={pendingSmsDrafts} />;
   }, [tab, userAccounts, plannedExpenses, plannedOccurrences, debts, currencySettings, operations, transfers, userBudgets, financialGoals, email, pendingSmsDrafts]);
   return <SafeAreaView style={s.safe} edges={['top']}>
     <StatusBar style="dark" />

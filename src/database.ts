@@ -1362,12 +1362,26 @@ export function listImportDrafts(): Promise<ImportDraft[]> {
   return enqueue(listImportDraftsCore);
 }
 
-// A heuristic (never-silent) hint that this SMS/push message might duplicate an operation the
-// user already entered by hand: same account/kind/currency/amount (to the cent) and a date within
-// +/-1 day — operations only store a day-level date, not a timestamp, so a tighter window isn't
-// possible. A hit never auto-drops the draft; it just flags it for the user to confirm or reject.
+// A heuristic (never-silent) hint that this SMS/push message might duplicate an operation that
+// already exists in Afina — either entered by hand, or (just as real a risk) already posted by
+// Afina's own interest engine (synchronizeInterestPostings) crediting the same destination
+// account on the same day. That second case can't rely on exact amount matching: Afina's simple
+// day-count interest formula can legitimately differ by a fraction from what the bank actually
+// credits, so an amount-only check could silently miss it. interest_postings has a
+// UNIQUE(account_id, payout_date) constraint, so at most one 'interest' operation ever exists per
+// account per day — matching on account+day+source='interest' alone is reliable there without
+// needing the amount to line up at all. Manual-entry duplicates still go through the tighter
+// amount-matched check. A hit never auto-drops the draft; it just flags it for the user.
 async function findDedupOperation(db: SQLite.SQLiteDatabase, accountId: string, kind: 'income' | 'expense', currency: string, amount: number, occurredAt: string): Promise<string | undefined> {
   const day = occurredAt.slice(0, 10);
+  if (kind === 'income') {
+    const interestRow = await db.getFirstAsync<{ id: string }>(
+      `SELECT id FROM operations WHERE status = 'posted' AND account_id = ? AND source = 'interest'
+       AND date BETWEEN date(?, '-1 day') AND date(?, '+1 day') LIMIT 1`,
+      accountId, day, day,
+    );
+    if (interestRow) return interestRow.id;
+  }
   const row = await db.getFirstAsync<{ id: string }>(
     `SELECT id FROM operations WHERE status = 'posted' AND account_id = ? AND kind = ? AND currency = ?
      AND ABS(amount - ?) < 0.01 AND date BETWEEN date(?, '-1 day') AND date(?, '+1 day') LIMIT 1`,
@@ -1383,9 +1397,15 @@ export function createImportDraft(input: { source: ImportDraftSource; sender: st
     // here embed a running balance, so two genuinely distinct transactions can never collide).
     const bodyHash = hashString(`${input.source} ${input.sender} ${input.rawBody}`);
     const existing = await db.getFirstAsync<ImportDraftRow>('SELECT * FROM sms_drafts WHERE sender = ? AND body_hash = ?', input.sender, bodyHash);
-    if (existing) return { draft: mapImportDraftRow(existing), alreadyExisted: true };
+    // A resend that's still sitting there unconfirmed is a no-op *unless* it was previously
+    // 'unrecognized' and a parser can now make sense of it (e.g. a parser fix shipped after the
+    // message was already captured) -- otherwise a real fix would never retroactively apply to
+    // messages the app already has on file, only to ones that happen to arrive again.
+    if (existing && !(existing.status === 'unrecognized' && input.parsed)) {
+      return { draft: mapImportDraftRow(existing), alreadyExisted: true };
+    }
 
-    const id = makeId();
+    const id = existing?.id ?? makeId();
     const parsed = input.parsed;
     let accountId: string | undefined;
     let dedupOperationId: string | undefined;
@@ -1398,16 +1418,52 @@ export function createImportDraft(input: { source: ImportDraftSource; sender: st
     // no timestamp in it at all, only amount and running balance.
     const occurredAt = parsed?.occurredAt ?? input.receivedAt;
     if (parsed && accountId) dedupOperationId = await findDedupOperation(db, accountId, parsed.kind, parsed.currency, parsed.amount, occurredAt);
-    await db.runAsync(
-      `INSERT INTO sms_drafts (id, source, sender, parser_id, raw_body, body_hash, received_at, occurred_at, amount, currency, kind, fee_amount, card_last4, account_id, merchant, balance_after, status, dedup_operation_id)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      id, input.source, input.sender, input.parserId ?? null, input.rawBody, bodyHash, input.receivedAt,
-      parsed ? occurredAt : null, parsed?.amount ?? null, parsed?.currency ?? null, parsed?.kind ?? null,
-      parsed?.feeAmount ?? null, parsed?.cardLast4 ?? null, accountId ?? null, parsed?.merchant ?? null,
-      parsed?.balanceAfter ?? null, parsed ? 'pending' : 'unrecognized', dedupOperationId ?? null,
-    );
+    if (existing) {
+      await db.runAsync(
+        `UPDATE sms_drafts SET parser_id = ?, occurred_at = ?, amount = ?, currency = ?, kind = ?, fee_amount = ?,
+         card_last4 = ?, account_id = ?, merchant = ?, balance_after = ?, status = 'pending',
+         dedup_operation_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+        input.parserId ?? null, occurredAt, parsed!.amount, parsed!.currency, parsed!.kind,
+        parsed!.feeAmount ?? null, parsed!.cardLast4 ?? null, accountId ?? null, parsed!.merchant ?? null,
+        parsed!.balanceAfter ?? null, dedupOperationId ?? null, id,
+      );
+    } else {
+      await db.runAsync(
+        `INSERT INTO sms_drafts (id, source, sender, parser_id, raw_body, body_hash, received_at, occurred_at, amount, currency, kind, fee_amount, card_last4, account_id, merchant, balance_after, status, dedup_operation_id)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        id, input.source, input.sender, input.parserId ?? null, input.rawBody, bodyHash, input.receivedAt,
+        parsed ? occurredAt : null, parsed?.amount ?? null, parsed?.currency ?? null, parsed?.kind ?? null,
+        parsed?.feeAmount ?? null, parsed?.cardLast4 ?? null, accountId ?? null, parsed?.merchant ?? null,
+        parsed?.balanceAfter ?? null, parsed ? 'pending' : 'unrecognized', dedupOperationId ?? null,
+      );
+    }
     const row = await db.getFirstAsync<ImportDraftRow>('SELECT * FROM sms_drafts WHERE id = ?', id);
     return { draft: mapImportDraftRow(row!), alreadyExisted: false };
+  });
+}
+
+// One-off re-match: drafts captured before an account had card_last4 filled in are stuck with no
+// account (the match only ever runs once, at draft-creation time) -- re-run it now that the user
+// has gone back and filled cards in, without touching drafts that already resolved fine or that
+// still don't match anything (never guesses when 0 or 2+ accounts share the same last 4 digits).
+export function rematchImportDrafts() {
+  return enqueue(async () => {
+    const db = await getDatabase();
+    const rows = await db.getAllAsync<ImportDraftRow>(
+      "SELECT * FROM sms_drafts WHERE status = 'pending' AND account_id IS NULL AND card_last4 IS NOT NULL",
+    );
+    let updated = 0;
+    for (const row of rows) {
+      const matches = await db.getAllAsync<{ id: string }>('SELECT id FROM accounts WHERE card_last4 = ?', row.card_last4);
+      if (matches.length !== 1) continue;
+      const accountId = matches[0]!.id;
+      const dedupOperationId = row.amount !== null && row.currency !== null && row.kind !== null && row.occurred_at
+        ? await findDedupOperation(db, accountId, row.kind, row.currency, row.amount, row.occurred_at)
+        : undefined;
+      await db.runAsync('UPDATE sms_drafts SET account_id = ?, dedup_operation_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?', accountId, dedupOperationId ?? null, row.id);
+      updated++;
+    }
+    return updated;
   });
 }
 
