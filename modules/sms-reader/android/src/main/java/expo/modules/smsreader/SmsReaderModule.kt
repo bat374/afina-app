@@ -24,7 +24,7 @@ class SmsReaderModule : Module() {
     // listener/service. A listener needs a foreground-service notification on Android 8+ and
     // still gets killed by OEM battery managers; this feature's UX already requires opening the
     // app to review and confirm a draft, so a scan on launch/resume costs nothing extra.
-    AsyncFunction<List<Map<String, Any?>>>("readInboxAsync") { sinceEpochMs: Double, senders: List<String> ->
+    AsyncFunction("readInboxAsync") { sinceEpochMs: Double, senders: List<String> ->
       val context = appContext.reactContext ?: throw Exceptions.ReactContextLost()
       val normalizedSenders = senders.map { it.trim().lowercase() }.toSet()
       val results = mutableListOf<Map<String, Any?>>()
