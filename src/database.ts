@@ -1,5 +1,5 @@
 import * as SQLite from 'expo-sqlite';
-import { Account, AccountType, Budget, CashFlowKind, CurrencySettings, Debt, DebtDirection, DebtHistory, DebtHistoryType, DebtStatus, ExpenseRepeat, FinancialGoal, FinancialOperation, GoalType, InterestDestination, InterestPosting, InterestSchedule, PlannedExecutionInput, PlannedExpense, PlannedOccurrence, PlannedOccurrenceStatus, RecurrenceUnit, SmsDraft, Transfer, TransferInput, WithdrawalPolicy } from './types';
+import { Account, AccountType, Budget, CashFlowKind, CurrencySettings, Debt, DebtDirection, DebtHistory, DebtHistoryType, DebtStatus, ExpenseRepeat, FinancialGoal, FinancialOperation, GoalType, ImportDraft, ImportDraftSource, InterestDestination, InterestPosting, InterestSchedule, PlannedExecutionInput, PlannedExpense, PlannedOccurrence, PlannedOccurrenceStatus, RecurrenceUnit, Transfer, TransferInput, WithdrawalPolicy } from './types';
 import { addLocalDays, daysBetween, localToday, nextBusinessMonday, nextMonthlyDate, parseLocalDate, previousMonthlyDate, toLocalIso } from './date';
 import { occursOn } from './recurrence';
 import { ParsedSms } from './sms/types';
@@ -223,7 +223,7 @@ async function initializeDatabaseCore() {
       account_id TEXT NOT NULL,
       date TEXT NOT NULL,
       kind TEXT NOT NULL CHECK(kind IN ('income', 'expense')),
-      source TEXT NOT NULL CHECK(source IN ('manual', 'debt', 'interest', 'sms', 'receipt')),
+      source TEXT NOT NULL CHECK(source IN ('manual', 'debt', 'interest', 'sms', 'receipt', 'push')),
       debt_id TEXT,
       related_operation_id TEXT,
       account_amount REAL,
@@ -292,6 +292,7 @@ async function initializeDatabaseCore() {
     );
     CREATE TABLE IF NOT EXISTS sms_drafts (
       id TEXT PRIMARY KEY NOT NULL,
+      source TEXT NOT NULL DEFAULT 'sms' CHECK(source IN ('sms', 'push')),
       sender TEXT NOT NULL,
       parser_id TEXT,
       raw_body TEXT NOT NULL,
@@ -441,6 +442,44 @@ async function initializeDatabaseCore() {
   for (const [name, sqlType] of operationExtras) {
     if (!operationColumns.some((column) => column.name === name)) await db.execAsync(`ALTER TABLE operations ADD COLUMN ${name} ${sqlType};`);
   }
+  // Adds 'push' to operations.source's CHECK — SQLite can't ALTER a CHECK, so this rebuilds the
+  // table the same way the 'interest' addition above did. Runs after operationExtras so every
+  // ALTER-added column already exists to be explicitly selected across (not relying on positional
+  // SELECT * column order, which depends on ALTER TABLE's append order and is easy to get wrong).
+  const operationSqlForPush = await db.getFirstAsync<{ sql: string }>("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'operations'");
+  if (operationSqlForPush?.sql && !operationSqlForPush.sql.includes("'push'")) {
+    await db.execAsync(`
+      BEGIN;
+      CREATE TABLE operations_v3 (
+        id TEXT PRIMARY KEY NOT NULL, title TEXT NOT NULL, category TEXT NOT NULL,
+        amount REAL NOT NULL CHECK(amount > 0), currency TEXT NOT NULL, account_id TEXT NOT NULL,
+        date TEXT NOT NULL, kind TEXT NOT NULL CHECK(kind IN ('income', 'expense')),
+        source TEXT NOT NULL CHECK(source IN ('manual', 'debt', 'interest', 'sms', 'receipt', 'push')),
+        debt_id TEXT, related_operation_id TEXT, account_amount REAL, account_currency TEXT,
+        status TEXT NOT NULL DEFAULT 'posted' CHECK(status IN ('posted', 'reversed')),
+        source_occurrence_id TEXT, planned_amount REAL, planned_currency TEXT,
+        interest_source_account_id TEXT, receipt_photo_uri TEXT,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+      );
+      INSERT INTO operations_v3 (
+        id, title, category, amount, currency, account_id, date, kind, source, debt_id,
+        related_operation_id, account_amount, account_currency, status, source_occurrence_id,
+        planned_amount, planned_currency, interest_source_account_id, receipt_photo_uri, created_at
+      )
+      SELECT
+        id, title, category, amount, currency, account_id, date, kind, source, debt_id,
+        related_operation_id, account_amount, account_currency, status, source_occurrence_id,
+        planned_amount, planned_currency, interest_source_account_id, receipt_photo_uri, created_at
+      FROM operations;
+      DROP TABLE operations;
+      ALTER TABLE operations_v3 RENAME TO operations;
+      COMMIT;
+    `);
+  }
+  const smsDraftColumns = await db.getAllAsync<{ name: string }>('PRAGMA table_info(sms_drafts)');
+  // No CHECK on this ALTER — SQLite's ADD COLUMN doesn't take one the way CREATE TABLE does;
+  // validity of 'sms' | 'push' is enforced in TypeScript instead (ImportDraftSource).
+  if (!smsDraftColumns.some((column) => column.name === 'source')) await db.execAsync("ALTER TABLE sms_drafts ADD COLUMN source TEXT NOT NULL DEFAULT 'sms';");
   const flowColumns = await db.getAllAsync<{ name: string }>('PRAGMA table_info(scheduled_flows)');
   if (!flowColumns.some((column) => column.name === 'occurrences_tracking_from')) {
     await db.execAsync('ALTER TABLE scheduled_flows ADD COLUMN occurrences_tracking_from TEXT;');
@@ -1295,16 +1334,16 @@ export function createOperation(input: FinancialOperationInput) {
   });
 }
 
-type SmsDraftRow = {
-  id: string; sender: string; parser_id: string | null; raw_body: string; body_hash: string;
+type ImportDraftRow = {
+  id: string; source: ImportDraftSource; sender: string; parser_id: string | null; raw_body: string; body_hash: string;
   received_at: string; occurred_at: string | null; amount: number | null; currency: string | null;
   kind: 'income' | 'expense' | null; fee_amount: number | null; card_last4: string | null;
   account_id: string | null; merchant: string | null; balance_after: number | null;
-  status: SmsDraft['status']; operation_id: string | null; dedup_operation_id: string | null;
+  status: ImportDraft['status']; operation_id: string | null; dedup_operation_id: string | null;
 };
 
-const mapSmsDraftRow = (row: SmsDraftRow): SmsDraft => ({
-  id: row.id, sender: row.sender, parserId: row.parser_id ?? undefined, rawBody: row.raw_body,
+const mapImportDraftRow = (row: ImportDraftRow): ImportDraft => ({
+  id: row.id, source: row.source, sender: row.sender, parserId: row.parser_id ?? undefined, rawBody: row.raw_body,
   receivedAt: row.received_at, occurredAt: row.occurred_at ?? undefined,
   amount: row.amount ?? undefined, currency: row.currency ?? undefined, kind: row.kind ?? undefined,
   feeAmount: row.fee_amount ?? undefined, cardLast4: row.card_last4 ?? undefined,
@@ -1313,20 +1352,20 @@ const mapSmsDraftRow = (row: SmsDraftRow): SmsDraft => ({
   operationId: row.operation_id ?? undefined, dedupOperationId: row.dedup_operation_id ?? undefined,
 });
 
-async function listSmsDraftsCore(): Promise<SmsDraft[]> {
+async function listImportDraftsCore(): Promise<ImportDraft[]> {
   const db = await getDatabase();
-  const rows = await db.getAllAsync<SmsDraftRow>("SELECT * FROM sms_drafts WHERE status IN ('pending', 'unrecognized') ORDER BY received_at DESC");
-  return rows.map(mapSmsDraftRow);
+  const rows = await db.getAllAsync<ImportDraftRow>("SELECT * FROM sms_drafts WHERE status IN ('pending', 'unrecognized') ORDER BY received_at DESC");
+  return rows.map(mapImportDraftRow);
 }
 
-export function listSmsDrafts(): Promise<SmsDraft[]> {
-  return enqueue(listSmsDraftsCore);
+export function listImportDrafts(): Promise<ImportDraft[]> {
+  return enqueue(listImportDraftsCore);
 }
 
-// A heuristic (never-silent) hint that this SMS might duplicate an operation the user already
-// entered by hand: same account/kind/currency/amount (to the cent) and a date within +/-1 day —
-// operations only store a day-level date, not a timestamp, so a tighter window isn't possible.
-// A hit never auto-drops the draft; it just flags it for the user to confirm or reject.
+// A heuristic (never-silent) hint that this SMS/push message might duplicate an operation the
+// user already entered by hand: same account/kind/currency/amount (to the cent) and a date within
+// +/-1 day — operations only store a day-level date, not a timestamp, so a tighter window isn't
+// possible. A hit never auto-drops the draft; it just flags it for the user to confirm or reject.
 async function findDedupOperation(db: SQLite.SQLiteDatabase, accountId: string, kind: 'income' | 'expense', currency: string, amount: number, occurredAt: string): Promise<string | undefined> {
   const day = occurredAt.slice(0, 10);
   const row = await db.getFirstAsync<{ id: string }>(
@@ -1337,14 +1376,14 @@ async function findDedupOperation(db: SQLite.SQLiteDatabase, accountId: string, 
   return row?.id;
 }
 
-export function createSmsDraft(input: { sender: string; rawBody: string; receivedAt: string; parsed: ParsedSms | null; parserId?: string }) {
+export function createImportDraft(input: { source: ImportDraftSource; sender: string; rawBody: string; receivedAt: string; parsed: ParsedSms | null; parserId?: string }) {
   return enqueue(async () => {
     const db = await getDatabase();
-    // Same sender + byte-identical body = the bank resent the same message (both formats here
-    // embed a running balance, so two genuinely distinct transactions can never collide here).
-    const bodyHash = hashString(`${input.sender} ${input.rawBody}`);
-    const existing = await db.getFirstAsync<SmsDraftRow>('SELECT * FROM sms_drafts WHERE sender = ? AND body_hash = ?', input.sender, bodyHash);
-    if (existing) return { draft: mapSmsDraftRow(existing), alreadyExisted: true };
+    // Same source + sender + byte-identical body = a resend of the same message (both SMS formats
+    // here embed a running balance, so two genuinely distinct transactions can never collide).
+    const bodyHash = hashString(`${input.source} ${input.sender} ${input.rawBody}`);
+    const existing = await db.getFirstAsync<ImportDraftRow>('SELECT * FROM sms_drafts WHERE sender = ? AND body_hash = ?', input.sender, bodyHash);
+    if (existing) return { draft: mapImportDraftRow(existing), alreadyExisted: true };
 
     const id = makeId();
     const parsed = input.parsed;
@@ -1354,24 +1393,28 @@ export function createSmsDraft(input: { sender: string; rawBody: string; receive
       const matches = await db.getAllAsync<{ id: string }>('SELECT id FROM accounts WHERE card_last4 = ?', parsed.cardLast4);
       if (matches.length === 1) accountId = matches[0]!.id;
     }
-    if (parsed && accountId) dedupOperationId = await findDedupOperation(db, accountId, parsed.kind, parsed.currency, parsed.amount, parsed.occurredAt);
+    // Falls back to receivedAt (always present) when the parser couldn't determine occurredAt --
+    // confirmed reality for push notifications, not a hypothetical: Sberbank's purchase push has
+    // no timestamp in it at all, only amount and running balance.
+    const occurredAt = parsed?.occurredAt ?? input.receivedAt;
+    if (parsed && accountId) dedupOperationId = await findDedupOperation(db, accountId, parsed.kind, parsed.currency, parsed.amount, occurredAt);
     await db.runAsync(
-      `INSERT INTO sms_drafts (id, sender, parser_id, raw_body, body_hash, received_at, occurred_at, amount, currency, kind, fee_amount, card_last4, account_id, merchant, balance_after, status, dedup_operation_id)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      id, input.sender, input.parserId ?? null, input.rawBody, bodyHash, input.receivedAt,
-      parsed?.occurredAt ?? null, parsed?.amount ?? null, parsed?.currency ?? null, parsed?.kind ?? null,
+      `INSERT INTO sms_drafts (id, source, sender, parser_id, raw_body, body_hash, received_at, occurred_at, amount, currency, kind, fee_amount, card_last4, account_id, merchant, balance_after, status, dedup_operation_id)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      id, input.source, input.sender, input.parserId ?? null, input.rawBody, bodyHash, input.receivedAt,
+      parsed ? occurredAt : null, parsed?.amount ?? null, parsed?.currency ?? null, parsed?.kind ?? null,
       parsed?.feeAmount ?? null, parsed?.cardLast4 ?? null, accountId ?? null, parsed?.merchant ?? null,
       parsed?.balanceAfter ?? null, parsed ? 'pending' : 'unrecognized', dedupOperationId ?? null,
     );
-    const row = await db.getFirstAsync<SmsDraftRow>('SELECT * FROM sms_drafts WHERE id = ?', id);
-    return { draft: mapSmsDraftRow(row!), alreadyExisted: false };
+    const row = await db.getFirstAsync<ImportDraftRow>('SELECT * FROM sms_drafts WHERE id = ?', id);
+    return { draft: mapImportDraftRow(row!), alreadyExisted: false };
   });
 }
 
-export function confirmSmsDraft(id: string, input: { accountId: string; title: string; category: string; feeAsSeparateOperation?: boolean }) {
+export function confirmImportDraft(id: string, input: { accountId: string; title: string; category: string; feeAsSeparateOperation?: boolean }) {
   return enqueue(async () => {
     const db = await getDatabase();
-    const draft = await db.getFirstAsync<SmsDraftRow>('SELECT * FROM sms_drafts WHERE id = ?', id);
+    const draft = await db.getFirstAsync<ImportDraftRow>('SELECT * FROM sms_drafts WHERE id = ?', id);
     if (!draft || draft.status !== 'pending' || draft.amount === null || draft.currency === null || draft.kind === null || !draft.occurred_at) {
       throw new Error('Черновик не найден или уже обработан');
     }
@@ -1381,8 +1424,8 @@ export function confirmSmsDraft(id: string, input: { accountId: string; title: s
     await db.withTransactionAsync(async () => {
       await db.runAsync(
         `INSERT INTO operations (id, title, category, amount, currency, account_id, date, kind, source)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'sms')`,
-        operationId, input.title, input.category, draft.amount, draft.currency, input.accountId, date, draft.kind,
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        operationId, input.title, input.category, draft.amount, draft.currency, input.accountId, date, draft.kind, draft.source,
       );
       await db.runAsync('UPDATE accounts SET balance = balance + ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?', delta, input.accountId);
       // Deliberately NOT linked via related_operation_id — that field already means "this is a
@@ -1392,8 +1435,8 @@ export function confirmSmsDraft(id: string, input: { accountId: string; title: s
         const feeOperationId = makeId();
         await db.runAsync(
           `INSERT INTO operations (id, title, category, amount, currency, account_id, date, kind, source)
-           VALUES (?, ?, ?, ?, ?, ?, ?, 'expense', 'sms')`,
-          feeOperationId, 'Комиссия за операцию', 'Комиссия', draft.fee_amount, draft.currency, input.accountId, date,
+           VALUES (?, ?, ?, ?, ?, ?, ?, 'expense', ?)`,
+          feeOperationId, 'Комиссия за операцию', 'Комиссия', draft.fee_amount, draft.currency, input.accountId, date, draft.source,
         );
         await db.runAsync('UPDATE accounts SET balance = balance - ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?', draft.fee_amount, input.accountId);
       }
@@ -1403,14 +1446,14 @@ export function confirmSmsDraft(id: string, input: { accountId: string; title: s
   });
 }
 
-export function dismissSmsDraft(id: string) {
+export function dismissImportDraft(id: string) {
   return enqueue(async () => {
     const db = await getDatabase();
     await db.runAsync("UPDATE sms_drafts SET status = 'dismissed', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND status IN ('pending', 'unrecognized')", id);
   });
 }
 
-export function countPendingSmsDrafts(): Promise<number> {
+export function countPendingImportDrafts(): Promise<number> {
   return enqueue(async () => {
     const db = await getDatabase();
     const row = await db.getFirstAsync<{ count: number }>("SELECT COUNT(*) as count FROM sms_drafts WHERE status IN ('pending', 'unrecognized')");
@@ -1420,9 +1463,12 @@ export function countPendingSmsDrafts(): Promise<number> {
 
 const SMS_WATERMARK_KEY = 'sms_last_scanned_at';
 
+// SMS-specific: push notifications aren't scanned-since-a-timestamp, they're captured natively as
+// they arrive and drained on next app open (see modules/notification-reader, once built), so that
+// channel has no equivalent watermark concept.
 // Advances only after the whole inbox read for this scan has been turned into drafts (or
 // harmlessly deduped) -- so a scan interrupted partway through just reprocesses the overlapping
-// window next time, which createSmsDraft's (sender, body) uniqueness already makes idempotent.
+// window next time, which createImportDraft's (sender, body) uniqueness already makes idempotent.
 export function getSmsScanWatermark(): Promise<string | undefined> {
   return enqueue(async () => {
     const db = await getDatabase();

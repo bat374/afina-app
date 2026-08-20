@@ -93,12 +93,16 @@ export type PlannedOccurrence = {
   operationId?: string;
 };
 
-export type SmsDraftStatus = 'pending' | 'unrecognized' | 'confirmed' | 'dismissed';
+export type ImportDraftStatus = 'pending' | 'unrecognized' | 'confirmed' | 'dismissed';
+export type ImportDraftSource = 'sms' | 'push';
 
-// A parsed (or unparseable) bank SMS awaiting user confirmation before it can ever touch a
-// balance. Device-local only — the raw SMS text never leaves the phone (not synced to Supabase).
-export type SmsDraft = {
+// A parsed (or unparseable) bank SMS or push notification awaiting user confirmation before it
+// can ever touch a balance. Device-local only — the raw text never leaves the phone (not synced
+// to Supabase). `sender` holds the SMS sender id for source='sms', or the notifying app's Android
+// package name for source='push'.
+export type ImportDraft = {
   id: string;
+  source: ImportDraftSource;
   sender: string;
   parserId?: string;
   rawBody: string;
@@ -112,7 +116,7 @@ export type SmsDraft = {
   accountId?: string;
   merchant?: string;
   balanceAfter?: number;
-  status: SmsDraftStatus;
+  status: ImportDraftStatus;
   operationId?: string;
   dedupOperationId?: string;
 };
@@ -171,7 +175,7 @@ export type FinancialOperation = {
   accountId: string;
   date: string;
   kind: 'income' | 'expense';
-  source: 'manual' | 'debt' | 'interest' | 'sms' | 'receipt';
+  source: 'manual' | 'debt' | 'interest' | 'sms' | 'receipt' | 'push';
   debtId?: string;
   relatedOperationId?: string;
   accountAmount?: number;

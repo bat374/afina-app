@@ -11,9 +11,11 @@ import { Ionicons } from '@expo/vector-icons';
 import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
 import { budgets, calendarDays, goals, transactions } from './src/data';
 import { money, percent } from './src/format';
-import { Account, AccountType, Budget, CashFlowKind, CurrencySettings, Debt, DebtDirection, DebtHistory, ExpenseRepeat, FinancialGoal, FinancialOperation, GoalType, InterestSchedule, PlannedExecutionInput, PlannedExpense, PlannedOccurrence, RecurrenceUnit, SmsDraft, Transfer, TransferInput, WithdrawalPolicy } from './src/types';
-import { AccountInput, BudgetInput, cancelPlannedOccurrence, confirmSmsDraft, countPendingSmsDrafts, createDebt, createOperation, createSmsDraft, DebtInput, deleteAccount, deleteBudget, deleteFinancialGoal, deletePlannedExpense, dismissSmsDraft, executePlannedOccurrence, extendDebt, FinancialGoalInput, FinancialOperationInput, getCurrencySettings, getSmsScanWatermark, initializeDatabase, listAccounts, listBudgets, listDebtHistory, listDebts, listFinancialGoals, listOperations, listPlannedExpenses, listPlannedOccurrences, listSmsDrafts, listTransfers, markDebtOverdue, PlannedExpenseInput, recordDebtPayment, recordTransfer, reverseDebtPayment, reverseTransfer, saveAccount, saveBudget, saveCurrencySettings, saveFinancialGoal, savePlannedExpense, setSmsScanWatermark, synchronizeInterestPostings, synchronizePlannedOccurrences, updateDebt } from './src/database';
+import { Account, AccountType, Budget, CashFlowKind, CurrencySettings, Debt, DebtDirection, DebtHistory, ExpenseRepeat, FinancialGoal, FinancialOperation, GoalType, ImportDraft, InterestSchedule, PlannedExecutionInput, PlannedExpense, PlannedOccurrence, RecurrenceUnit, Transfer, TransferInput, WithdrawalPolicy } from './src/types';
+import { AccountInput, BudgetInput, cancelPlannedOccurrence, confirmImportDraft, countPendingImportDrafts, createDebt, createImportDraft, createOperation, DebtInput, deleteAccount, deleteBudget, deleteFinancialGoal, deletePlannedExpense, dismissImportDraft, executePlannedOccurrence, extendDebt, FinancialGoalInput, FinancialOperationInput, getCurrencySettings, getSmsScanWatermark, initializeDatabase, listAccounts, listBudgets, listDebtHistory, listDebts, listFinancialGoals, listImportDrafts, listOperations, listPlannedExpenses, listPlannedOccurrences, listTransfers, markDebtOverdue, PlannedExpenseInput, recordDebtPayment, recordTransfer, reverseDebtPayment, reverseTransfer, saveAccount, saveBudget, saveCurrencySettings, saveFinancialGoal, savePlannedExpense, setSmsScanWatermark, synchronizeInterestPostings, synchronizePlannedOccurrences, updateDebt } from './src/database';
 import { parsersForSender, parseSms } from './src/sms/registry';
+import { parsePush } from './src/push/registry';
+import { KNOWN_BANK_PACKAGES } from './src/push/packages';
 import { hasSmsPermission, isSmsReaderAvailable, readSmsInbox, requestSmsPermission } from './modules/sms-reader';
 import { DetectedAccount, recognizeAccountScreenshot } from './src/ocr';
 import { annualPassiveIncome, buildMonthProjection, getCurrencyTotals } from './src/finance';
@@ -464,8 +466,8 @@ async function scanSmsInbox(): Promise<void> {
   for (const message of messages) {
     const sender = message.address.trim().toLowerCase();
     const result = parseSms(sender, message.body);
-    await createSmsDraft({
-      sender, rawBody: message.body, receivedAt: new Date(message.dateMs).toISOString(),
+    await createImportDraft({
+      source: 'sms', sender, rawBody: message.body, receivedAt: new Date(message.dateMs).toISOString(),
       parsed: result?.parsed ?? null, parserId: result?.parserId,
     });
   }
@@ -475,20 +477,21 @@ async function scanSmsInbox(): Promise<void> {
   await setSmsScanWatermark(scanStartedAt);
 }
 
-function SmsDraftCard({ draft, accounts, onConfirm, onDismiss }: { draft: SmsDraft; accounts: Account[]; onConfirm: (accountId: string, includeFee: boolean) => void; onDismiss: () => void }) {
+function ImportDraftCard({ draft, accounts, onConfirm, onDismiss }: { draft: ImportDraft; accounts: Account[]; onConfirm: (accountId: string, includeFee: boolean) => void; onDismiss: () => void }) {
   const [accountId, setAccountId] = useState(draft.accountId);
   const [includeFee, setIncludeFee] = useState(true);
   useEffect(() => { setAccountId(draft.accountId); }, [draft.accountId]);
+  const sourceLabel = draft.source === 'push' ? 'Push' : 'SMS';
   if (draft.status === 'unrecognized') {
     return <View style={[s.card, { padding: 16 }]}>
-      <Text style={s.rowTitle}>Не распознано</Text>
+      <Text style={s.rowTitle}>Не распознано · {sourceLabel}</Text>
       <Text style={[s.rowSub, { marginTop: 4 }]}>{draft.sender} · {draft.rawBody.slice(0, 90)}{draft.rawBody.length > 90 ? '…' : ''}</Text>
       <Pressable style={[s.secondaryButton, { marginTop: 8 }]} onPress={onDismiss}><Text style={s.secondaryText}>Убрать</Text></Pressable>
     </View>;
   }
   return <View style={[s.card, { padding: 16 }]}>
     <View style={s.budgetTop}><Text style={s.rowTitle}>{draft.merchant || (draft.kind === 'income' ? 'Поступление' : 'Операция по карте')}</Text><Text style={draft.kind === 'income' ? s.income : s.expense}>{draft.kind === 'income' ? '+' : '−'}{money(draft.amount ?? 0, false, draft.currency)}</Text></View>
-    <Text style={s.rowSub}>{draft.occurredAt?.replace('T', ' ')}{draft.cardLast4 ? ` · карта •${draft.cardLast4}` : ''}</Text>
+    <Text style={s.rowSub}>{sourceLabel} · {draft.occurredAt?.replace('T', ' ')}{draft.cardLast4 ? ` · карта •${draft.cardLast4}` : ''}</Text>
     {!!draft.dedupOperationId && <Text style={[s.rowSub, { color: C.red, marginTop: 4 }]}>Похоже, уже добавлено вручную — проверьте перед подтверждением</Text>}
     <Text style={[s.fieldLabel, { marginTop: 10 }]}>СЧЁТ</Text>
     <View style={s.targetList}>{accounts.map((item) => <Pressable key={item.id} style={[s.targetAccount, accountId === item.id && s.targetAccountActive]} onPress={() => setAccountId(item.id)}><Text style={s.targetAccountText}>{item.name} · {item.currency}</Text></Pressable>)}</View>
@@ -503,41 +506,66 @@ function SmsDraftCard({ draft, accounts, onConfirm, onDismiss }: { draft: SmsDra
   </View>;
 }
 
-function SmsImportModal({ visible, accounts, onClose }: { visible: boolean; accounts: Account[]; onClose: () => void }) {
+const KNOWN_BANK_PACKAGE_LIST = Object.entries(KNOWN_BANK_PACKAGES);
+
+function ImportDraftsModal({ visible, accounts, onClose }: { visible: boolean; accounts: Account[]; onClose: () => void }) {
+  const [channel, setChannel] = useState<'sms' | 'push'>('sms');
   const [sender, setSender] = useState(KNOWN_SMS_SENDERS[0]!);
+  const [bankKey, setBankKey] = useState(KNOWN_BANK_PACKAGE_LIST[0]![0]);
+  const [title, setTitle] = useState('');
   const [body, setBody] = useState('');
-  const [drafts, setDrafts] = useState<SmsDraft[]>([]);
+  const [drafts, setDrafts] = useState<ImportDraft[]>([]);
   const [loading, setLoading] = useState(false);
-  const reload = async () => setDrafts(await listSmsDrafts());
+  const reload = async () => setDrafts(await listImportDrafts());
   useEffect(() => { if (visible) reload(); }, [visible]);
   const handleParse = async () => {
     if (!body.trim()) return;
     setLoading(true);
     try {
-      const result = parseSms(sender, body.trim());
-      await createSmsDraft({ sender, rawBody: body.trim(), receivedAt: new Date().toISOString(), parsed: result?.parsed ?? null, parserId: result?.parserId });
-      setBody(''); await reload();
+      if (channel === 'sms') {
+        const result = parseSms(sender, body.trim());
+        await createImportDraft({ source: 'sms', sender, rawBody: body.trim(), receivedAt: new Date().toISOString(), parsed: result?.parsed ?? null, parserId: result?.parserId });
+      } else {
+        const packageName = KNOWN_BANK_PACKAGES[bankKey]!;
+        const result = parsePush(packageName, title.trim(), body.trim());
+        await createImportDraft({ source: 'push', sender: packageName, rawBody: `${title.trim()}\n${body.trim()}`, receivedAt: new Date().toISOString(), parsed: result?.parsed ?? null, parserId: result?.parserId });
+      }
+      setTitle(''); setBody(''); await reload();
     } finally { setLoading(false); }
   };
-  const handleConfirm = async (draft: SmsDraft, accountId: string, includeFee: boolean) => {
-    await confirmSmsDraft(draft.id, { accountId, title: draft.merchant || (draft.kind === 'income' ? 'Поступление' : 'Операция по карте'), category: 'Другое', feeAsSeparateOperation: includeFee });
+  const handleConfirm = async (draft: ImportDraft, accountId: string, includeFee: boolean) => {
+    await confirmImportDraft(draft.id, { accountId, title: draft.merchant || (draft.kind === 'income' ? 'Поступление' : 'Операция по карте'), category: 'Другое', feeAsSeparateOperation: includeFee });
     await reload();
   };
-  const handleDismiss = async (draft: SmsDraft) => { await dismissSmsDraft(draft.id); await reload(); };
+  const handleDismiss = async (draft: ImportDraft) => { await dismissImportDraft(draft.id); await reload(); };
   return <Modal visible={visible} animationType="slide" presentationStyle="pageSheet" onRequestClose={onClose}>
     <SafeAreaView style={s.modal} edges={['top', 'bottom']}>
-      <View style={s.modalHead}><Pressable onPress={onClose} style={s.close}><Ionicons name="close" size={22} color={C.ink} /></Pressable><Text style={s.modalTitle}>SMS-импорт (тест)</Text><View style={{ width: 40 }} /></View>
+      <View style={s.modalHead}><Pressable onPress={onClose} style={s.close}><Ionicons name="close" size={22} color={C.ink} /></Pressable><Text style={s.modalTitle}>Импорт SMS и push (тест)</Text><View style={{ width: 40 }} /></View>
       <KeyboardAvoidingView style={{ flex: 1 }} behavior={Platform.OS === 'ios' ? 'padding' : 'height'}>
         <ScrollView contentContainerStyle={s.formBody} keyboardShouldPersistTaps="handled" keyboardDismissMode="on-drag" automaticallyAdjustKeyboardInsets>
-          <Text style={s.helperText}>Вставьте текст SMS от банка, чтобы проверить разбор — до появления автоматического чтения SMS с телефона.</Text>
-          <Text style={s.fieldLabel}>ОТПРАВИТЕЛЬ</Text>
-          <View style={s.choiceRow}>{KNOWN_SMS_SENDERS.map((item) => <Pressable key={item} style={[s.choice, sender === item && s.choiceActive]} onPress={() => setSender(item)}><Text style={[s.choiceText, sender === item && s.choiceTextActive]}>{item}</Text></Pressable>)}</View>
-          <Text style={s.fieldLabel}>ТЕКСТ SMS</Text>
-          <TextInput value={body} onChangeText={setBody} placeholder="Вставьте текст сюда" placeholderTextColor="#9BA9AF" multiline style={[s.input, { minHeight: 100, paddingTop: 12, textAlignVertical: 'top' }]} />
+          <Text style={s.helperText}>Вставьте текст SMS или push-уведомления от банка, чтобы проверить разбор — до появления автоматического чтения с телефона.</Text>
+          <Text style={s.fieldLabel}>ИСТОЧНИК</Text>
+          <View style={s.choiceRow}>
+            <Pressable style={[s.choice, channel === 'sms' && s.choiceActive]} onPress={() => setChannel('sms')}><Text style={[s.choiceText, channel === 'sms' && s.choiceTextActive]}>SMS</Text></Pressable>
+            <Pressable style={[s.choice, channel === 'push' && s.choiceActive]} onPress={() => setChannel('push')}><Text style={[s.choiceText, channel === 'push' && s.choiceTextActive]}>Push</Text></Pressable>
+          </View>
+          {channel === 'sms' ? <>
+            <Text style={s.fieldLabel}>ОТПРАВИТЕЛЬ</Text>
+            <View style={s.choiceRow}>{KNOWN_SMS_SENDERS.map((item) => <Pressable key={item} style={[s.choice, sender === item && s.choiceActive]} onPress={() => setSender(item)}><Text style={[s.choiceText, sender === item && s.choiceTextActive]}>{item}</Text></Pressable>)}</View>
+            <Text style={s.fieldLabel}>ТЕКСТ SMS</Text>
+            <TextInput value={body} onChangeText={setBody} placeholder="Вставьте текст сюда" placeholderTextColor="#9BA9AF" multiline style={[s.input, { minHeight: 100, paddingTop: 12, textAlignVertical: 'top' }]} />
+          </> : <>
+            <Text style={s.fieldLabel}>БАНК</Text>
+            <View style={s.choiceRow}>{KNOWN_BANK_PACKAGE_LIST.map(([key]) => <Pressable key={key} style={[s.choice, bankKey === key && s.choiceActive]} onPress={() => setBankKey(key)}><Text style={[s.choiceText, bankKey === key && s.choiceTextActive]}>{key}</Text></Pressable>)}</View>
+            <Text style={s.fieldLabel}>ЗАГОЛОВОК УВЕДОМЛЕНИЯ</Text>
+            <TextInput value={title} onChangeText={setTitle} placeholder="Например, Покупка по СБП в Rahmat" placeholderTextColor="#9BA9AF" style={s.input} />
+            <Text style={s.fieldLabel}>ТЕКСТ УВЕДОМЛЕНИЯ</Text>
+            <TextInput value={body} onChangeText={setBody} placeholder="Вставьте текст сюда" placeholderTextColor="#9BA9AF" multiline style={[s.input, { minHeight: 100, paddingTop: 12, textAlignVertical: 'top' }]} />
+          </>}
           <Pressable style={s.primaryButton} disabled={loading || !body.trim()} onPress={handleParse}><Text style={s.primaryText}>{loading ? 'Разбираем…' : 'Разобрать'}</Text></Pressable>
           <Text style={[s.sectionTitle, { marginTop: 26, marginBottom: 10 }]}>Черновики</Text>
           {!drafts.length && <Text style={s.rowSub}>Пока пусто</Text>}
-          {drafts.map((draft) => <View key={draft.id} style={{ marginBottom: 10 }}><SmsDraftCard draft={draft} accounts={accounts} onConfirm={(accountId, includeFee) => handleConfirm(draft, accountId, includeFee)} onDismiss={() => handleDismiss(draft)} /></View>)}
+          {drafts.map((draft) => <View key={draft.id} style={{ marginBottom: 10 }}><ImportDraftCard draft={draft} accounts={accounts} onConfirm={(accountId, includeFee) => handleConfirm(draft, accountId, includeFee)} onDismiss={() => handleDismiss(draft)} /></View>)}
         </ScrollView>
       </KeyboardAvoidingView>
     </SafeAreaView>
@@ -700,7 +728,7 @@ function Profile({ email, accounts, currencySettings, onCurrencySettings, onBack
     <Pressable style={s.deleteButton} onPress={handleSignOut}><Ionicons name="log-out-outline" size={18} color={C.red} /><Text style={s.deleteText}>Выйти из аккаунта</Text></Pressable>
     <View style={{ height: 20 }} />
     <PinSetupModal visible={pinSetupOpen} onClose={() => setPinSetupOpen(false)} onSaved={() => { setLockEnabledState(true); setPinSetupOpen(false); }} />
-    <SmsImportModal visible={smsImportOpen} accounts={accounts} onClose={() => { setSmsImportOpen(false); onSmsDraftsChanged(); }} />
+    <ImportDraftsModal visible={smsImportOpen} accounts={accounts} onClose={() => { setSmsImportOpen(false); onSmsDraftsChanged(); }} />
   </ScrollView>;
 }
 
@@ -1500,7 +1528,7 @@ function AppContent({ userId, email }: { userId: string; email?: string }) {
         } catch { /* Офлайн: продолжаем использовать последний сохранённый курс. */ }
       }
       setDatabaseReady(true);
-      scanSmsInbox().then(() => countPendingSmsDrafts().then(setPendingSmsDrafts)).catch(() => { /* Permission not granted yet, or reader unavailable on this platform. */ });
+      scanSmsInbox().then(() => countPendingImportDrafts().then(setPendingSmsDrafts)).catch(() => { /* Permission not granted yet, or reader unavailable on this platform. */ });
     }).catch((error) => Alert.alert(
       'Не удалось открыть локальную базу',
       `Перезапустите приложение и попробуйте снова. Если не помогает — проверьте свободное место на устройстве.${describeError(error) ? `\n\n${describeError(error)}` : ''}`,
@@ -1508,7 +1536,7 @@ function AppContent({ userId, email }: { userId: string; email?: string }) {
   }, [userId]);
   useEffect(() => {
     const subscription = AppState.addEventListener('change', (next) => {
-      if (next === 'active' && databaseReady) scanSmsInbox().then(() => countPendingSmsDrafts().then(setPendingSmsDrafts)).catch(() => { /* Same as above. */ });
+      if (next === 'active' && databaseReady) scanSmsInbox().then(() => countPendingImportDrafts().then(setPendingSmsDrafts)).catch(() => { /* Same as above. */ });
     });
     return () => subscription.remove();
   }, [databaseReady]);
@@ -1626,7 +1654,7 @@ function AppContent({ userId, email }: { userId: string; email?: string }) {
 
   const screen = useMemo(() => {
     const onProfile = () => setTab('profile');
-    if (tab === 'profile') return <Profile email={email} accounts={userAccounts} currencySettings={currencySettings} onCurrencySettings={() => setCurrencySettingsOpen(true)} onBack={() => setTab('home')} pendingSmsDrafts={pendingSmsDrafts} onSmsDraftsChanged={() => countPendingSmsDrafts().then(setPendingSmsDrafts)} />;
+    if (tab === 'profile') return <Profile email={email} accounts={userAccounts} currencySettings={currencySettings} onCurrencySettings={() => setCurrencySettingsOpen(true)} onBack={() => setTab('home')} pendingSmsDrafts={pendingSmsDrafts} onSmsDraftsChanged={() => countPendingImportDrafts().then(setPendingSmsDrafts)} />;
     if (tab === 'accounts') return <Accounts accounts={userAccounts} onAdd={openNewAccount} onImport={() => setImportOpen(true)} onEdit={openAccount} debts={debts} onAddDebt={openNewDebt} onOpenDebt={openDebt} currencySettings={currencySettings} onCurrencySettings={() => setCurrencySettingsOpen(true)} onProfile={onProfile} />;
     if (tab === 'calendar') return <Calendar accounts={userAccounts} plannedExpenses={plannedExpenses} plannedOccurrences={plannedOccurrences} debts={debts} currencySettings={currencySettings} onAddExpense={openNewExpense} onEditExpense={openExpense} onExecuteOccurrence={handleOpenOccurrence} onCancelOccurrence={handleCancelOccurrence} onProfile={onProfile} />;
     if (tab === 'operations') return <Operations operations={operations} transfers={transfers} plannedOccurrences={plannedOccurrences} plannedExpenses={plannedExpenses} accounts={userAccounts} onAdd={() => setOperationEditorOpen(true)} onTransfer={() => setTransferModalOpen(true)} onReverseTransfer={handleReverseTransfer} onExecuteOccurrence={handleOpenOccurrence} onCancelOccurrence={handleCancelOccurrence} onProfile={onProfile} />;
