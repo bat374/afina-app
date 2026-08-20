@@ -981,28 +981,32 @@ export function listTransfers(): Promise<Transfer[]> {
   return enqueue(listTransfersCore);
 }
 
+async function recordTransferCore(db: SQLite.SQLiteDatabase, input: TransferInput): Promise<string> {
+  if (input.fromAccountId === input.toAccountId) throw new Error('Счета списания и зачисления должны различаться');
+  if (!Number.isFinite(input.fromAmount) || input.fromAmount <= 0) throw new Error('Сумма списания должна быть больше нуля');
+  if (!Number.isFinite(input.toAmount) || input.toAmount <= 0) throw new Error('Сумма зачисления должна быть больше нуля');
+  const fromAccount = await db.getFirstAsync<{ currency: string }>('SELECT currency FROM accounts WHERE id = ?', input.fromAccountId);
+  const toAccount = await db.getFirstAsync<{ currency: string }>('SELECT currency FROM accounts WHERE id = ?', input.toAccountId);
+  if (!fromAccount) throw new Error('Счёт списания не найден');
+  if (!toAccount) throw new Error('Счёт зачисления не найден');
+  const id = makeId();
+  await db.withTransactionAsync(async () => {
+    await db.runAsync('UPDATE accounts SET balance = balance - ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?', input.fromAmount, input.fromAccountId);
+    await db.runAsync('UPDATE accounts SET balance = balance + ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?', input.toAmount, input.toAccountId);
+    await db.runAsync(
+      `INSERT INTO transfers (id, from_account_id, to_account_id, from_amount, from_currency, to_amount, to_currency, exchange_rate, note, date, status)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'posted')`,
+      id, input.fromAccountId, input.toAccountId, input.fromAmount, fromAccount.currency, input.toAmount, toAccount.currency,
+      input.exchangeRate ?? null, input.note ?? null, input.date,
+    );
+  });
+  return id;
+}
+
 export function recordTransfer(input: TransferInput) {
   return enqueue(async () => {
     const db = await getDatabase();
-    if (input.fromAccountId === input.toAccountId) throw new Error('Счета списания и зачисления должны различаться');
-    if (!Number.isFinite(input.fromAmount) || input.fromAmount <= 0) throw new Error('Сумма списания должна быть больше нуля');
-    if (!Number.isFinite(input.toAmount) || input.toAmount <= 0) throw new Error('Сумма зачисления должна быть больше нуля');
-    const fromAccount = await db.getFirstAsync<{ currency: string }>('SELECT currency FROM accounts WHERE id = ?', input.fromAccountId);
-    const toAccount = await db.getFirstAsync<{ currency: string }>('SELECT currency FROM accounts WHERE id = ?', input.toAccountId);
-    if (!fromAccount) throw new Error('Счёт списания не найден');
-    if (!toAccount) throw new Error('Счёт зачисления не найден');
-    const id = makeId();
-    await db.withTransactionAsync(async () => {
-      await db.runAsync('UPDATE accounts SET balance = balance - ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?', input.fromAmount, input.fromAccountId);
-      await db.runAsync('UPDATE accounts SET balance = balance + ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?', input.toAmount, input.toAccountId);
-      await db.runAsync(
-        `INSERT INTO transfers (id, from_account_id, to_account_id, from_amount, from_currency, to_amount, to_currency, exchange_rate, note, date, status)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'posted')`,
-        id, input.fromAccountId, input.toAccountId, input.fromAmount, fromAccount.currency, input.toAmount, toAccount.currency,
-        input.exchangeRate ?? null, input.note ?? null, input.date,
-      );
-    });
-    return id;
+    return recordTransferCore(db, input);
   });
 }
 
@@ -1365,22 +1369,26 @@ export function listImportDrafts(): Promise<ImportDraft[]> {
 // A heuristic (never-silent) hint that this SMS/push message might duplicate an operation that
 // already exists in Afina — either entered by hand, or (just as real a risk) already posted by
 // Afina's own interest engine (synchronizeInterestPostings) crediting the same destination
-// account on the same day. That second case can't rely on exact amount matching: Afina's simple
-// day-count interest formula can legitimately differ by a fraction from what the bank actually
-// credits, so an amount-only check could silently miss it. interest_postings has a
-// UNIQUE(account_id, payout_date) constraint, so at most one 'interest' operation ever exists per
-// account per day — matching on account+day+source='interest' alone is reliable there without
-// needing the amount to line up at all. Manual-entry duplicates still go through the tighter
-// amount-matched check. A hit never auto-drops the draft; it just flags it for the user.
+// account on the same day. That second case can't rely on the tight (to-the-cent) amount check
+// used for manual entries: Afina's simple day-count interest formula can legitimately differ by a
+// fraction from what the bank actually credits. But it must still compare amounts at some
+// tolerance — matching purely on account+day+source='interest' with no amount check at all is too
+// loose: a same-day round-number transfer (e.g. moving 100,000 UZS off a deposit) is nothing like
+// a day's interest and must not be flagged as "possibly the same thing" just because some interest
+// posting also happened to land on that account that day. A 5% relative tolerance (floor 1 unit,
+// for tiny fractional amounts) covers rounding drift without matching wildly different transfers.
+// Manual-entry duplicates still go through the tighter exact-amount check below. A hit never
+// auto-drops the draft; it just flags it for the user.
 async function findDedupOperation(db: SQLite.SQLiteDatabase, accountId: string, kind: 'income' | 'expense', currency: string, amount: number, occurredAt: string): Promise<string | undefined> {
   const day = occurredAt.slice(0, 10);
   if (kind === 'income') {
-    const interestRow = await db.getFirstAsync<{ id: string }>(
-      `SELECT id FROM operations WHERE status = 'posted' AND account_id = ? AND source = 'interest'
-       AND date BETWEEN date(?, '-1 day') AND date(?, '+1 day') LIMIT 1`,
+    const interestRows = await db.getAllAsync<{ id: string; amount: number }>(
+      `SELECT id, amount FROM operations WHERE status = 'posted' AND account_id = ? AND source = 'interest'
+       AND date BETWEEN date(?, '-1 day') AND date(?, '+1 day')`,
       accountId, day, day,
     );
-    if (interestRow) return interestRow.id;
+    const closeMatch = interestRows.find((row) => Math.abs(row.amount - amount) <= Math.max(1, amount * 0.05));
+    if (closeMatch) return closeMatch.id;
   }
   const row = await db.getFirstAsync<{ id: string }>(
     `SELECT id FROM operations WHERE status = 'posted' AND account_id = ? AND kind = ? AND currency = ?
@@ -1449,17 +1457,23 @@ export function createImportDraft(input: { source: ImportDraftSource; sender: st
 export function rematchImportDrafts() {
   return enqueue(async () => {
     const db = await getDatabase();
-    const rows = await db.getAllAsync<ImportDraftRow>(
-      "SELECT * FROM sms_drafts WHERE status = 'pending' AND account_id IS NULL AND card_last4 IS NOT NULL",
-    );
+    // Recomputes for every still-pending draft, not just ones missing an account -- also refreshes
+    // dedup_operation_id against the current findDedupOperation logic, so a dedup-check fix (e.g.
+    // the interest-vs-transfer tolerance bug) retroactively corrects drafts that were already
+    // matched to an account, not only ones waiting on card_last4.
+    const rows = await db.getAllAsync<ImportDraftRow>("SELECT * FROM sms_drafts WHERE status = 'pending'");
     let updated = 0;
     for (const row of rows) {
-      const matches = await db.getAllAsync<{ id: string }>('SELECT id FROM accounts WHERE card_last4 = ?', row.card_last4);
-      if (matches.length !== 1) continue;
-      const accountId = matches[0]!.id;
+      let accountId = row.account_id ?? undefined;
+      if (!accountId && row.card_last4) {
+        const matches = await db.getAllAsync<{ id: string }>('SELECT id FROM accounts WHERE card_last4 = ?', row.card_last4);
+        if (matches.length === 1) accountId = matches[0]!.id;
+      }
+      if (!accountId) continue;
       const dedupOperationId = row.amount !== null && row.currency !== null && row.kind !== null && row.occurred_at
         ? await findDedupOperation(db, accountId, row.kind, row.currency, row.amount, row.occurred_at)
         : undefined;
+      if (accountId === row.account_id && (dedupOperationId ?? null) === row.dedup_operation_id) continue;
       await db.runAsync('UPDATE sms_drafts SET account_id = ?, dedup_operation_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?', accountId, dedupOperationId ?? null, row.id);
       updated++;
     }
@@ -1499,6 +1513,43 @@ export function confirmImportDraft(id: string, input: { accountId: string; title
       await db.runAsync("UPDATE sms_drafts SET status = 'confirmed', operation_id = ?, account_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?", operationId, input.accountId, id);
     });
     return operationId;
+  });
+}
+
+// A draft's matched account is only one side of what's actually a transfer between the user's own
+// accounts (e.g. a deposit crediting a card) — the other side is never known from the SMS/push
+// text alone, so the user must pick it explicitly here rather than the app guessing. Same-currency
+// only for now: nothing seen so far needs a cross-currency SMS-derived transfer, and inventing an
+// exchange rate the bank never stated would be a guess, not a fact.
+export function confirmImportDraftAsTransfer(id: string, input: { counterpartyAccountId: string; note?: string }) {
+  return enqueue(async () => {
+    const db = await getDatabase();
+    const draft = await db.getFirstAsync<ImportDraftRow>('SELECT * FROM sms_drafts WHERE id = ?', id);
+    if (!draft || draft.status !== 'pending' || draft.amount === null || draft.currency === null || draft.kind === null || !draft.occurred_at || !draft.account_id) {
+      throw new Error('Черновик не найден, уже обработан или не привязан к счёту');
+    }
+    const counterparty = await db.getFirstAsync<{ currency: string }>('SELECT currency FROM accounts WHERE id = ?', input.counterpartyAccountId);
+    if (!counterparty) throw new Error('Счёт не найден');
+    if (counterparty.currency !== draft.currency) throw new Error('Перевод между разными валютами пока нельзя провести из SMS/push — добавьте вручную через «Перевод»');
+    if (input.counterpartyAccountId === draft.account_id) throw new Error('Счета списания и зачисления должны различаться');
+    const date = draft.occurred_at.slice(0, 10);
+    const fromAccountId = draft.kind === 'income' ? input.counterpartyAccountId : draft.account_id;
+    const toAccountId = draft.kind === 'income' ? draft.account_id : input.counterpartyAccountId;
+    const transferId = makeId();
+    // Not nested inside recordTransferCore's own withTransactionAsync (expo-sqlite doesn't support
+    // nested transactions) -- inlined here instead, so the transfer and the draft's status update
+    // land in one transaction together, same as confirmImportDraft does for a plain operation.
+    await db.withTransactionAsync(async () => {
+      await db.runAsync('UPDATE accounts SET balance = balance - ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?', draft.amount, fromAccountId);
+      await db.runAsync('UPDATE accounts SET balance = balance + ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?', draft.amount, toAccountId);
+      await db.runAsync(
+        `INSERT INTO transfers (id, from_account_id, to_account_id, from_amount, from_currency, to_amount, to_currency, note, date, status)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'posted')`,
+        transferId, fromAccountId, toAccountId, draft.amount, draft.currency, draft.amount, draft.currency, input.note ?? null, date,
+      );
+      await db.runAsync("UPDATE sms_drafts SET status = 'confirmed', operation_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?", transferId, id);
+    });
+    return transferId;
   });
 }
 

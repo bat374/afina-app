@@ -22,7 +22,18 @@ const MONTHS: Record<string, number> = {
 };
 const accountTopUpRe = /Schet po karte\s*\*(\d{4})\s+popolnen na summu\s+(\d+(?:\.\d+)?)\s+([A-Z]{3})\.\s*(\d{2})-([A-Za-z]{3})-(\d{4})\s+(\d{2}):(\d{2})/i;
 
+// A declined purchase attempt, e.g.:
+//   "Hisobda mablag' yetarli emas. Nedostatochno sredstv.Karta *3463. Xarid/Pokupka
+//    "YANDEX.GO>YUNUSOBOD", -41000.00, UZS, "19-08-2026 20:24". Dostupno: 28593.19, UZS."
+// This still contains a "Karta *NNNN. Xarid/Pokupka ..." substring that purchaseRe would
+// otherwise match — confirmed against a real sample where "Dostupno" is unchanged from the prior
+// (successful) message, i.e. no money actually moved. Must be checked before purchaseRe runs, or
+// a transaction the bank refused would get recorded as a real expense that never happened.
+const declinedRe = /yetarli\s+emas|nedostatochno\s+sredstv/i;
+
 function parseKapitalbank(body: string): ParsedSms | null {
+  if (declinedRe.test(body)) return null;
+
   const purchase = body.match(purchaseRe);
   if (purchase) {
     const [, cardLast4, merchant, rawAmount, currency, dd, mm, yyyy, hh, min, balance] = purchase;

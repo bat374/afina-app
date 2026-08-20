@@ -12,7 +12,7 @@ import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
 import { budgets, calendarDays, goals, transactions } from './src/data';
 import { money, percent } from './src/format';
 import { Account, AccountType, Budget, CashFlowKind, CurrencySettings, Debt, DebtDirection, DebtHistory, ExpenseRepeat, FinancialGoal, FinancialOperation, GoalType, ImportDraft, InterestSchedule, PlannedExecutionInput, PlannedExpense, PlannedOccurrence, RecurrenceUnit, Transfer, TransferInput, WithdrawalPolicy } from './src/types';
-import { AccountInput, BudgetInput, cancelPlannedOccurrence, confirmImportDraft, countPendingImportDrafts, createDebt, createImportDraft, createOperation, DebtInput, deleteAccount, deleteBudget, deleteFinancialGoal, deletePlannedExpense, dismissImportDraft, executePlannedOccurrence, extendDebt, FinancialGoalInput, FinancialOperationInput, getCurrencySettings, getSmsScanWatermark, initializeDatabase, listAccounts, listBudgets, listDebtHistory, listDebts, listFinancialGoals, listImportDrafts, listOperations, listPlannedExpenses, listPlannedOccurrences, listTransfers, markDebtOverdue, PlannedExpenseInput, recordDebtPayment, recordTransfer, rematchImportDrafts, reverseDebtPayment, reverseTransfer, saveAccount, saveBudget, saveCurrencySettings, saveFinancialGoal, savePlannedExpense, setSmsScanWatermark, synchronizeInterestPostings, synchronizePlannedOccurrences, updateDebt } from './src/database';
+import { AccountInput, BudgetInput, cancelPlannedOccurrence, confirmImportDraft, confirmImportDraftAsTransfer, countPendingImportDrafts, createDebt, createImportDraft, createOperation, DebtInput, deleteAccount, deleteBudget, deleteFinancialGoal, deletePlannedExpense, dismissImportDraft, executePlannedOccurrence, extendDebt, FinancialGoalInput, FinancialOperationInput, getCurrencySettings, getSmsScanWatermark, initializeDatabase, listAccounts, listBudgets, listDebtHistory, listDebts, listFinancialGoals, listImportDrafts, listOperations, listPlannedExpenses, listPlannedOccurrences, listTransfers, markDebtOverdue, PlannedExpenseInput, recordDebtPayment, recordTransfer, rematchImportDrafts, reverseDebtPayment, reverseTransfer, saveAccount, saveBudget, saveCurrencySettings, saveFinancialGoal, savePlannedExpense, setSmsScanWatermark, synchronizeInterestPostings, synchronizePlannedOccurrences, updateDebt } from './src/database';
 import { parsersForSender, parseSms } from './src/sms/registry';
 import { parsePush } from './src/push/registry';
 import { KNOWN_BANK_PACKAGES } from './src/push/packages';
@@ -478,10 +478,36 @@ async function scanSmsInbox(): Promise<void> {
   await setSmsScanWatermark(scanStartedAt);
 }
 
-function ImportDraftCard({ draft, accounts, onConfirm, onDismiss }: { draft: ImportDraft; accounts: Account[]; onConfirm: (accountId: string, includeFee: boolean) => void; onDismiss: () => void }) {
+function ImportDraftCard({ draft, accounts, onConfirm, onDismiss }: { draft: ImportDraft; accounts: Account[]; onConfirm: (accountId: string, includeFee: boolean, transferCounterpartyId?: string) => void; onDismiss: () => void }) {
   const [accountId, setAccountId] = useState(draft.accountId);
   const [includeFee, setIncludeFee] = useState(true);
-  useEffect(() => { setAccountId(draft.accountId); }, [draft.accountId]);
+  // Collapsed by default once a card_last4 match already picked an account — the full account
+  // list is only useful when that guess needs overriding, not as a wall of options on every card.
+  const [pickerOpen, setPickerOpen] = useState(!draft.accountId);
+  const [isTransfer, setIsTransfer] = useState(false);
+  const [counterpartyId, setCounterpartyId] = useState<string | undefined>();
+  const [counterpartyPickerOpen, setCounterpartyPickerOpen] = useState(true);
+  useEffect(() => { setAccountId(draft.accountId); setPickerOpen(!draft.accountId); }, [draft.accountId]);
+  const selectedAccount = accounts.find((item) => item.id === accountId);
+  const selectedCounterparty = accounts.find((item) => item.id === counterpartyId);
+  // There's no card/account number for the other side of a transfer (a deposit's own SMS never
+  // mentions it) — so this can only ever be a ranked guess for the user to confirm or override,
+  // never an auto-pick. Same-currency is a hard filter (see confirmImportDraftAsTransfer's own
+  // comment on why); type/bank/balance only reorder the list, they never exclude an option.
+  const looksDepositSourced = /\bdep\b/i.test(draft.merchant ?? '');
+  const counterpartyOptions = accounts
+    .filter((item) => item.id !== accountId && item.currency === draft.currency)
+    .slice()
+    .sort((a, b) => {
+      const score = (item: Account) => {
+        let value = 0;
+        if (looksDepositSourced && (item.type === 'deposit' || item.type === 'savings')) value += 2;
+        if (draft.source === 'sms' && item.subtitle.toLowerCase().includes(draft.sender.toLowerCase())) value += 2;
+        if (draft.amount !== undefined && item.balance >= draft.amount) value += 1;
+        return value;
+      };
+      return score(b) - score(a);
+    });
   const sourceLabel = draft.source === 'push' ? 'Push' : 'SMS';
   if (draft.status === 'unrecognized') {
     return <View style={[s.card, { padding: 16 }]}>
@@ -495,14 +521,31 @@ function ImportDraftCard({ draft, accounts, onConfirm, onDismiss }: { draft: Imp
     <Text style={s.rowSub}>{sourceLabel} · {draft.occurredAt?.replace('T', ' ')}{draft.cardLast4 ? ` · карта •${draft.cardLast4}` : ''}</Text>
     {!!draft.dedupOperationId && <Text style={[s.rowSub, { color: C.red, marginTop: 4 }]}>Похоже, эта операция уже учтена в Афине (вручную или автоматически, например проценты по вкладу) — проверьте перед подтверждением</Text>}
     <Text style={[s.fieldLabel, { marginTop: 10 }]}>СЧЁТ</Text>
-    <View style={s.targetList}>{accounts.map((item) => <Pressable key={item.id} style={[s.targetAccount, accountId === item.id && s.targetAccountActive]} onPress={() => setAccountId(item.id)}><Text style={s.targetAccountText}>{item.name} · {item.currency}</Text></Pressable>)}</View>
+    {pickerOpen ? <View style={s.targetList}>{accounts.map((item) => <Pressable key={item.id} style={[s.targetAccount, accountId === item.id && s.targetAccountActive]} onPress={() => { setAccountId(item.id); setPickerOpen(false); }}><Text style={s.targetAccountText}>{item.name} · {item.currency}</Text></Pressable>)}</View>
+      : <Pressable style={[s.targetAccount, s.targetAccountActive, { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }]} onPress={() => setPickerOpen(true)}>
+          <Text style={s.targetAccountText}>{selectedAccount ? `${selectedAccount.name} · ${selectedAccount.currency}` : 'Выбрать счёт'}</Text>
+          <Ionicons name="chevron-down" size={16} color={C.muted} />
+        </Pressable>}
     {!!draft.feeAmount && <Pressable style={[s.eventRow, { minHeight: 40 }]} onPress={() => setIncludeFee((value) => !value)}>
       <Ionicons name={includeFee ? 'checkbox' : 'square-outline'} size={20} color={C.blue} />
       <Text style={[s.rowSub, { marginLeft: 8 }]}>Провести комиссию {money(draft.feeAmount, false, draft.currency)} отдельной операцией</Text>
     </Pressable>}
+    <Pressable style={[s.eventRow, { minHeight: 40 }]} onPress={() => setIsTransfer((value) => !value)}>
+      <Ionicons name={isTransfer ? 'checkbox' : 'square-outline'} size={20} color={C.blue} />
+      <Text style={[s.rowSub, { marginLeft: 8 }]}>Это перевод между своими счетами (например, со вклада)</Text>
+    </Pressable>
+    {isTransfer && <>
+      <Text style={[s.fieldLabel, { marginTop: 4 }]}>{draft.kind === 'income' ? 'СЧЁТ СПИСАНИЯ' : 'СЧЁТ ЗАЧИСЛЕНИЯ'}</Text>
+      {!counterpartyOptions.length ? <Text style={s.rowSub}>Нет других счетов в {draft.currency}</Text>
+        : counterpartyPickerOpen ? <View style={s.targetList}>{counterpartyOptions.map((item) => <Pressable key={item.id} style={[s.targetAccount, counterpartyId === item.id && s.targetAccountActive]} onPress={() => { setCounterpartyId(item.id); setCounterpartyPickerOpen(false); }}><Text style={s.targetAccountText}>{item.name} · {item.currency}</Text></Pressable>)}</View>
+          : <Pressable style={[s.targetAccount, s.targetAccountActive, { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }]} onPress={() => setCounterpartyPickerOpen(true)}>
+              <Text style={s.targetAccountText}>{selectedCounterparty ? `${selectedCounterparty.name} · ${selectedCounterparty.currency}` : 'Выбрать счёт'}</Text>
+              <Ionicons name="chevron-down" size={16} color={C.muted} />
+            </Pressable>}
+    </>}
     <View style={[s.twoColumns, { marginTop: 10 }]}>
       <Pressable style={[s.secondaryButton, { flex: 1 }]} onPress={onDismiss}><Text style={s.secondaryText}>Отклонить</Text></Pressable>
-      <Pressable style={[s.primaryButton, { flex: 1, marginTop: 0 }]} disabled={!accountId} onPress={() => accountId && onConfirm(accountId, includeFee)}><Text style={s.primaryText}>Подтвердить</Text></Pressable>
+      <Pressable style={[s.primaryButton, { flex: 1, marginTop: 0 }]} disabled={!accountId || (isTransfer && !counterpartyId)} onPress={() => accountId && onConfirm(accountId, includeFee, isTransfer ? counterpartyId : undefined)}><Text style={s.primaryText}>Подтвердить</Text></Pressable>
     </View>
   </View>;
 }
@@ -534,9 +577,12 @@ function ImportDraftsModal({ visible, accounts, onClose }: { visible: boolean; a
       setTitle(''); setBody(''); await reload();
     } finally { setLoading(false); }
   };
-  const handleConfirm = async (draft: ImportDraft, accountId: string, includeFee: boolean) => {
-    await confirmImportDraft(draft.id, { accountId, title: draft.merchant || (draft.kind === 'income' ? 'Поступление' : 'Операция по карте'), category: 'Другое', feeAsSeparateOperation: includeFee });
-    await reload();
+  const handleConfirm = async (draft: ImportDraft, accountId: string, includeFee: boolean, transferCounterpartyId?: string) => {
+    try {
+      if (transferCounterpartyId) await confirmImportDraftAsTransfer(draft.id, { counterpartyAccountId: transferCounterpartyId });
+      else await confirmImportDraft(draft.id, { accountId, title: draft.merchant || (draft.kind === 'income' ? 'Поступление' : 'Операция по карте'), category: 'Другое', feeAsSeparateOperation: includeFee });
+      await reload();
+    } catch (error) { Alert.alert('Не удалось подтвердить', describeError(error) ?? 'Попробуйте ещё раз.'); }
   };
   const handleDismiss = async (draft: ImportDraft) => { await dismissImportDraft(draft.id); await reload(); };
   const [rematching, setRematching] = useState(false);
@@ -545,7 +591,7 @@ function ImportDraftsModal({ visible, accounts, onClose }: { visible: boolean; a
     try {
       const updated = await rematchImportDrafts();
       await reload();
-      Alert.alert(updated > 0 ? 'Готово' : 'Нечего обновлять', updated > 0 ? `Счёт найден для ${updated} ${updated === 1 ? 'черновика' : 'черновиков'}.` : 'Черновиков без счёта, подходящих под добавленные карты, не найдено.');
+      Alert.alert(updated > 0 ? 'Готово' : 'Нечего обновлять', updated > 0 ? `Обновлено черновиков: ${updated}.` : 'Обновлять нечего.');
     } finally { setRematching(false); }
   };
   return <Modal visible={visible} animationType="slide" presentationStyle="pageSheet" onRequestClose={onClose}>
@@ -575,10 +621,10 @@ function ImportDraftsModal({ visible, accounts, onClose }: { visible: boolean; a
           <Pressable style={s.primaryButton} disabled={loading || !body.trim()} onPress={handleParse}><Text style={s.primaryText}>{loading ? 'Разбираем…' : 'Разобрать'}</Text></Pressable>
           <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginTop: 26, marginBottom: 10 }}>
             <Text style={s.sectionTitle}>Черновики</Text>
-            <Pressable onPress={handleRematch} disabled={rematching}><Text style={s.link}>{rematching ? 'Обновляем…' : 'Обновить счета по картам'}</Text></Pressable>
+            <Pressable onPress={handleRematch} disabled={rematching}><Text style={s.link}>{rematching ? 'Обновляем…' : 'Обновить счета и проверки'}</Text></Pressable>
           </View>
           {!drafts.length && <Text style={s.rowSub}>Пока пусто</Text>}
-          {drafts.map((draft) => <View key={draft.id} style={{ marginBottom: 10 }}><ImportDraftCard draft={draft} accounts={accounts} onConfirm={(accountId, includeFee) => handleConfirm(draft, accountId, includeFee)} onDismiss={() => handleDismiss(draft)} /></View>)}
+          {drafts.map((draft) => <View key={draft.id} style={{ marginBottom: 10 }}><ImportDraftCard draft={draft} accounts={accounts} onConfirm={(accountId, includeFee, transferCounterpartyId) => handleConfirm(draft, accountId, includeFee, transferCounterpartyId)} onDismiss={() => handleDismiss(draft)} /></View>)}
         </ScrollView>
       </KeyboardAvoidingView>
     </SafeAreaView>
