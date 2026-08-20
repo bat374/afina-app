@@ -1342,7 +1342,7 @@ export function createSmsDraft(input: { sender: string; rawBody: string; receive
     const db = await getDatabase();
     // Same sender + byte-identical body = the bank resent the same message (both formats here
     // embed a running balance, so two genuinely distinct transactions can never collide here).
-    const bodyHash = hashString(`${input.sender} ${input.rawBody}`);
+    const bodyHash = hashString(`${input.sender} ${input.rawBody}`);
     const existing = await db.getFirstAsync<SmsDraftRow>('SELECT * FROM sms_drafts WHERE sender = ? AND body_hash = ?', input.sender, bodyHash);
     if (existing) return { draft: mapSmsDraftRow(existing), alreadyExisted: true };
 
@@ -1407,6 +1407,34 @@ export function dismissSmsDraft(id: string) {
   return enqueue(async () => {
     const db = await getDatabase();
     await db.runAsync("UPDATE sms_drafts SET status = 'dismissed', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND status IN ('pending', 'unrecognized')", id);
+  });
+}
+
+export function countPendingSmsDrafts(): Promise<number> {
+  return enqueue(async () => {
+    const db = await getDatabase();
+    const row = await db.getFirstAsync<{ count: number }>("SELECT COUNT(*) as count FROM sms_drafts WHERE status IN ('pending', 'unrecognized')");
+    return row?.count ?? 0;
+  });
+}
+
+const SMS_WATERMARK_KEY = 'sms_last_scanned_at';
+
+// Advances only after the whole inbox read for this scan has been turned into drafts (or
+// harmlessly deduped) -- so a scan interrupted partway through just reprocesses the overlapping
+// window next time, which createSmsDraft's (sender, body) uniqueness already makes idempotent.
+export function getSmsScanWatermark(): Promise<string | undefined> {
+  return enqueue(async () => {
+    const db = await getDatabase();
+    const row = await db.getFirstAsync<{ value: string }>('SELECT value FROM app_settings WHERE key = ?', SMS_WATERMARK_KEY);
+    return row?.value ?? undefined;
+  });
+}
+
+export function setSmsScanWatermark(iso: string) {
+  return enqueue(async () => {
+    const db = await getDatabase();
+    await db.runAsync('INSERT OR REPLACE INTO app_settings (key, value) VALUES (?, ?)', SMS_WATERMARK_KEY, iso);
   });
 }
 

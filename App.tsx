@@ -12,8 +12,9 @@ import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
 import { budgets, calendarDays, goals, transactions } from './src/data';
 import { money, percent } from './src/format';
 import { Account, AccountType, Budget, CashFlowKind, CurrencySettings, Debt, DebtDirection, DebtHistory, ExpenseRepeat, FinancialGoal, FinancialOperation, GoalType, InterestSchedule, PlannedExecutionInput, PlannedExpense, PlannedOccurrence, RecurrenceUnit, SmsDraft, Transfer, TransferInput, WithdrawalPolicy } from './src/types';
-import { AccountInput, BudgetInput, cancelPlannedOccurrence, confirmSmsDraft, createDebt, createOperation, createSmsDraft, DebtInput, deleteAccount, deleteBudget, deleteFinancialGoal, deletePlannedExpense, dismissSmsDraft, executePlannedOccurrence, extendDebt, FinancialGoalInput, FinancialOperationInput, getCurrencySettings, initializeDatabase, listAccounts, listBudgets, listDebtHistory, listDebts, listFinancialGoals, listOperations, listPlannedExpenses, listPlannedOccurrences, listSmsDrafts, listTransfers, markDebtOverdue, PlannedExpenseInput, recordDebtPayment, recordTransfer, reverseDebtPayment, reverseTransfer, saveAccount, saveBudget, saveCurrencySettings, saveFinancialGoal, savePlannedExpense, synchronizeInterestPostings, synchronizePlannedOccurrences, updateDebt } from './src/database';
+import { AccountInput, BudgetInput, cancelPlannedOccurrence, confirmSmsDraft, countPendingSmsDrafts, createDebt, createOperation, createSmsDraft, DebtInput, deleteAccount, deleteBudget, deleteFinancialGoal, deletePlannedExpense, dismissSmsDraft, executePlannedOccurrence, extendDebt, FinancialGoalInput, FinancialOperationInput, getCurrencySettings, getSmsScanWatermark, initializeDatabase, listAccounts, listBudgets, listDebtHistory, listDebts, listFinancialGoals, listOperations, listPlannedExpenses, listPlannedOccurrences, listSmsDrafts, listTransfers, markDebtOverdue, PlannedExpenseInput, recordDebtPayment, recordTransfer, reverseDebtPayment, reverseTransfer, saveAccount, saveBudget, saveCurrencySettings, saveFinancialGoal, savePlannedExpense, setSmsScanWatermark, synchronizeInterestPostings, synchronizePlannedOccurrences, updateDebt } from './src/database';
 import { parsersForSender, parseSms } from './src/sms/registry';
+import { hasSmsPermission, isSmsReaderAvailable, readSmsInbox, requestSmsPermission } from './modules/sms-reader';
 import { DetectedAccount, recognizeAccountScreenshot } from './src/ocr';
 import { annualPassiveIncome, buildMonthProjection, getCurrencyTotals } from './src/finance';
 import { consolidatedNetWorth, convertCurrency, convertToBase, fetchOfficialCurrencyRates, operationConversionBasis, rebaseRates, weightedAssetRates } from './src/currency';
@@ -27,7 +28,7 @@ import type { Session } from '@supabase/supabase-js';
 
 type Tab = 'home' | 'accounts' | 'calendar' | 'operations' | 'analytics' | 'profile';
 
-const APP_VERSION = '1.3.0';
+const APP_VERSION = '1.4.0';
 
 const C = {
   bg: '#EDF5F8', card: '#FFFFFF', ink: '#172A34', muted: '#718087',
@@ -445,10 +446,34 @@ function ReceiptViewerModal({ uri, onClose }: { uri: string | null; onClose: () 
   </Modal>;
 }
 
-// Senders with a registered parser (see src/sms/registry.ts). Until the native SMS reader exists
-// (BACKLOG R-02's sibling), this is a manual paste harness — verifies parsing/dedup end to end
-// without needing a native build loop, per the architecture plan.
+// Senders with a registered parser (see src/sms/registry.ts).
 const KNOWN_SMS_SENDERS = ['kapitalbank', '13131'];
+
+// Foreground scan only — on app launch and on return from background, per the architecture plan:
+// a background listener needs a foreground-service notification on Android 8+ and still gets
+// killed by OEM battery managers, for a feature whose UX already requires opening the app to
+// confirm a draft. Silently does nothing if the reader is unavailable (iOS) or permission was
+// never granted — this never prompts on its own, only an explicit tap in Profile does.
+async function scanSmsInbox(): Promise<void> {
+  if (!isSmsReaderAvailable) return;
+  if (!(await hasSmsPermission())) return;
+  const watermark = await getSmsScanWatermark();
+  const sinceEpochMs = watermark ? new Date(watermark).getTime() : Date.now() - 7 * 24 * 60 * 60 * 1000;
+  const scanStartedAt = new Date().toISOString();
+  const messages = await readSmsInbox(sinceEpochMs, KNOWN_SMS_SENDERS);
+  for (const message of messages) {
+    const sender = message.address.trim().toLowerCase();
+    const result = parseSms(sender, message.body);
+    await createSmsDraft({
+      sender, rawBody: message.body, receivedAt: new Date(message.dateMs).toISOString(),
+      parsed: result?.parsed ?? null, parserId: result?.parserId,
+    });
+  }
+  // Advances to when this scan started, not to the last message's own timestamp — so a message
+  // that arrives mid-scan (after the read but before this line) gets picked up next time instead
+  // of silently falling into the gap between the two watermarks.
+  await setSmsScanWatermark(scanStartedAt);
+}
 
 function SmsDraftCard({ draft, accounts, onConfirm, onDismiss }: { draft: SmsDraft; accounts: Account[]; onConfirm: (accountId: string, includeFee: boolean) => void; onDismiss: () => void }) {
   const [accountId, setAccountId] = useState(draft.accountId);
@@ -602,12 +627,20 @@ function Analytics({ accounts, plannedExpenses, plannedOccurrences, debts, curre
   </ScrollView>;
 }
 
-function Profile({ email, accounts, currencySettings, onCurrencySettings, onBack }: { email?: string; accounts: Account[]; currencySettings: CurrencySettings; onCurrencySettings: () => void; onBack: () => void }) {
+function Profile({ email, accounts, currencySettings, onCurrencySettings, onBack, pendingSmsDrafts, onSmsDraftsChanged }: { email?: string; accounts: Account[]; currencySettings: CurrencySettings; onCurrencySettings: () => void; onBack: () => void; pendingSmsDrafts: number; onSmsDraftsChanged: () => void }) {
   const [lockEnabled, setLockEnabledState] = useState(false);
   const [lockLoaded, setLockLoaded] = useState(false);
   const [pinSetupOpen, setPinSetupOpen] = useState(false);
   const [smsImportOpen, setSmsImportOpen] = useState(false);
+  const [smsPermissionGranted, setSmsPermissionGranted] = useState(false);
   useEffect(() => { getLockEnabled().then((value) => { setLockEnabledState(value); setLockLoaded(true); }); }, []);
+  useEffect(() => { if (isSmsReaderAvailable) hasSmsPermission().then(setSmsPermissionGranted); }, []);
+  const handleEnableSms = async () => {
+    const granted = await requestSmsPermission();
+    setSmsPermissionGranted(granted);
+    if (granted) { await scanSmsInbox(); onSmsDraftsChanged(); }
+    else Alert.alert('Разрешение не выдано', 'Без доступа к SMS автоматическое чтение недоступно — можно вставлять текст вручную.');
+  };
   const handleToggleLock = (value: boolean) => {
     if (value) { setPinSetupOpen(true); return; }
     Alert.alert('Отключить вход по PIN/биометрии?', 'Приложение больше не будет запрашивать вход при открытии.', [
@@ -647,9 +680,17 @@ function Profile({ email, accounts, currencySettings, onCurrencySettings, onBack
       {lockEnabled && <><View style={s.divider} /><Pressable style={s.eventRow} onPress={() => setPinSetupOpen(true)}><View style={{ flex: 1 }}><Text style={s.rowTitle}>Изменить PIN-код</Text></View><Ionicons name="chevron-forward" size={19} color={C.muted} /></Pressable></>}
     </View>
     <SectionTitle title="Автоматизация" />
+    {isSmsReaderAvailable && <View style={[s.card, { marginBottom: 10 }]}>
+      <View style={s.eventRow}>
+        <View style={[s.roundIcon, { backgroundColor: `${C.green}18` }]}><Ionicons name="chatbubble-ellipses-outline" size={19} color={C.green} /></View>
+        <View style={{ flex: 1 }}><Text style={s.rowTitle}>Автоматическое чтение SMS</Text><Text style={s.rowSub}>{smsPermissionGranted ? 'Включено — сканируется при открытии приложения' : 'Нужно разрешение на чтение SMS'}</Text></View>
+        {!smsPermissionGranted && <Pressable onPress={handleEnableSms}><Text style={s.link}>Включить</Text></Pressable>}
+      </View>
+    </View>}
     <Pressable style={s.accountCard} onPress={() => setSmsImportOpen(true)}>
       <View style={[s.roundIcon, { backgroundColor: `${C.green}18` }]}><Ionicons name="chatbox-ellipses-outline" size={20} color={C.green} /></View>
-      <View style={{ flex: 1 }}><Text style={s.rowTitle}>Проверить разбор SMS</Text><Text style={s.rowSub}>Тестовая вставка текста, пока нет автоматического чтения</Text></View>
+      <View style={{ flex: 1 }}><Text style={s.rowTitle}>Черновики из SMS</Text><Text style={s.rowSub}>{pendingSmsDrafts > 0 ? `${pendingSmsDrafts} ждут подтверждения` : 'Посмотреть черновики или вставить текст вручную'}</Text></View>
+      {pendingSmsDrafts > 0 && <View style={[s.chartBadge, { marginRight: 8 }]}><Text style={s.chartBadgeText}>{pendingSmsDrafts}</Text></View>}
       <Ionicons name="chevron-forward" size={19} color={C.muted} />
     </Pressable>
     <SectionTitle title="О приложении" />
@@ -659,7 +700,7 @@ function Profile({ email, accounts, currencySettings, onCurrencySettings, onBack
     <Pressable style={s.deleteButton} onPress={handleSignOut}><Ionicons name="log-out-outline" size={18} color={C.red} /><Text style={s.deleteText}>Выйти из аккаунта</Text></Pressable>
     <View style={{ height: 20 }} />
     <PinSetupModal visible={pinSetupOpen} onClose={() => setPinSetupOpen(false)} onSaved={() => { setLockEnabledState(true); setPinSetupOpen(false); }} />
-    <SmsImportModal visible={smsImportOpen} accounts={accounts} onClose={() => setSmsImportOpen(false)} />
+    <SmsImportModal visible={smsImportOpen} accounts={accounts} onClose={() => { setSmsImportOpen(false); onSmsDraftsChanged(); }} />
   </ScrollView>;
 }
 
@@ -1421,6 +1462,7 @@ function AppContent({ userId, email }: { userId: string; email?: string }) {
   const [financialGoals, setFinancialGoals] = useState<FinancialGoal[]>([]);
   const [currencySettings, setCurrencySettings] = useState<CurrencySettings>({ baseCurrency: 'UZS', rates: { UZS: 1 }, autoUpdate: true });
   const [databaseReady, setDatabaseReady] = useState(false);
+  const [pendingSmsDrafts, setPendingSmsDrafts] = useState(0);
 
   const reloadAccounts = async () => setUserAccounts(await listAccounts());
   const reloadExpenses = async () => setPlannedExpenses(await listPlannedExpenses());
@@ -1458,11 +1500,18 @@ function AppContent({ userId, email }: { userId: string; email?: string }) {
         } catch { /* Офлайн: продолжаем использовать последний сохранённый курс. */ }
       }
       setDatabaseReady(true);
+      scanSmsInbox().then(() => countPendingSmsDrafts().then(setPendingSmsDrafts)).catch(() => { /* Permission not granted yet, or reader unavailable on this platform. */ });
     }).catch((error) => Alert.alert(
       'Не удалось открыть локальную базу',
       `Перезапустите приложение и попробуйте снова. Если не помогает — проверьте свободное место на устройстве.${describeError(error) ? `\n\n${describeError(error)}` : ''}`,
     ));
   }, [userId]);
+  useEffect(() => {
+    const subscription = AppState.addEventListener('change', (next) => {
+      if (next === 'active' && databaseReady) scanSmsInbox().then(() => countPendingSmsDrafts().then(setPendingSmsDrafts)).catch(() => { /* Same as above. */ });
+    });
+    return () => subscription.remove();
+  }, [databaseReady]);
   useEffect(() => {
     if (!databaseReady) return;
     const timer = setTimeout(() => {
@@ -1577,13 +1626,13 @@ function AppContent({ userId, email }: { userId: string; email?: string }) {
 
   const screen = useMemo(() => {
     const onProfile = () => setTab('profile');
-    if (tab === 'profile') return <Profile email={email} accounts={userAccounts} currencySettings={currencySettings} onCurrencySettings={() => setCurrencySettingsOpen(true)} onBack={() => setTab('home')} />;
+    if (tab === 'profile') return <Profile email={email} accounts={userAccounts} currencySettings={currencySettings} onCurrencySettings={() => setCurrencySettingsOpen(true)} onBack={() => setTab('home')} pendingSmsDrafts={pendingSmsDrafts} onSmsDraftsChanged={() => countPendingSmsDrafts().then(setPendingSmsDrafts)} />;
     if (tab === 'accounts') return <Accounts accounts={userAccounts} onAdd={openNewAccount} onImport={() => setImportOpen(true)} onEdit={openAccount} debts={debts} onAddDebt={openNewDebt} onOpenDebt={openDebt} currencySettings={currencySettings} onCurrencySettings={() => setCurrencySettingsOpen(true)} onProfile={onProfile} />;
     if (tab === 'calendar') return <Calendar accounts={userAccounts} plannedExpenses={plannedExpenses} plannedOccurrences={plannedOccurrences} debts={debts} currencySettings={currencySettings} onAddExpense={openNewExpense} onEditExpense={openExpense} onExecuteOccurrence={handleOpenOccurrence} onCancelOccurrence={handleCancelOccurrence} onProfile={onProfile} />;
     if (tab === 'operations') return <Operations operations={operations} transfers={transfers} plannedOccurrences={plannedOccurrences} plannedExpenses={plannedExpenses} accounts={userAccounts} onAdd={() => setOperationEditorOpen(true)} onTransfer={() => setTransferModalOpen(true)} onReverseTransfer={handleReverseTransfer} onExecuteOccurrence={handleOpenOccurrence} onCancelOccurrence={handleCancelOccurrence} onProfile={onProfile} />;
     if (tab === 'analytics') return <Analytics accounts={userAccounts} plannedExpenses={plannedExpenses} plannedOccurrences={plannedOccurrences} debts={debts} currencySettings={currencySettings} operations={operations} userBudgets={userBudgets} financialGoals={financialGoals} onAddBudget={openNewBudget} onEditBudget={openBudget} onAddGoal={openNewGoal} onEditGoal={openGoal} onProfile={onProfile} />;
     return <Home onImport={() => setImportOpen(true)} go={setTab} accounts={userAccounts} plannedExpenses={plannedExpenses} plannedOccurrences={plannedOccurrences} debts={debts} currencySettings={currencySettings} onCurrencySettings={() => setCurrencySettingsOpen(true)} onProfile={onProfile} />;
-  }, [tab, userAccounts, plannedExpenses, plannedOccurrences, debts, currencySettings, operations, transfers, userBudgets, financialGoals, email]);
+  }, [tab, userAccounts, plannedExpenses, plannedOccurrences, debts, currencySettings, operations, transfers, userBudgets, financialGoals, email, pendingSmsDrafts]);
   return <SafeAreaView style={s.safe} edges={['top']}>
     <StatusBar style="dark" />
     <View style={s.screen}>{screen}</View>
