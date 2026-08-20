@@ -48,6 +48,7 @@ const accountRows = (snapshot: LocalSnapshot) => snapshot.accounts.map((account)
   statement_day: account.statementDay ?? null, payment_due_day: account.paymentDueDay ?? null,
   grace_period_days: account.gracePeriodDays ?? null,
   minimum_payment_percent: account.minimumPaymentPercent ?? null, accent: account.accent,
+  card_last4: account.cardLast4 ?? null,
 }));
 
 // Guards against overlapping uploads: the caller re-triggers this on every local state
@@ -198,6 +199,7 @@ export async function downloadCloudData(userId: string): Promise<LocalSnapshot> 
       creditLimit: numberOrUndefined(row.credit_limit), statementDay: numberOrUndefined(row.statement_day),
       paymentDueDay: numberOrUndefined(row.payment_due_day), gracePeriodDays: numberOrUndefined(row.grace_period_days),
       minimumPaymentPercent: numberOrUndefined(row.minimum_payment_percent), accent: row.accent,
+      cardLast4: row.card_last4 ?? undefined,
     })),
     scheduledFlows: flowRows.map((row) => ({
       id: row.id, title: row.title, category: row.category, amount: Number(row.amount), currency: row.currency,

@@ -11,8 +11,9 @@ import { Ionicons } from '@expo/vector-icons';
 import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
 import { budgets, calendarDays, goals, transactions } from './src/data';
 import { money, percent } from './src/format';
-import { Account, AccountType, Budget, CashFlowKind, CurrencySettings, Debt, DebtDirection, DebtHistory, ExpenseRepeat, FinancialGoal, FinancialOperation, GoalType, InterestSchedule, PlannedExecutionInput, PlannedExpense, PlannedOccurrence, RecurrenceUnit, Transfer, TransferInput, WithdrawalPolicy } from './src/types';
-import { AccountInput, BudgetInput, cancelPlannedOccurrence, createDebt, createOperation, DebtInput, deleteAccount, deleteBudget, deleteFinancialGoal, deletePlannedExpense, executePlannedOccurrence, extendDebt, FinancialGoalInput, FinancialOperationInput, getCurrencySettings, initializeDatabase, listAccounts, listBudgets, listDebtHistory, listDebts, listFinancialGoals, listOperations, listPlannedExpenses, listPlannedOccurrences, listTransfers, markDebtOverdue, PlannedExpenseInput, recordDebtPayment, recordTransfer, reverseDebtPayment, reverseTransfer, saveAccount, saveBudget, saveCurrencySettings, saveFinancialGoal, savePlannedExpense, synchronizeInterestPostings, synchronizePlannedOccurrences, updateDebt } from './src/database';
+import { Account, AccountType, Budget, CashFlowKind, CurrencySettings, Debt, DebtDirection, DebtHistory, ExpenseRepeat, FinancialGoal, FinancialOperation, GoalType, InterestSchedule, PlannedExecutionInput, PlannedExpense, PlannedOccurrence, RecurrenceUnit, SmsDraft, Transfer, TransferInput, WithdrawalPolicy } from './src/types';
+import { AccountInput, BudgetInput, cancelPlannedOccurrence, confirmSmsDraft, createDebt, createOperation, createSmsDraft, DebtInput, deleteAccount, deleteBudget, deleteFinancialGoal, deletePlannedExpense, dismissSmsDraft, executePlannedOccurrence, extendDebt, FinancialGoalInput, FinancialOperationInput, getCurrencySettings, initializeDatabase, listAccounts, listBudgets, listDebtHistory, listDebts, listFinancialGoals, listOperations, listPlannedExpenses, listPlannedOccurrences, listSmsDrafts, listTransfers, markDebtOverdue, PlannedExpenseInput, recordDebtPayment, recordTransfer, reverseDebtPayment, reverseTransfer, saveAccount, saveBudget, saveCurrencySettings, saveFinancialGoal, savePlannedExpense, synchronizeInterestPostings, synchronizePlannedOccurrences, updateDebt } from './src/database';
+import { parsersForSender, parseSms } from './src/sms/registry';
 import { DetectedAccount, recognizeAccountScreenshot } from './src/ocr';
 import { annualPassiveIncome, buildMonthProjection, getCurrencyTotals } from './src/finance';
 import { consolidatedNetWorth, convertCurrency, convertToBase, fetchOfficialCurrencyRates, operationConversionBasis, rebaseRates, weightedAssetRates } from './src/currency';
@@ -444,6 +445,80 @@ function ReceiptViewerModal({ uri, onClose }: { uri: string | null; onClose: () 
   </Modal>;
 }
 
+// Senders with a registered parser (see src/sms/registry.ts). Until the native SMS reader exists
+// (BACKLOG R-02's sibling), this is a manual paste harness — verifies parsing/dedup end to end
+// without needing a native build loop, per the architecture plan.
+const KNOWN_SMS_SENDERS = ['kapitalbank', '13131'];
+
+function SmsDraftCard({ draft, accounts, onConfirm, onDismiss }: { draft: SmsDraft; accounts: Account[]; onConfirm: (accountId: string, includeFee: boolean) => void; onDismiss: () => void }) {
+  const [accountId, setAccountId] = useState(draft.accountId);
+  const [includeFee, setIncludeFee] = useState(true);
+  useEffect(() => { setAccountId(draft.accountId); }, [draft.accountId]);
+  if (draft.status === 'unrecognized') {
+    return <View style={[s.card, { padding: 16 }]}>
+      <Text style={s.rowTitle}>Не распознано</Text>
+      <Text style={[s.rowSub, { marginTop: 4 }]}>{draft.sender} · {draft.rawBody.slice(0, 90)}{draft.rawBody.length > 90 ? '…' : ''}</Text>
+      <Pressable style={[s.secondaryButton, { marginTop: 8 }]} onPress={onDismiss}><Text style={s.secondaryText}>Убрать</Text></Pressable>
+    </View>;
+  }
+  return <View style={[s.card, { padding: 16 }]}>
+    <View style={s.budgetTop}><Text style={s.rowTitle}>{draft.merchant || (draft.kind === 'income' ? 'Поступление' : 'Операция по карте')}</Text><Text style={draft.kind === 'income' ? s.income : s.expense}>{draft.kind === 'income' ? '+' : '−'}{money(draft.amount ?? 0, false, draft.currency)}</Text></View>
+    <Text style={s.rowSub}>{draft.occurredAt?.replace('T', ' ')}{draft.cardLast4 ? ` · карта •${draft.cardLast4}` : ''}</Text>
+    {!!draft.dedupOperationId && <Text style={[s.rowSub, { color: C.red, marginTop: 4 }]}>Похоже, уже добавлено вручную — проверьте перед подтверждением</Text>}
+    <Text style={[s.fieldLabel, { marginTop: 10 }]}>СЧЁТ</Text>
+    <View style={s.targetList}>{accounts.map((item) => <Pressable key={item.id} style={[s.targetAccount, accountId === item.id && s.targetAccountActive]} onPress={() => setAccountId(item.id)}><Text style={s.targetAccountText}>{item.name} · {item.currency}</Text></Pressable>)}</View>
+    {!!draft.feeAmount && <Pressable style={[s.eventRow, { minHeight: 40 }]} onPress={() => setIncludeFee((value) => !value)}>
+      <Ionicons name={includeFee ? 'checkbox' : 'square-outline'} size={20} color={C.blue} />
+      <Text style={[s.rowSub, { marginLeft: 8 }]}>Провести комиссию {money(draft.feeAmount, false, draft.currency)} отдельной операцией</Text>
+    </Pressable>}
+    <View style={[s.twoColumns, { marginTop: 10 }]}>
+      <Pressable style={[s.secondaryButton, { flex: 1 }]} onPress={onDismiss}><Text style={s.secondaryText}>Отклонить</Text></Pressable>
+      <Pressable style={[s.primaryButton, { flex: 1, marginTop: 0 }]} disabled={!accountId} onPress={() => accountId && onConfirm(accountId, includeFee)}><Text style={s.primaryText}>Подтвердить</Text></Pressable>
+    </View>
+  </View>;
+}
+
+function SmsImportModal({ visible, accounts, onClose }: { visible: boolean; accounts: Account[]; onClose: () => void }) {
+  const [sender, setSender] = useState(KNOWN_SMS_SENDERS[0]!);
+  const [body, setBody] = useState('');
+  const [drafts, setDrafts] = useState<SmsDraft[]>([]);
+  const [loading, setLoading] = useState(false);
+  const reload = async () => setDrafts(await listSmsDrafts());
+  useEffect(() => { if (visible) reload(); }, [visible]);
+  const handleParse = async () => {
+    if (!body.trim()) return;
+    setLoading(true);
+    try {
+      const result = parseSms(sender, body.trim());
+      await createSmsDraft({ sender, rawBody: body.trim(), receivedAt: new Date().toISOString(), parsed: result?.parsed ?? null, parserId: result?.parserId });
+      setBody(''); await reload();
+    } finally { setLoading(false); }
+  };
+  const handleConfirm = async (draft: SmsDraft, accountId: string, includeFee: boolean) => {
+    await confirmSmsDraft(draft.id, { accountId, title: draft.merchant || (draft.kind === 'income' ? 'Поступление' : 'Операция по карте'), category: 'Другое', feeAsSeparateOperation: includeFee });
+    await reload();
+  };
+  const handleDismiss = async (draft: SmsDraft) => { await dismissSmsDraft(draft.id); await reload(); };
+  return <Modal visible={visible} animationType="slide" presentationStyle="pageSheet" onRequestClose={onClose}>
+    <SafeAreaView style={s.modal} edges={['top', 'bottom']}>
+      <View style={s.modalHead}><Pressable onPress={onClose} style={s.close}><Ionicons name="close" size={22} color={C.ink} /></Pressable><Text style={s.modalTitle}>SMS-импорт (тест)</Text><View style={{ width: 40 }} /></View>
+      <KeyboardAvoidingView style={{ flex: 1 }} behavior={Platform.OS === 'ios' ? 'padding' : 'height'}>
+        <ScrollView contentContainerStyle={s.formBody} keyboardShouldPersistTaps="handled" keyboardDismissMode="on-drag" automaticallyAdjustKeyboardInsets>
+          <Text style={s.helperText}>Вставьте текст SMS от банка, чтобы проверить разбор — до появления автоматического чтения SMS с телефона.</Text>
+          <Text style={s.fieldLabel}>ОТПРАВИТЕЛЬ</Text>
+          <View style={s.choiceRow}>{KNOWN_SMS_SENDERS.map((item) => <Pressable key={item} style={[s.choice, sender === item && s.choiceActive]} onPress={() => setSender(item)}><Text style={[s.choiceText, sender === item && s.choiceTextActive]}>{item}</Text></Pressable>)}</View>
+          <Text style={s.fieldLabel}>ТЕКСТ SMS</Text>
+          <TextInput value={body} onChangeText={setBody} placeholder="Вставьте текст сюда" placeholderTextColor="#9BA9AF" multiline style={[s.input, { minHeight: 100, paddingTop: 12, textAlignVertical: 'top' }]} />
+          <Pressable style={s.primaryButton} disabled={loading || !body.trim()} onPress={handleParse}><Text style={s.primaryText}>{loading ? 'Разбираем…' : 'Разобрать'}</Text></Pressable>
+          <Text style={[s.sectionTitle, { marginTop: 26, marginBottom: 10 }]}>Черновики</Text>
+          {!drafts.length && <Text style={s.rowSub}>Пока пусто</Text>}
+          {drafts.map((draft) => <View key={draft.id} style={{ marginBottom: 10 }}><SmsDraftCard draft={draft} accounts={accounts} onConfirm={(accountId, includeFee) => handleConfirm(draft, accountId, includeFee)} onDismiss={() => handleDismiss(draft)} /></View>)}
+        </ScrollView>
+      </KeyboardAvoidingView>
+    </SafeAreaView>
+  </Modal>;
+}
+
 function LegacyAnalytics() {
   const maxBar = 11.2;
   return <ScrollView contentContainerStyle={s.page} showsVerticalScrollIndicator={false}>
@@ -527,10 +602,11 @@ function Analytics({ accounts, plannedExpenses, plannedOccurrences, debts, curre
   </ScrollView>;
 }
 
-function Profile({ email, currencySettings, onCurrencySettings, onBack }: { email?: string; currencySettings: CurrencySettings; onCurrencySettings: () => void; onBack: () => void }) {
+function Profile({ email, accounts, currencySettings, onCurrencySettings, onBack }: { email?: string; accounts: Account[]; currencySettings: CurrencySettings; onCurrencySettings: () => void; onBack: () => void }) {
   const [lockEnabled, setLockEnabledState] = useState(false);
   const [lockLoaded, setLockLoaded] = useState(false);
   const [pinSetupOpen, setPinSetupOpen] = useState(false);
+  const [smsImportOpen, setSmsImportOpen] = useState(false);
   useEffect(() => { getLockEnabled().then((value) => { setLockEnabledState(value); setLockLoaded(true); }); }, []);
   const handleToggleLock = (value: boolean) => {
     if (value) { setPinSetupOpen(true); return; }
@@ -570,6 +646,12 @@ function Profile({ email, currencySettings, onCurrencySettings, onBack }: { emai
       </View>
       {lockEnabled && <><View style={s.divider} /><Pressable style={s.eventRow} onPress={() => setPinSetupOpen(true)}><View style={{ flex: 1 }}><Text style={s.rowTitle}>Изменить PIN-код</Text></View><Ionicons name="chevron-forward" size={19} color={C.muted} /></Pressable></>}
     </View>
+    <SectionTitle title="Автоматизация" />
+    <Pressable style={s.accountCard} onPress={() => setSmsImportOpen(true)}>
+      <View style={[s.roundIcon, { backgroundColor: `${C.green}18` }]}><Ionicons name="chatbox-ellipses-outline" size={20} color={C.green} /></View>
+      <View style={{ flex: 1 }}><Text style={s.rowTitle}>Проверить разбор SMS</Text><Text style={s.rowSub}>Тестовая вставка текста, пока нет автоматического чтения</Text></View>
+      <Ionicons name="chevron-forward" size={19} color={C.muted} />
+    </Pressable>
     <SectionTitle title="О приложении" />
     <View style={s.card}>
       <View style={s.eventRow}><View style={[s.roundIcon, { backgroundColor: C.sageSoft }]}><Ionicons name="sparkles-outline" size={19} color={C.green} /></View><View style={{ flex: 1 }}><Text style={s.rowTitle}>Афина</Text><Text style={s.rowSub}>Версия {APP_VERSION}</Text></View></View>
@@ -577,6 +659,7 @@ function Profile({ email, currencySettings, onCurrencySettings, onBack }: { emai
     <Pressable style={s.deleteButton} onPress={handleSignOut}><Ionicons name="log-out-outline" size={18} color={C.red} /><Text style={s.deleteText}>Выйти из аккаунта</Text></Pressable>
     <View style={{ height: 20 }} />
     <PinSetupModal visible={pinSetupOpen} onClose={() => setPinSetupOpen(false)} onSaved={() => { setLockEnabledState(true); setPinSetupOpen(false); }} />
+    <SmsImportModal visible={smsImportOpen} accounts={accounts} onClose={() => setSmsImportOpen(false)} />
   </ScrollView>;
 }
 
@@ -723,6 +806,7 @@ function AccountEditor({
   const [paymentDueDay, setPaymentDueDay] = useState<number | undefined>();
   const [gracePeriodDays, setGracePeriodDays] = useState<number | undefined>();
   const [minimumPaymentPercent, setMinimumPaymentPercent] = useState<number | undefined>();
+  const [cardLast4, setCardLast4] = useState('');
   const [saving, setSaving] = useState(false);
 
   useEffect(() => {
@@ -746,6 +830,7 @@ function AccountEditor({
     setReplenishmentAllowed(account?.replenishmentAllowed ?? false);
     setCreditLimit(account?.creditLimit); setStatementDay(account?.statementDay); setPaymentDueDay(account?.paymentDueDay);
     setGracePeriodDays(account?.gracePeriodDays); setMinimumPaymentPercent(account?.minimumPaymentPercent ?? 5);
+    setCardLast4(account?.cardLast4 ?? '');
   }, [visible, account]);
 
   const submit = async () => {
@@ -754,6 +839,7 @@ function AccountEditor({
     if (!name.trim()) { Alert.alert('Укажите название счёта'); return; }
     if (numericBalance === undefined || !Number.isFinite(numericBalance)) { Alert.alert('Проверьте начальный баланс'); return; }
     if (!/^[A-Z]{3}$/.test(currency)) { Alert.alert('Укажите трёхбуквенный код валюты, например UZS, RUB или EUR'); return; }
+    if (cardLast4.trim() && !/^\d{4}$/.test(cardLast4.trim())) { Alert.alert('Последние 4 цифры карты — ровно 4 цифры'); return; }
     if (type === 'deposit' && !maturityDate) { Alert.alert('Укажите дату окончания вклада'); return; }
     if (type === 'credit_card' && (!creditLimit || creditLimit <= 0)) { Alert.alert('Укажите кредитный лимит'); return; }
     if (type === 'credit_card' && (!statementDay || statementDay < 1 || statementDay > 31 || !paymentDueDay || paymentDueDay < 1 || paymentDueDay > 31)) { Alert.alert('Укажите дни выписки и платежа от 1 до 31'); return; }
@@ -784,6 +870,7 @@ function AccountEditor({
         gracePeriodDays: type === 'credit_card' ? Math.round(gracePeriodDays ?? 0) : undefined,
         minimumPaymentPercent: type === 'credit_card' ? minimumPaymentPercent : undefined,
         accent: option.accent,
+        cardLast4: cardLast4.trim() || undefined,
       });
     } finally { setSaving(false); }
   };
@@ -800,6 +887,9 @@ function AccountEditor({
           <TextInput value={name} onChangeText={setName} placeholder="Например, Основная карта" placeholderTextColor="#9BA9AF" style={s.input} />
           <Text style={s.fieldLabel}>БАНК ИЛИ ОПИСАНИЕ</Text>
           <TextInput value={subtitle} onChangeText={setSubtitle} placeholder="Например, Kapitalbank • 4821" placeholderTextColor="#9BA9AF" style={s.input} />
+          <Text style={s.fieldLabel}>ПОСЛЕДНИЕ 4 ЦИФРЫ КАРТЫ · НЕОБЯЗАТЕЛЬНО</Text>
+          <TextInput value={cardLast4} onChangeText={(text) => setCardLast4(text.replace(/\D/g, '').slice(0, 4))} placeholder="0000" placeholderTextColor="#9BA9AF" keyboardType="number-pad" maxLength={4} style={s.input} />
+          <Text style={s.helperText}>Нужно, чтобы Афина сама находила этот счёт по SMS от банка или фото чека.</Text>
           <Text style={s.fieldLabel}>{type === 'credit_card' ? 'ТЕКУЩАЯ ЗАДОЛЖЕННОСТЬ' : 'БАЛАНС'}</Text><DecimalInput value={balance} onChange={setBalance} placeholder="0,00" />
           <Text style={s.fieldLabel}>ВАЛЮТА</Text><CurrencyPicker value={currency} onChange={(value) => { setCurrency(value); setDestinationAccountId(undefined); }} />
           {type === 'credit_card' && <><Text style={s.fieldLabel}>КРЕДИТНЫЙ ЛИМИТ</Text><DecimalInput value={creditLimit} onChange={setCreditLimit} placeholder="0,00" /><View style={s.twoColumns}><View style={{ flex: 1 }}><Text style={s.fieldLabel}>ДЕНЬ ВЫПИСКИ</Text><DecimalInput value={statementDay} onChange={setStatementDay} placeholder="Например, 5" /></View><View style={{ flex: 1 }}><Text style={s.fieldLabel}>ДЕНЬ ПЛАТЕЖА</Text><DecimalInput value={paymentDueDay} onChange={setPaymentDueDay} placeholder="Например, 25" /></View></View><View style={s.twoColumns}><View style={{ flex: 1 }}><Text style={s.fieldLabel}>ЛЬГОТНЫЙ ПЕРИОД, ДНЕЙ</Text><DecimalInput value={gracePeriodDays} onChange={setGracePeriodDays} placeholder="Например, 55" /></View><View style={{ flex: 1 }}><Text style={s.fieldLabel}>МИН. ПЛАТЁЖ, %</Text><DecimalInput value={minimumPaymentPercent} onChange={setMinimumPaymentPercent} placeholder="Например, 5" /></View></View><Text style={s.fieldLabel}>СТАВКА ПОСЛЕ ЛЬГОТНОГО ПЕРИОДА, %</Text><DecimalInput value={rate} onChange={setRate} placeholder="Например, 36" /></>}
@@ -1487,7 +1577,7 @@ function AppContent({ userId, email }: { userId: string; email?: string }) {
 
   const screen = useMemo(() => {
     const onProfile = () => setTab('profile');
-    if (tab === 'profile') return <Profile email={email} currencySettings={currencySettings} onCurrencySettings={() => setCurrencySettingsOpen(true)} onBack={() => setTab('home')} />;
+    if (tab === 'profile') return <Profile email={email} accounts={userAccounts} currencySettings={currencySettings} onCurrencySettings={() => setCurrencySettingsOpen(true)} onBack={() => setTab('home')} />;
     if (tab === 'accounts') return <Accounts accounts={userAccounts} onAdd={openNewAccount} onImport={() => setImportOpen(true)} onEdit={openAccount} debts={debts} onAddDebt={openNewDebt} onOpenDebt={openDebt} currencySettings={currencySettings} onCurrencySettings={() => setCurrencySettingsOpen(true)} onProfile={onProfile} />;
     if (tab === 'calendar') return <Calendar accounts={userAccounts} plannedExpenses={plannedExpenses} plannedOccurrences={plannedOccurrences} debts={debts} currencySettings={currencySettings} onAddExpense={openNewExpense} onEditExpense={openExpense} onExecuteOccurrence={handleOpenOccurrence} onCancelOccurrence={handleCancelOccurrence} onProfile={onProfile} />;
     if (tab === 'operations') return <Operations operations={operations} transfers={transfers} plannedOccurrences={plannedOccurrences} plannedExpenses={plannedExpenses} accounts={userAccounts} onAdd={() => setOperationEditorOpen(true)} onTransfer={() => setTransferModalOpen(true)} onReverseTransfer={handleReverseTransfer} onExecuteOccurrence={handleOpenOccurrence} onCancelOccurrence={handleCancelOccurrence} onProfile={onProfile} />;

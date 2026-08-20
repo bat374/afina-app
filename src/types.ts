@@ -35,6 +35,10 @@ export type Account = {
   gracePeriodDays?: number;
   minimumPaymentPercent?: number;
   accent: string;
+  // Last 4 digits of the card, as printed on bank SMS/receipts (e.g. "3463"). Used to match an
+  // incoming SMS or receipt photo to this account without guessing — see BACKLOG.md R-01/R-02/R-03.
+  // Synced via cloudSync.ts (supabase/migrations/20260820_000002_account_card_last4.sql).
+  cardLast4?: string;
 };
 
 export type CalendarDay = {
@@ -87,6 +91,30 @@ export type PlannedOccurrence = {
   currency: string;
   status: PlannedOccurrenceStatus;
   operationId?: string;
+};
+
+export type SmsDraftStatus = 'pending' | 'unrecognized' | 'confirmed' | 'dismissed';
+
+// A parsed (or unparseable) bank SMS awaiting user confirmation before it can ever touch a
+// balance. Device-local only — the raw SMS text never leaves the phone (not synced to Supabase).
+export type SmsDraft = {
+  id: string;
+  sender: string;
+  parserId?: string;
+  rawBody: string;
+  receivedAt: string;
+  occurredAt?: string;
+  amount?: number;
+  currency?: string;
+  kind?: 'income' | 'expense';
+  feeAmount?: number;
+  cardLast4?: string;
+  accountId?: string;
+  merchant?: string;
+  balanceAfter?: number;
+  status: SmsDraftStatus;
+  operationId?: string;
+  dedupOperationId?: string;
 };
 
 export type PlannedExecutionInput = {

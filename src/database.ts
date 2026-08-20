@@ -1,7 +1,9 @@
 import * as SQLite from 'expo-sqlite';
-import { Account, AccountType, Budget, CashFlowKind, CurrencySettings, Debt, DebtDirection, DebtHistory, DebtHistoryType, DebtStatus, ExpenseRepeat, FinancialGoal, FinancialOperation, GoalType, InterestDestination, InterestPosting, InterestSchedule, PlannedExecutionInput, PlannedExpense, PlannedOccurrence, PlannedOccurrenceStatus, RecurrenceUnit, Transfer, TransferInput, WithdrawalPolicy } from './types';
+import { Account, AccountType, Budget, CashFlowKind, CurrencySettings, Debt, DebtDirection, DebtHistory, DebtHistoryType, DebtStatus, ExpenseRepeat, FinancialGoal, FinancialOperation, GoalType, InterestDestination, InterestPosting, InterestSchedule, PlannedExecutionInput, PlannedExpense, PlannedOccurrence, PlannedOccurrenceStatus, RecurrenceUnit, SmsDraft, Transfer, TransferInput, WithdrawalPolicy } from './types';
 import { addLocalDays, daysBetween, localToday, nextBusinessMonday, nextMonthlyDate, parseLocalDate, previousMonthlyDate, toLocalIso } from './date';
 import { occursOn } from './recurrence';
+import { ParsedSms } from './sms/types';
+import { hashString } from './sms/hash';
 
 type AccountRow = {
   id: string;
@@ -29,6 +31,7 @@ type AccountRow = {
   grace_period_days: number | null;
   minimum_payment_percent: number | null;
   accent: string;
+  card_last4: string | null;
 };
 
 export type AccountInput = Omit<Account, 'id'>;
@@ -287,6 +290,29 @@ async function initializeDatabaseCore() {
       updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
       UNIQUE(flow_id, occurrence_date)
     );
+    CREATE TABLE IF NOT EXISTS sms_drafts (
+      id TEXT PRIMARY KEY NOT NULL,
+      sender TEXT NOT NULL,
+      parser_id TEXT,
+      raw_body TEXT NOT NULL,
+      body_hash TEXT NOT NULL,
+      received_at TEXT NOT NULL,
+      occurred_at TEXT,
+      amount REAL CHECK(amount IS NULL OR amount > 0),
+      currency TEXT,
+      kind TEXT CHECK(kind IN ('income', 'expense')),
+      fee_amount REAL,
+      card_last4 TEXT,
+      account_id TEXT,
+      merchant TEXT,
+      balance_after REAL,
+      status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending', 'unrecognized', 'confirmed', 'dismissed')),
+      operation_id TEXT,
+      dedup_operation_id TEXT,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE(sender, body_hash)
+    );
     INSERT OR IGNORE INTO scheduled_flows
       (id, title, category, amount, currency, account_id, start_date, end_date, repeat_rule, kind,
        repeat_interval, repeat_unit, source_transaction_id, created_at, updated_at)
@@ -383,7 +409,7 @@ async function initializeDatabaseCore() {
   columns = await db.getAllAsync<{ name: string }>('PRAGMA table_info(accounts)');
   const creditColumns = [
     ['credit_limit', 'REAL'], ['statement_day', 'INTEGER'], ['payment_due_day', 'INTEGER'],
-    ['grace_period_days', 'INTEGER'], ['minimum_payment_percent', 'REAL'],
+    ['grace_period_days', 'INTEGER'], ['minimum_payment_percent', 'REAL'], ['card_last4', 'TEXT'],
   ] as const;
   for (const [name, sqlType] of creditColumns) {
     if (!columns.some((column) => column.name === name)) await db.execAsync(`ALTER TABLE accounts ADD COLUMN ${name} ${sqlType};`);
@@ -532,6 +558,7 @@ async function listAccountsCore(): Promise<Account[]> {
     gracePeriodDays: row.grace_period_days ?? undefined,
     minimumPaymentPercent: row.minimum_payment_percent ?? undefined,
     accent: row.accent,
+    cardLast4: row.card_last4 ?? undefined,
   }));
 }
 
@@ -555,7 +582,7 @@ export function saveAccount(input: AccountInput, id?: string) {
        interest_destination = ?, destination_account_id = ?, next_interest_date = ?, auto_renewal = ?,
        rate_review_reminder = ?, withdrawal_policy = ?, minimum_balance = ?, replenishment_allowed = ?,
        credit_limit = ?, statement_day = ?, payment_due_day = ?, grace_period_days = ?, minimum_payment_percent = ?,
-       accent = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+       accent = ?, card_last4 = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
         input.name, input.subtitle, input.type === 'credit_card' ? 'card' : input.type, input.balance, input.currency,
         input.rate ?? null, input.rateCaption ?? null, input.startDate ?? null, input.maturityDate ?? null,
         input.interestSchedule ?? null, input.interestDestination ?? null, input.destinationAccountId ?? null,
@@ -564,7 +591,7 @@ export function saveAccount(input: AccountInput, id?: string) {
         input.replenishmentAllowed === undefined ? null : input.replenishmentAllowed ? 1 : 0,
         input.creditLimit ?? null, input.statementDay ?? null, input.paymentDueDay ?? null,
         input.gracePeriodDays ?? null, input.minimumPaymentPercent ?? null,
-        input.accent, id,
+        input.accent, input.cardLast4 ?? null, id,
       );
       return id;
     }
@@ -574,8 +601,8 @@ export function saveAccount(input: AccountInput, id?: string) {
       start_date, maturity_date, interest_schedule, interest_destination, destination_account_id,
       next_interest_date, auto_renewal, rate_review_reminder, withdrawal_policy, minimum_balance,
       replenishment_allowed, credit_limit, statement_day, payment_due_day, grace_period_days,
-      minimum_payment_percent, accent, interest_tracking_from)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      minimum_payment_percent, accent, interest_tracking_from, card_last4)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       newId, input.name, input.subtitle, input.type === 'credit_card' ? 'card' : input.type, input.balance, input.currency,
       input.rate ?? null, input.rateCaption ?? null, input.startDate ?? null, input.maturityDate ?? null,
       input.interestSchedule ?? null, input.interestDestination ?? null, input.destinationAccountId ?? null,
@@ -584,7 +611,7 @@ export function saveAccount(input: AccountInput, id?: string) {
       input.replenishmentAllowed === undefined ? null : input.replenishmentAllowed ? 1 : 0,
       input.creditLimit ?? null, input.statementDay ?? null, input.paymentDueDay ?? null,
       input.gracePeriodDays ?? null, input.minimumPaymentPercent ?? null,
-      input.accent, trackingFrom,
+      input.accent, trackingFrom, input.cardLast4 ?? null,
     );
     return newId;
   });
@@ -1265,6 +1292,121 @@ export function createOperation(input: FinancialOperationInput) {
       await db.runAsync('UPDATE accounts SET balance = balance + ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?', delta, input.accountId);
     });
     return id;
+  });
+}
+
+type SmsDraftRow = {
+  id: string; sender: string; parser_id: string | null; raw_body: string; body_hash: string;
+  received_at: string; occurred_at: string | null; amount: number | null; currency: string | null;
+  kind: 'income' | 'expense' | null; fee_amount: number | null; card_last4: string | null;
+  account_id: string | null; merchant: string | null; balance_after: number | null;
+  status: SmsDraft['status']; operation_id: string | null; dedup_operation_id: string | null;
+};
+
+const mapSmsDraftRow = (row: SmsDraftRow): SmsDraft => ({
+  id: row.id, sender: row.sender, parserId: row.parser_id ?? undefined, rawBody: row.raw_body,
+  receivedAt: row.received_at, occurredAt: row.occurred_at ?? undefined,
+  amount: row.amount ?? undefined, currency: row.currency ?? undefined, kind: row.kind ?? undefined,
+  feeAmount: row.fee_amount ?? undefined, cardLast4: row.card_last4 ?? undefined,
+  accountId: row.account_id ?? undefined, merchant: row.merchant ?? undefined,
+  balanceAfter: row.balance_after ?? undefined, status: row.status,
+  operationId: row.operation_id ?? undefined, dedupOperationId: row.dedup_operation_id ?? undefined,
+});
+
+async function listSmsDraftsCore(): Promise<SmsDraft[]> {
+  const db = await getDatabase();
+  const rows = await db.getAllAsync<SmsDraftRow>("SELECT * FROM sms_drafts WHERE status IN ('pending', 'unrecognized') ORDER BY received_at DESC");
+  return rows.map(mapSmsDraftRow);
+}
+
+export function listSmsDrafts(): Promise<SmsDraft[]> {
+  return enqueue(listSmsDraftsCore);
+}
+
+// A heuristic (never-silent) hint that this SMS might duplicate an operation the user already
+// entered by hand: same account/kind/currency/amount (to the cent) and a date within +/-1 day —
+// operations only store a day-level date, not a timestamp, so a tighter window isn't possible.
+// A hit never auto-drops the draft; it just flags it for the user to confirm or reject.
+async function findDedupOperation(db: SQLite.SQLiteDatabase, accountId: string, kind: 'income' | 'expense', currency: string, amount: number, occurredAt: string): Promise<string | undefined> {
+  const day = occurredAt.slice(0, 10);
+  const row = await db.getFirstAsync<{ id: string }>(
+    `SELECT id FROM operations WHERE status = 'posted' AND account_id = ? AND kind = ? AND currency = ?
+     AND ABS(amount - ?) < 0.01 AND date BETWEEN date(?, '-1 day') AND date(?, '+1 day') LIMIT 1`,
+    accountId, kind, currency, amount, day, day,
+  );
+  return row?.id;
+}
+
+export function createSmsDraft(input: { sender: string; rawBody: string; receivedAt: string; parsed: ParsedSms | null; parserId?: string }) {
+  return enqueue(async () => {
+    const db = await getDatabase();
+    // Same sender + byte-identical body = the bank resent the same message (both formats here
+    // embed a running balance, so two genuinely distinct transactions can never collide here).
+    const bodyHash = hashString(`${input.sender} ${input.rawBody}`);
+    const existing = await db.getFirstAsync<SmsDraftRow>('SELECT * FROM sms_drafts WHERE sender = ? AND body_hash = ?', input.sender, bodyHash);
+    if (existing) return { draft: mapSmsDraftRow(existing), alreadyExisted: true };
+
+    const id = makeId();
+    const parsed = input.parsed;
+    let accountId: string | undefined;
+    let dedupOperationId: string | undefined;
+    if (parsed?.cardLast4) {
+      const matches = await db.getAllAsync<{ id: string }>('SELECT id FROM accounts WHERE card_last4 = ?', parsed.cardLast4);
+      if (matches.length === 1) accountId = matches[0]!.id;
+    }
+    if (parsed && accountId) dedupOperationId = await findDedupOperation(db, accountId, parsed.kind, parsed.currency, parsed.amount, parsed.occurredAt);
+    await db.runAsync(
+      `INSERT INTO sms_drafts (id, sender, parser_id, raw_body, body_hash, received_at, occurred_at, amount, currency, kind, fee_amount, card_last4, account_id, merchant, balance_after, status, dedup_operation_id)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      id, input.sender, input.parserId ?? null, input.rawBody, bodyHash, input.receivedAt,
+      parsed?.occurredAt ?? null, parsed?.amount ?? null, parsed?.currency ?? null, parsed?.kind ?? null,
+      parsed?.feeAmount ?? null, parsed?.cardLast4 ?? null, accountId ?? null, parsed?.merchant ?? null,
+      parsed?.balanceAfter ?? null, parsed ? 'pending' : 'unrecognized', dedupOperationId ?? null,
+    );
+    const row = await db.getFirstAsync<SmsDraftRow>('SELECT * FROM sms_drafts WHERE id = ?', id);
+    return { draft: mapSmsDraftRow(row!), alreadyExisted: false };
+  });
+}
+
+export function confirmSmsDraft(id: string, input: { accountId: string; title: string; category: string; feeAsSeparateOperation?: boolean }) {
+  return enqueue(async () => {
+    const db = await getDatabase();
+    const draft = await db.getFirstAsync<SmsDraftRow>('SELECT * FROM sms_drafts WHERE id = ?', id);
+    if (!draft || draft.status !== 'pending' || draft.amount === null || draft.currency === null || draft.kind === null || !draft.occurred_at) {
+      throw new Error('Черновик не найден или уже обработан');
+    }
+    const operationId = makeId();
+    const date = draft.occurred_at.slice(0, 10);
+    const delta = draft.kind === 'income' ? draft.amount : -draft.amount;
+    await db.withTransactionAsync(async () => {
+      await db.runAsync(
+        `INSERT INTO operations (id, title, category, amount, currency, account_id, date, kind, source)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'sms')`,
+        operationId, input.title, input.category, draft.amount, draft.currency, input.accountId, date, draft.kind,
+      );
+      await db.runAsync('UPDATE accounts SET balance = balance + ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?', delta, input.accountId);
+      // Deliberately NOT linked via related_operation_id — that field already means "this is a
+      // reversal of X" everywhere it's displayed (Operations screen shows "обратная проводка"),
+      // so reusing it for a fee sibling would mislabel it. Just a plain second expense.
+      if (input.feeAsSeparateOperation && draft.fee_amount) {
+        const feeOperationId = makeId();
+        await db.runAsync(
+          `INSERT INTO operations (id, title, category, amount, currency, account_id, date, kind, source)
+           VALUES (?, ?, ?, ?, ?, ?, ?, 'expense', 'sms')`,
+          feeOperationId, 'Комиссия за операцию', 'Комиссия', draft.fee_amount, draft.currency, input.accountId, date,
+        );
+        await db.runAsync('UPDATE accounts SET balance = balance - ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?', draft.fee_amount, input.accountId);
+      }
+      await db.runAsync("UPDATE sms_drafts SET status = 'confirmed', operation_id = ?, account_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?", operationId, input.accountId, id);
+    });
+    return operationId;
+  });
+}
+
+export function dismissSmsDraft(id: string) {
+  return enqueue(async () => {
+    const db = await getDatabase();
+    await db.runAsync("UPDATE sms_drafts SET status = 'dismissed', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND status IN ('pending', 'unrecognized')", id);
   });
 }
 
