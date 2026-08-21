@@ -1,5 +1,6 @@
-import { Account, CurrencySettings, Debt, PlannedExpense, PlannedOccurrence } from './types';
-import { localToday, parseLocalDate } from './date';
+import { Account, CurrencySettings, Debt, FinancialOperation, PlannedExpense, PlannedOccurrence, Transfer } from './types';
+import { addLocalDays, localToday, parseLocalDate } from './date';
+import { convertCurrency } from './currency';
 import { occursOn } from './recurrence';
 
 export type InterestEvent = {
@@ -40,17 +41,30 @@ export const getCurrencyTotals = (accounts: Account[]) => {
   return totals;
 };
 
+// `nativeCurrency` is what the linked account actually gets charged/credited in (or the flow's
+// own currency if it isn't linked to an account yet) -- distinct from `currency`, the display
+// currency the caller asked for (whatever's selected on the Calendar/Home/Analytics screen).
+// Previously this returned null whenever those two didn't match, silently dropping any plan not
+// denominated in the exact currency currently selected on screen, even though a conversion rate
+// for it existed and is used everywhere else in the app (BACKLOG.md BUG-03: planned expenses
+// disappearing from Analytics' "План расходов" because their account's currency isn't whatever
+// currency happened to be selected).
 export const flowAmountInCurrency = (flow: PlannedExpense, account: Account | undefined, currency: string, settings?: CurrencySettings) => {
-  const targetCurrency = account?.currency ?? flow.currency;
-  if (targetCurrency !== currency) return null;
-  if (flow.currency === targetCurrency) return flow.amount;
-  if (flow.exchangeRate && flow.exchangeRate > 0) return flow.amount * flow.exchangeRate;
-  const sourceRate = settings?.rates[flow.currency];
-  const targetRate = targetCurrency === settings?.baseCurrency ? 1 : settings?.rates[targetCurrency];
-  return sourceRate && targetRate ? flow.amount * sourceRate / targetRate : null;
+  const nativeCurrency = account?.currency ?? flow.currency;
+  let nativeAmount: number;
+  if (flow.currency === nativeCurrency) nativeAmount = flow.amount;
+  else if (flow.exchangeRate && flow.exchangeRate > 0) nativeAmount = flow.amount * flow.exchangeRate;
+  else {
+    const sourceRate = settings?.rates[flow.currency];
+    const targetRate = nativeCurrency === settings?.baseCurrency ? 1 : settings?.rates[nativeCurrency];
+    if (!sourceRate || !targetRate) return null;
+    nativeAmount = flow.amount * sourceRate / targetRate;
+  }
+  if (nativeCurrency === currency) return nativeAmount;
+  return settings ? convertCurrency(nativeAmount, nativeCurrency, currency, settings) : null;
 };
 
-export function buildMonthProjection(accounts: Account[], currency: string, year: number, month: number, plannedExpenses: PlannedExpense[] = [], debts: Debt[] = [], settings?: CurrencySettings, today = localToday(), plannedOccurrences: PlannedOccurrence[] = []) {
+export function buildMonthProjection(accounts: Account[], currency: string, year: number, month: number, plannedExpenses: PlannedExpense[] = [], debts: Debt[] = [], settings?: CurrencySettings, today = localToday(), plannedOccurrences: PlannedOccurrence[] = [], operations: FinancialOperation[] = [], transfers: Transfer[] = []) {
   // A flow's occurrence for "today" can already be resolved (executed or cancelled) by the time
   // this projection runs — "today" itself doesn't count as `past` below, so without this the same
   // flow would otherwise be counted once as a real operation (already in account.balance) and a
@@ -63,9 +77,32 @@ export function buildMonthProjection(accounts: Account[], currency: string, year
   const trackedIds = new Set(relevant.map((account) => account.id));
   const runningPrincipal = new Map(relevant.map((account) => [account.id, account.balance]));
   let balance = relevant.reduce((sum, account) => sum + account.balance, 0);
+  const currentBalance = balance;
   const days: ProjectedDay[] = [];
   const events: InterestEvent[] = [];
   const todayDate = parseLocalDate(today) ?? new Date();
+
+  // Reconstructs past days' actual balance/income/expense from real history instead of repeating
+  // today's live balance for every day before it (the account.balance in `relevant` is always
+  // "right now" — it has no memory of what it was on any earlier date). Only posted, non-reversed
+  // operations/transfers on the tracked accounts count; the same-currency transfer pool nets to
+  // zero on the aggregate `relevant` total by construction, which is correct.
+  const historyOperations = operations.filter((op) => op.status !== 'reversed' && trackedIds.has(op.accountId) && op.currency === currency);
+  const historyTransfers = transfers.filter((transfer) => transfer.status !== 'reversed');
+  // Gross income/expense in (fromExclusiveIso, toInclusiveIso] -- kept separate rather than
+  // netted, so a day with both an income and an expense still shows both, not just the difference.
+  const grossTotalsInRange = (fromExclusiveIso: string, toInclusiveIso: string) => {
+    let income = 0; let expense = 0;
+    for (const op of historyOperations) {
+      if (op.date > fromExclusiveIso && op.date <= toInclusiveIso) { if (op.kind === 'income') income += op.amount; else expense += op.amount; }
+    }
+    for (const transfer of historyTransfers) {
+      if (transfer.date <= fromExclusiveIso || transfer.date > toInclusiveIso) continue;
+      if (trackedIds.has(transfer.fromAccountId) && transfer.fromCurrency === currency) expense += transfer.fromAmount;
+      if (trackedIds.has(transfer.toAccountId) && transfer.toCurrency === currency) income += transfer.toAmount;
+    }
+    return { income, expense };
+  };
 
   for (let day = 1; day <= count; day += 1) {
     const current = new Date(year, month, day, 12);
@@ -149,7 +186,19 @@ export function buildMonthProjection(accounts: Account[], currency: string, year
         events.push({ kind: 'debt_expense', date, day, accountId: debt.accountId ?? debt.id, title: `Погашение долга · ${debt.person}`, amount: debt.currentBalance, currency, trackedInBalance: true });
       }
     }
-    days.push({ day, date, balance, income, expense: expenseTotal, risky: balance < 0 });
+    if (past) {
+      // Everything above this block was skipped for a past day (every projection branch is
+      // gated on `!past`), so `balance`/`income`/`expenseTotal` are still just carrying today's
+      // live figures forward unchanged -- reconstruct this day's actual numbers from history
+      // instead of pushing those as if they applied historically too.
+      const previousDate = addLocalDays(date, -1);
+      const afterToday = grossTotalsInRange(date, today);
+      const dayBalance = currentBalance - afterToday.income + afterToday.expense;
+      const onThisDay = grossTotalsInRange(previousDate, date);
+      days.push({ day, date, balance: dayBalance, income: onThisDay.income, expense: onThisDay.expense, risky: dayBalance < 0 });
+    } else {
+      days.push({ day, date, balance, income, expense: expenseTotal, risky: balance < 0 });
+    }
   }
   return {
     days,

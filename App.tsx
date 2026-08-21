@@ -127,12 +127,12 @@ function LegacyHome({ onImport, go, accounts }: { onImport: () => void; go: (tab
   </ScrollView>;
 }
 
-function Home({ onImport, go, accounts, plannedExpenses, plannedOccurrences, debts, currencySettings, onCurrencySettings, onProfile, pendingImportDrafts }: { onImport: () => void; go: (tab: Tab) => void; accounts: Account[]; plannedExpenses: PlannedExpense[]; plannedOccurrences: PlannedOccurrence[]; debts: Debt[]; currencySettings: CurrencySettings; onCurrencySettings: () => void; onProfile: () => void; pendingImportDrafts: number }) {
+function Home({ onImport, go, accounts, plannedExpenses, plannedOccurrences, debts, currencySettings, onCurrencySettings, onProfile, pendingImportDrafts, operations, transfers }: { onImport: () => void; go: (tab: Tab) => void; accounts: Account[]; plannedExpenses: PlannedExpense[]; plannedOccurrences: PlannedOccurrence[]; debts: Debt[]; currencySettings: CurrencySettings; onCurrencySettings: () => void; onProfile: () => void; pendingImportDrafts: number; operations: FinancialOperation[]; transfers: Transfer[] }) {
   const now = new Date();
   const totals = getCurrencyTotals(accounts);
   const currencies = Array.from(new Set([currencySettings.baseCurrency, ...Object.keys(totals), ...plannedExpenses.map((item) => item.currency), ...debts.map((item) => item.currency)])).sort((a, b) => a === 'UZS' ? -1 : b === 'UZS' ? 1 : a.localeCompare(b));
   const primaryCurrency = currencies[0] ?? 'UZS';
-  const projection = buildMonthProjection(accounts, primaryCurrency, now.getFullYear(), now.getMonth(), plannedExpenses, debts, currencySettings, localToday(), plannedOccurrences);
+  const projection = buildMonthProjection(accounts, primaryCurrency, now.getFullYear(), now.getMonth(), plannedExpenses, debts, currencySettings, localToday(), plannedOccurrences, operations, transfers);
   const consolidated = consolidatedNetWorth(accounts, debts, currencySettings);
   const risk = projection.days.find((day) => day.risky);
   const events = projection.events.filter((event) => event.day >= now.getDate()).slice(0, 3);
@@ -270,10 +270,11 @@ function LegacyCalendar() {
   </ScrollView>;
 }
 
-function Calendar({ accounts, plannedExpenses, plannedOccurrences, debts, currencySettings, onAddExpense, onEditExpense, onExecuteOccurrence, onCancelOccurrence, onProfile }: {
+function Calendar({ accounts, plannedExpenses, plannedOccurrences, debts, currencySettings, onAddExpense, onEditExpense, onExecuteOccurrence, onCancelOccurrence, onProfile, operations, transfers }: {
   accounts: Account[]; plannedExpenses: PlannedExpense[]; plannedOccurrences: PlannedOccurrence[]; debts: Debt[]; currencySettings: CurrencySettings;
   onAddExpense: (date: string) => void; onEditExpense: (expense: PlannedExpense) => void;
   onExecuteOccurrence: (occurrence: PlannedOccurrence, flow: PlannedExpense) => void; onCancelOccurrence: (occurrence: PlannedOccurrence) => void; onProfile: () => void;
+  operations: FinancialOperation[]; transfers: Transfer[];
 }) {
   const [today, setToday] = useState(localToday());
   const todayDate = dateFromIso(today);
@@ -286,7 +287,7 @@ function Calendar({ accounts, plannedExpenses, plannedOccurrences, debts, curren
   useEffect(() => { const timer = setInterval(() => setToday(localToday()), 60_000); return () => clearInterval(timer); }, []);
   useEffect(() => { if (currencies.length && !currencies.includes(currency)) setCurrency(currencies[0] ?? 'UZS'); }, [accounts, plannedExpenses, debts]);
   const year = viewDate.getFullYear(); const month = viewDate.getMonth();
-  const projection = useMemo(() => buildMonthProjection(accounts, currency, year, month, plannedExpenses, debts, currencySettings, today, plannedOccurrences), [accounts, currency, year, month, plannedExpenses, debts, currencySettings, today, plannedOccurrences]);
+  const projection = useMemo(() => buildMonthProjection(accounts, currency, year, month, plannedExpenses, debts, currencySettings, today, plannedOccurrences, operations, transfers), [accounts, currency, year, month, plannedExpenses, debts, currencySettings, today, plannedOccurrences, operations, transfers]);
   const offset = (new Date(year, month, 1).getDay() + 6) % 7;
   const selectedEvents = projection.events.filter((event) => event.day === selectedDay);
   const delta = projection.closingBalance - projection.openingBalance;
@@ -450,7 +451,7 @@ function ReceiptViewerModal({ uri, onClose }: { uri: string | null; onClose: () 
 }
 
 // Senders with a registered parser (see src/sms/registry.ts).
-const KNOWN_SMS_SENDERS = ['kapitalbank', '13131'];
+const KNOWN_SMS_SENDERS = ['kapitalbank', '13131', '2212'];
 
 // Foreground scan only — on app launch and on return from background, per the architecture plan:
 // a background listener needs a foreground-service notification on Android 8+ and still gets
@@ -664,7 +665,7 @@ function LegacyAnalytics() {
   </ScrollView>;
 }
 
-function Analytics({ accounts, plannedExpenses, plannedOccurrences, debts, currencySettings, operations, userBudgets, financialGoals, onAddBudget, onEditBudget, onAddGoal, onEditGoal, onProfile }: { accounts: Account[]; plannedExpenses: PlannedExpense[]; plannedOccurrences: PlannedOccurrence[]; debts: Debt[]; currencySettings: CurrencySettings; operations: FinancialOperation[]; userBudgets: Budget[]; financialGoals: FinancialGoal[]; onAddBudget: () => void; onEditBudget: (budget: Budget) => void; onAddGoal: () => void; onEditGoal: (goal: FinancialGoal) => void; onProfile: () => void }) {
+function Analytics({ accounts, plannedExpenses, plannedOccurrences, debts, currencySettings, operations, transfers, userBudgets, financialGoals, onAddBudget, onEditBudget, onAddGoal, onEditGoal, onProfile }: { accounts: Account[]; plannedExpenses: PlannedExpense[]; plannedOccurrences: PlannedOccurrence[]; debts: Debt[]; currencySettings: CurrencySettings; operations: FinancialOperation[]; transfers: Transfer[]; userBudgets: Budget[]; financialGoals: FinancialGoal[]; onAddBudget: () => void; onEditBudget: (budget: Budget) => void; onAddGoal: () => void; onEditGoal: (goal: FinancialGoal) => void; onProfile: () => void }) {
   const now = new Date();
   const totals = getCurrencyTotals(accounts);
   const currencies = Array.from(new Set([currencySettings.baseCurrency, ...Object.keys(totals), ...plannedExpenses.map((item) => item.currency), ...debts.map((item) => item.currency), ...operations.map((item) => item.currency), ...financialGoals.map((item) => item.currency)])).sort((a, b) => a === 'UZS' ? -1 : b === 'UZS' ? 1 : a.localeCompare(b));
@@ -675,7 +676,7 @@ function Analytics({ accounts, plannedExpenses, plannedOccurrences, debts, curre
   useEffect(() => { if (currencies.length && !currencies.includes(currency)) setCurrency(currencies[0] ?? 'UZS'); }, [accounts, plannedExpenses, debts]);
   const relevant = accounts.filter((account) => account.currency === currency);
   const total = totals[currency] ?? 0;
-  const projection = buildMonthProjection(accounts, currency, now.getFullYear(), now.getMonth(), plannedExpenses, debts, currencySettings, localToday(), plannedOccurrences);
+  const projection = buildMonthProjection(accounts, currency, now.getFullYear(), now.getMonth(), plannedExpenses, debts, currencySettings, localToday(), plannedOccurrences, operations, transfers);
   const consolidated = consolidatedNetWorth(accounts, debts, currencySettings);
   const weightedRates = weightedAssetRates(accounts, currencySettings);
   const earliest = [...operations.map((item) => item.date), ...plannedExpenses.map((item) => item.startDate)].sort()[0];
@@ -1715,10 +1716,10 @@ function AppContent({ userId, email }: { userId: string; email?: string }) {
     const onProfile = () => setTab('profile');
     if (tab === 'profile') return <Profile email={email} accounts={userAccounts} currencySettings={currencySettings} onCurrencySettings={() => setCurrencySettingsOpen(true)} onBack={() => setTab('home')} pendingSmsDrafts={pendingSmsDrafts} onSmsDraftsChanged={() => countPendingImportDrafts().then(setPendingSmsDrafts)} />;
     if (tab === 'accounts') return <Accounts accounts={userAccounts} onAdd={openNewAccount} onImport={() => setImportOpen(true)} onEdit={openAccount} debts={debts} onAddDebt={openNewDebt} onOpenDebt={openDebt} currencySettings={currencySettings} onCurrencySettings={() => setCurrencySettingsOpen(true)} onProfile={onProfile} />;
-    if (tab === 'calendar') return <Calendar accounts={userAccounts} plannedExpenses={plannedExpenses} plannedOccurrences={plannedOccurrences} debts={debts} currencySettings={currencySettings} onAddExpense={openNewExpense} onEditExpense={openExpense} onExecuteOccurrence={handleOpenOccurrence} onCancelOccurrence={handleCancelOccurrence} onProfile={onProfile} />;
+    if (tab === 'calendar') return <Calendar accounts={userAccounts} plannedExpenses={plannedExpenses} plannedOccurrences={plannedOccurrences} debts={debts} currencySettings={currencySettings} onAddExpense={openNewExpense} onEditExpense={openExpense} onExecuteOccurrence={handleOpenOccurrence} onCancelOccurrence={handleCancelOccurrence} onProfile={onProfile} operations={operations} transfers={transfers} />;
     if (tab === 'operations') return <Operations operations={operations} transfers={transfers} plannedOccurrences={plannedOccurrences} plannedExpenses={plannedExpenses} accounts={userAccounts} onAdd={() => setOperationEditorOpen(true)} onTransfer={() => setTransferModalOpen(true)} onReverseTransfer={handleReverseTransfer} onExecuteOccurrence={handleOpenOccurrence} onCancelOccurrence={handleCancelOccurrence} onProfile={onProfile} />;
-    if (tab === 'analytics') return <Analytics accounts={userAccounts} plannedExpenses={plannedExpenses} plannedOccurrences={plannedOccurrences} debts={debts} currencySettings={currencySettings} operations={operations} userBudgets={userBudgets} financialGoals={financialGoals} onAddBudget={openNewBudget} onEditBudget={openBudget} onAddGoal={openNewGoal} onEditGoal={openGoal} onProfile={onProfile} />;
-    return <Home onImport={() => setImportOpen(true)} go={setTab} accounts={userAccounts} plannedExpenses={plannedExpenses} plannedOccurrences={plannedOccurrences} debts={debts} currencySettings={currencySettings} onCurrencySettings={() => setCurrencySettingsOpen(true)} onProfile={onProfile} pendingImportDrafts={pendingSmsDrafts} />;
+    if (tab === 'analytics') return <Analytics accounts={userAccounts} plannedExpenses={plannedExpenses} plannedOccurrences={plannedOccurrences} debts={debts} currencySettings={currencySettings} operations={operations} transfers={transfers} userBudgets={userBudgets} financialGoals={financialGoals} onAddBudget={openNewBudget} onEditBudget={openBudget} onAddGoal={openNewGoal} onEditGoal={openGoal} onProfile={onProfile} />;
+    return <Home onImport={() => setImportOpen(true)} go={setTab} accounts={userAccounts} plannedExpenses={plannedExpenses} plannedOccurrences={plannedOccurrences} debts={debts} currencySettings={currencySettings} onCurrencySettings={() => setCurrencySettingsOpen(true)} onProfile={onProfile} pendingImportDrafts={pendingSmsDrafts} operations={operations} transfers={transfers} />;
   }, [tab, userAccounts, plannedExpenses, plannedOccurrences, debts, currencySettings, operations, transfers, userBudgets, financialGoals, email, pendingSmsDrafts]);
   return <SafeAreaView style={s.safe} edges={['top']}>
     <StatusBar style="dark" />

@@ -86,6 +86,9 @@ function parseKapitalbank(body: string): ParsedSms | null {
 
 export const kapitalbankParser: SmsParser = {
   id: 'kapitalbank',
-  senders: ['kapitalbank'],
+  // '2212' is the same Kapitalbank, a different sender id for the same three templates —
+  // confirmed against real examples using identical text ("Schet po karte ... popolnen",
+  // "Popolneniye, ...", "Snyatiye, ..."), not a new bank needing its own parser.
+  senders: ['kapitalbank', '2212'],
   parse: parseKapitalbank,
 };
