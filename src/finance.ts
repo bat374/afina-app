@@ -136,9 +136,14 @@ export function buildMonthProjection(accounts: Account[], currency: string, year
       if (past || sameDay(current, todayDate) || !account.rate || account.rate <= 0 || !account.interestSchedule) continue;
       if (current < start || (maturity && current > maturity)) continue;
       let amount = 0;
+      // Some banks withhold tax on deposit/savings interest before crediting it — taxFactor turns
+      // the gross contractual rate into what actually lands on the account, applied before the
+      // amount is used for compounding (interestDestination==='same') so growth tracks the real,
+      // net-of-tax balance rather than an inflated gross one.
+      const taxFactor = 1 - (account.taxRate ?? 0) / 100;
       if (account.interestSchedule === 'daily') {
         const principal = runningPrincipal.get(account.id) ?? account.balance;
-        amount = principal * (account.rate / 100) / 365;
+        amount = principal * (account.rate / 100) / 365 * taxFactor;
         if (account.interestDestination === 'same') runningPrincipal.set(account.id, principal + amount);
       } else if (account.interestSchedule === 'monthly') {
         const preferredDay = start.getDate();
@@ -148,11 +153,11 @@ export function buildMonthProjection(accounts: Account[], currency: string, year
           const previousPayment = monthlyPaymentDate(year, month - 1, preferredDay);
           const periodStart = previousPayment < start ? start : previousPayment;
           const principal = runningPrincipal.get(account.id) ?? account.balance;
-          amount = principal * (account.rate / 100) * (daysBetween(periodStart, current) / 365);
+          amount = principal * (account.rate / 100) * (daysBetween(periodStart, current) / 365) * taxFactor;
           if (account.interestDestination === 'same') runningPrincipal.set(account.id, principal + amount);
         }
       } else if (maturity && sameDay(current, maturity)) {
-        amount = account.balance * (account.rate / 100) * (daysBetween(start, maturity) / 365);
+        amount = account.balance * (account.rate / 100) * (daysBetween(start, maturity) / 365) * taxFactor;
       }
       if (!amount) continue;
       const tracked = account.interestDestination === 'same' || (!!account.destinationAccountId && trackedIds.has(account.destinationAccountId));
@@ -217,4 +222,4 @@ export function buildMonthProjection(accounts: Account[], currency: string, year
 export const annualPassiveIncome = (accounts: Account[], currency: string) =>
   accounts
     .filter((account) => account.currency === currency && account.rate && account.balance > 0 && account.type !== 'credit_card')
-    .reduce((sum, account) => sum + account.balance * ((account.rate ?? 0) / 100), 0);
+    .reduce((sum, account) => sum + account.balance * ((account.rate ?? 0) / 100) * (1 - (account.taxRate ?? 0) / 100), 0);

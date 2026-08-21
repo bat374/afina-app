@@ -39,6 +39,12 @@ export type Account = {
   // incoming SMS or receipt photo to this account without guessing — see BACKLOG.md R-01/R-02/R-03.
   // Synced via cloudSync.ts (supabase/migrations/20260820_000002_account_card_last4.sql).
   cardLast4?: string;
+  // Percent withheld by the bank from interest before it's credited (e.g. 20 for 20%) — some banks
+  // withhold tax on deposit/savings interest before payout, so the actual credited amount is lower
+  // than `rate` alone would predict. Applied in buildMonthProjection (src/finance.ts) so the
+  // forecast matches what the bank actually pays, not the gross contractual rate.
+  // Synced via cloudSync.ts (supabase/migrations/20260821_000001_account_tax_rate.sql).
+  taxRate?: number;
 };
 
 export type CalendarDay = {

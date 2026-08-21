@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
-  ActivityIndicator, Alert, AppState, Image, KeyboardAvoidingView, Modal, Platform, Pressable, ScrollView,
+  ActivityIndicator, Alert, Animated, AppState, Dimensions, Image, KeyboardAvoidingView, Modal, Platform, Pressable, ScrollView,
   StyleSheet, Switch, Text, TextInput, View,
 } from 'react-native';
 import { StatusBar } from 'expo-status-bar';
@@ -800,7 +800,27 @@ function Analytics({ accounts, plannedExpenses, plannedOccurrences, debts, curre
   const [customRange, setCustomRange] = useState({ from: `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-01`, to: localToday() });
   const [dateTarget, setDateTarget] = useState<'from' | 'to' | null>(null);
   const [drilldownKind, setDrilldownKind] = useState<'income' | 'expense' | 'passive' | null>(null);
+  const [celebratingGoal, setCelebratingGoal] = useState<FinancialGoal | null>(null);
   useEffect(() => { if (currencies.length && !currencies.includes(currency)) setCurrency(currencies[0] ?? 'UZS'); }, [accounts, plannedExpenses, debts]);
+  // Celebrate a completed goal exactly once per device, the first time this screen is visited
+  // after it crosses 100% — `getCelebratedGoalIds` (SecureStore) is the source of truth for "already
+  // shown", so this stays correct even if the screen remounts on every tab switch.
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      const celebrated = await getCelebratedGoalIds();
+      for (const goal of financialGoals) {
+        if (celebrated.includes(goal.id)) continue;
+        const progress = calculateGoalProgress(goal, accounts, operations, debts, currencySettings, now);
+        if (progress.percent >= 100) {
+          if (!cancelled) setCelebratingGoal(goal);
+          await addCelebratedGoalId(goal.id);
+          break;
+        }
+      }
+    })();
+    return () => { cancelled = true; };
+  }, []);
   const relevant = accounts.filter((account) => account.currency === currency);
   const total = totals[currency] ?? 0;
   const projection = buildMonthProjection(accounts, currency, now.getFullYear(), now.getMonth(), plannedExpenses, debts, currencySettings, localToday(), plannedOccurrences, operations, transfers);
@@ -831,7 +851,8 @@ function Analytics({ accounts, plannedExpenses, plannedOccurrences, debts, curre
   }
   const categoryBreakdown = Array.from(categoryTotals.entries()).map(([category, amount]) => ({ category, amount, percent: actual.expense ? amount / actual.expense * 100 : 0 })).sort((a, b) => b.amount - a.amount);
   const [categoryDrilldown, setCategoryDrilldown] = useState<string | null>(null);
-  return <ScrollView contentContainerStyle={s.page} showsVerticalScrollIndicator={false}>
+  return <>
+  <ScrollView contentContainerStyle={s.page} showsVerticalScrollIndicator={false}>
     <Header eyebrow={`${range.from} — ${range.to}`} title="Аналитика" onAvatarPress={onProfile} />
     <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={s.currencyRail}>{([['month', 'Месяц'], ['quarter', 'Квартал'], ['year', 'Год'], ['all', 'Всё время'], ['custom', 'Свой период']] as [AnalyticsPeriod, string][]).map(([value, label]) => <Pressable key={value} style={[s.currencyFilter, period === value && s.currencyFilterActive]} onPress={() => setPeriod(value)}><Text style={[s.currencyFilterText, period === value && s.currencyFilterTextActive]}>{label}</Text></Pressable>)}</ScrollView>
     {period === 'custom' && <View style={s.twoColumns}><View style={{ flex: 1 }}><DateField value={customRange.from} onPress={() => setDateTarget('from')} /></View><View style={{ flex: 1 }}><DateField value={customRange.to} onPress={() => setDateTarget('to')} /></View></View>}
@@ -862,7 +883,9 @@ function Analytics({ accounts, plannedExpenses, plannedOccurrences, debts, curre
     {planned.expense > 0 ? <View style={s.chartCard}><Text style={s.chartLabel}>ЗАПЛАНИРОВАНО · {currency}</Text><Text style={s.chartValue}>{money(planned.expense, false, currency)}</Text><Text style={[s.rowSub, { marginTop: 7 }]}>За выбранный период</Text></View> : <View style={s.emptyCard}><Ionicons name="receipt-outline" size={24} color={C.blue} /><Text style={s.emptyTitle}>Расходы ещё не запланированы</Text><Text style={s.emptyText}>Добавьте разовый или повторяющийся платёж в календаре</Text></View>}
     <DatePickerModal visible={dateTarget !== null} value={dateTarget ? customRange[dateTarget] : undefined} onClose={() => setDateTarget(null)} onSelect={(value) => { if (dateTarget === 'from') setCustomRange((current) => ({ from: value, to: value > current.to ? value : current.to })); else if (dateTarget === 'to') setCustomRange((current) => ({ from: value < current.from ? value : current.from, to: value })); setDateTarget(null); }} />
     <View style={{ height: 20 }} />
-  </ScrollView>;
+  </ScrollView>
+  {celebratingGoal && <ConfettiOverlay caption={celebratingGoal.title} onDone={() => setCelebratingGoal(null)} />}
+  </>;
 }
 
 function AnalyticsDrilldownModal({ visible, kind, category, operations, plannedExpenses, accounts, currency, range, settings, onClose }: {
@@ -1152,6 +1175,7 @@ function AccountEditor({
   const [gracePeriodDays, setGracePeriodDays] = useState<number | undefined>();
   const [minimumPaymentPercent, setMinimumPaymentPercent] = useState<number | undefined>();
   const [cardLast4, setCardLast4] = useState('');
+  const [taxRate, setTaxRate] = useState<number | undefined>();
   const [saving, setSaving] = useState(false);
 
   useEffect(() => {
@@ -1176,6 +1200,7 @@ function AccountEditor({
     setCreditLimit(account?.creditLimit); setStatementDay(account?.statementDay); setPaymentDueDay(account?.paymentDueDay);
     setGracePeriodDays(account?.gracePeriodDays); setMinimumPaymentPercent(account?.minimumPaymentPercent ?? 5);
     setCardLast4(account?.cardLast4 ?? '');
+    setTaxRate(account?.taxRate);
   }, [visible, account]);
 
   const submit = async () => {
@@ -1190,6 +1215,7 @@ function AccountEditor({
     if (type === 'credit_card' && (!statementDay || statementDay < 1 || statementDay > 31 || !paymentDueDay || paymentDueDay < 1 || paymentDueDay > 31)) { Alert.alert('Укажите дни выписки и платежа от 1 до 31'); return; }
     if (type === 'credit_card' && (!minimumPaymentPercent || minimumPaymentPercent <= 0 || minimumPaymentPercent > 100)) { Alert.alert('Укажите минимальный платёж от 0 до 100%'); return; }
     if (withdrawalPolicy === 'minimum_balance' && (!Number.isFinite(minimumBalance) || (minimumBalance ?? -1) < 0)) { Alert.alert('Укажите неснижаемый остаток'); return; }
+    if (taxRate !== undefined && (taxRate < 0 || taxRate > 100)) { Alert.alert('Налог на проценты — от 0 до 100%'); return; }
     const option = accountTypeOptions.find((item) => item.type === type) ?? accountTypeOptions[0];
     if (!option) return;
     setSaving(true);
@@ -1216,6 +1242,7 @@ function AccountEditor({
         minimumPaymentPercent: type === 'credit_card' ? minimumPaymentPercent : undefined,
         accent: option.accent,
         cardLast4: cardLast4.trim() || undefined,
+        taxRate: type === 'deposit' || type === 'savings' ? taxRate : undefined,
       });
     } finally { setSaving(false); }
   };
@@ -1238,7 +1265,7 @@ function AccountEditor({
           <Text style={s.fieldLabel}>{type === 'credit_card' ? 'ТЕКУЩАЯ ЗАДОЛЖЕННОСТЬ' : 'БАЛАНС'}</Text><DecimalInput value={balance} onChange={setBalance} placeholder="0,00" />
           <Text style={s.fieldLabel}>ВАЛЮТА</Text><CurrencyPicker value={currency} onChange={(value) => { setCurrency(value); setDestinationAccountId(undefined); }} />
           {type === 'credit_card' && <><Text style={s.fieldLabel}>КРЕДИТНЫЙ ЛИМИТ</Text><DecimalInput value={creditLimit} onChange={setCreditLimit} placeholder="0,00" /><View style={s.twoColumns}><View style={{ flex: 1 }}><Text style={s.fieldLabel}>ДЕНЬ ВЫПИСКИ</Text><DecimalInput value={statementDay} onChange={setStatementDay} placeholder="Например, 5" /></View><View style={{ flex: 1 }}><Text style={s.fieldLabel}>ДЕНЬ ПЛАТЕЖА</Text><DecimalInput value={paymentDueDay} onChange={setPaymentDueDay} placeholder="Например, 25" /></View></View><View style={s.twoColumns}><View style={{ flex: 1 }}><Text style={s.fieldLabel}>ЛЬГОТНЫЙ ПЕРИОД, ДНЕЙ</Text><DecimalInput value={gracePeriodDays} onChange={setGracePeriodDays} placeholder="Например, 55" /></View><View style={{ flex: 1 }}><Text style={s.fieldLabel}>МИН. ПЛАТЁЖ, %</Text><DecimalInput value={minimumPaymentPercent} onChange={setMinimumPaymentPercent} placeholder="Например, 5" /></View></View><Text style={s.fieldLabel}>СТАВКА ПОСЛЕ ЛЬГОТНОГО ПЕРИОДА, %</Text><DecimalInput value={rate} onChange={setRate} placeholder="Например, 36" /></>}
-          {(type === 'deposit' || type === 'savings') && <><Text style={s.fieldLabel}>ПРОЦЕНТНАЯ СТАВКА, % ГОДОВЫХ</Text><DecimalInput value={rate} onChange={setRate} placeholder="Например, 17" /><InterestSettings startDate={startDate} maturityDate={maturityDate} nextInterestDate={nextInterestDate} schedule={interestSchedule} destination={interestDestination} destinationAccountId={destinationAccountId} autoRenewal={autoRenewal} rateReviewReminder={rateReviewReminder} withdrawalPolicy={withdrawalPolicy} minimumBalance={minimumBalance} replenishmentAllowed={replenishmentAllowed} currency={currency} accounts={accounts} currentAccountId={account?.id} onChange={(patch) => { if (patch.startDate !== undefined) setStartDate(patch.startDate); if (patch.maturityDate !== undefined) setMaturityDate(patch.maturityDate); if ('nextInterestDate' in patch) setNextInterestDate(patch.nextInterestDate ?? ''); if (patch.interestSchedule) setInterestSchedule(patch.interestSchedule); if (patch.interestDestination) setInterestDestination(patch.interestDestination); if ('destinationAccountId' in patch) setDestinationAccountId(patch.destinationAccountId); if ('autoRenewal' in patch) setAutoRenewal(patch.autoRenewal ?? false); if ('rateReviewReminder' in patch) setRateReviewReminder(patch.rateReviewReminder ?? true); if (patch.withdrawalPolicy) setWithdrawalPolicy(patch.withdrawalPolicy); if ('minimumBalance' in patch) setMinimumBalance(patch.minimumBalance); if ('replenishmentAllowed' in patch) setReplenishmentAllowed(patch.replenishmentAllowed ?? false); }} /></>}
+          {(type === 'deposit' || type === 'savings') && <><Text style={s.fieldLabel}>ПРОЦЕНТНАЯ СТАВКА, % ГОДОВЫХ</Text><DecimalInput value={rate} onChange={setRate} placeholder="Например, 17" /><Text style={s.fieldLabel}>НАЛОГ НА ПРОЦЕНТЫ, % (ЕСЛИ БАНК УДЕРЖИВАЕТ)</Text><DecimalInput value={taxRate} onChange={setTaxRate} placeholder="Например, 20 — если не удерживают, оставьте пустым" /><InterestSettings startDate={startDate} maturityDate={maturityDate} nextInterestDate={nextInterestDate} schedule={interestSchedule} destination={interestDestination} destinationAccountId={destinationAccountId} autoRenewal={autoRenewal} rateReviewReminder={rateReviewReminder} withdrawalPolicy={withdrawalPolicy} minimumBalance={minimumBalance} replenishmentAllowed={replenishmentAllowed} currency={currency} accounts={accounts} currentAccountId={account?.id} onChange={(patch) => { if (patch.startDate !== undefined) setStartDate(patch.startDate); if (patch.maturityDate !== undefined) setMaturityDate(patch.maturityDate); if ('nextInterestDate' in patch) setNextInterestDate(patch.nextInterestDate ?? ''); if (patch.interestSchedule) setInterestSchedule(patch.interestSchedule); if (patch.interestDestination) setInterestDestination(patch.interestDestination); if ('destinationAccountId' in patch) setDestinationAccountId(patch.destinationAccountId); if ('autoRenewal' in patch) setAutoRenewal(patch.autoRenewal ?? false); if ('rateReviewReminder' in patch) setRateReviewReminder(patch.rateReviewReminder ?? true); if (patch.withdrawalPolicy) setWithdrawalPolicy(patch.withdrawalPolicy); if ('minimumBalance' in patch) setMinimumBalance(patch.minimumBalance); if ('replenishmentAllowed' in patch) setReplenishmentAllowed(patch.replenishmentAllowed ?? false); }} /></>}
 
           <Pressable style={[s.primaryButton, saving && { opacity: .6 }]} disabled={saving} onPress={submit}><Text style={s.primaryText}>{saving ? 'Сохраняем…' : account ? 'Сохранить изменения' : 'Добавить счёт'}</Text></Pressable>
           {account && <Pressable style={s.deleteButton} onPress={() => onDelete(account)}><Ionicons name="trash-outline" size={18} color={C.red} /><Text style={s.deleteText}>Удалить счёт</Text></Pressable>}
@@ -1713,7 +1740,7 @@ function ImportModal({ visible, onClose, accounts, onAccountSaved }: { visible: 
               <Text style={s.fieldLabel}>БАНК ИЛИ ОПИСАНИЕ</Text><TextInput value={detected.account.subtitle} onChangeText={(subtitle) => updateDetectedAccount({ subtitle })} style={s.input} />
               <Text style={s.fieldLabel}>БАЛАНС</Text><DecimalInput value={detected.account.balance} onChange={(balance) => updateDetectedAccount({ balance: balance ?? 0 })} placeholder="0,00" />
               <Text style={s.fieldLabel}>ВАЛЮТА</Text><CurrencyPicker value={detected.account.currency} onChange={(currency) => updateDetectedAccount({ currency, destinationAccountId: undefined })} />
-              {(detected.account.type === 'deposit' || detected.account.type === 'savings') && <><Text style={s.fieldLabel}>СТАВКА, % ГОДОВЫХ</Text><DecimalInput value={detected.account.rate} onChange={(rate) => updateDetectedAccount({ rate })} placeholder="Необязательно" /><InterestSettings startDate={detected.account.startDate} maturityDate={detected.account.maturityDate} nextInterestDate={detected.account.nextInterestDate} schedule={detected.account.interestSchedule} destination={detected.account.interestDestination} destinationAccountId={detected.account.destinationAccountId} autoRenewal={detected.account.autoRenewal} rateReviewReminder={detected.account.rateReviewReminder} withdrawalPolicy={detected.account.withdrawalPolicy} minimumBalance={detected.account.minimumBalance} replenishmentAllowed={detected.account.replenishmentAllowed} currency={detected.account.currency} accounts={accounts} onChange={updateDetectedAccount} /></>}
+              {(detected.account.type === 'deposit' || detected.account.type === 'savings') && <><Text style={s.fieldLabel}>СТАВКА, % ГОДОВЫХ</Text><DecimalInput value={detected.account.rate} onChange={(rate) => updateDetectedAccount({ rate })} placeholder="Необязательно" /><Text style={s.fieldLabel}>НАЛОГ НА ПРОЦЕНТЫ, % (ЕСЛИ БАНК УДЕРЖИВАЕТ)</Text><DecimalInput value={detected.account.taxRate} onChange={(taxRate) => updateDetectedAccount({ taxRate })} placeholder="Необязательно" /><InterestSettings startDate={detected.account.startDate} maturityDate={detected.account.maturityDate} nextInterestDate={detected.account.nextInterestDate} schedule={detected.account.interestSchedule} destination={detected.account.interestDestination} destinationAccountId={detected.account.destinationAccountId} autoRenewal={detected.account.autoRenewal} rateReviewReminder={detected.account.rateReviewReminder} withdrawalPolicy={detected.account.withdrawalPolicy} minimumBalance={detected.account.minimumBalance} replenishmentAllowed={detected.account.replenishmentAllowed} currency={detected.account.currency} accounts={accounts} onChange={updateDetectedAccount} /></>}
               <Pressable style={s.reviewDoneButton} onPress={() => setEditingDetected(false)}><Ionicons name="checkmark" size={17} color={C.blue} /><Text style={s.reviewDoneText}>Готово</Text></Pressable>
             </View> : <View style={s.card}>
               <View style={s.detectRow}><Text style={s.detectLabel}>Тип</Text><Text style={s.detectValue}>{typeLabel}</Text></View><View style={s.divider} />
@@ -2008,6 +2035,69 @@ const getLockEnabled = async () => (await SecureStore.getItemAsync(LOCK_ENABLED_
 const setLockEnabledStored = (value: boolean) => SecureStore.setItemAsync(LOCK_ENABLED_KEY, value ? '1' : '0');
 const getStoredPin = () => SecureStore.getItemAsync(LOCK_PIN_KEY);
 const setStoredPin = (pin: string | null) => pin ? SecureStore.setItemAsync(LOCK_PIN_KEY, pin) : SecureStore.deleteItemAsync(LOCK_PIN_KEY);
+
+// "Already celebrated this goal" is deliberately device-local, not synced — it's a one-time UI
+// treat, not financial data, so a plain SecureStore-backed id list is enough (no schema/migration).
+const CELEBRATED_GOALS_KEY = 'afina_celebrated_goals';
+const getCelebratedGoalIds = async (): Promise<string[]> => {
+  const raw = await SecureStore.getItemAsync(CELEBRATED_GOALS_KEY);
+  if (!raw) return [];
+  try { return JSON.parse(raw); } catch { return []; }
+};
+const addCelebratedGoalId = async (id: string) => {
+  const existing = await getCelebratedGoalIds();
+  if (existing.includes(id)) return;
+  await SecureStore.setItemAsync(CELEBRATED_GOALS_KEY, JSON.stringify([...existing, id]));
+};
+
+const CONFETTI_COLORS = [C.blue, C.green, C.red, C.navy, '#F2C94C'];
+
+function ConfettiOverlay({ caption, onDone }: { caption?: string; onDone: () => void }) {
+  const { width, height } = Dimensions.get('window');
+  const captionOpacity = useRef(new Animated.Value(0)).current;
+  const pieces = useRef(Array.from({ length: 36 }, (_, i) => ({
+    x: Math.random() * width,
+    delay: Math.random() * 250,
+    duration: 1800 + Math.random() * 900,
+    rotateStart: Math.random() * 360,
+    rotateEnd: Math.random() * 720 - 360,
+    drift: (Math.random() - 0.5) * 120,
+    size: 6 + Math.random() * 6,
+    color: CONFETTI_COLORS[i % CONFETTI_COLORS.length]!,
+    progress: new Animated.Value(0),
+  }))).current;
+  useEffect(() => {
+    const animations = pieces.map((piece) => Animated.timing(piece.progress, {
+      toValue: 1, duration: piece.duration, delay: piece.delay, useNativeDriver: true,
+    }));
+    Animated.stagger(20, animations).start();
+    Animated.sequence([
+      Animated.timing(captionOpacity, { toValue: 1, duration: 300, useNativeDriver: true }),
+      Animated.delay(1900),
+      Animated.timing(captionOpacity, { toValue: 0, duration: 400, useNativeDriver: true }),
+    ]).start();
+    const timer = setTimeout(onDone, 2800);
+    return () => clearTimeout(timer);
+  }, []);
+  return <View style={StyleSheet.absoluteFillObject} pointerEvents="none">
+    {pieces.map((piece, index) => {
+      const translateY = piece.progress.interpolate({ inputRange: [0, 1], outputRange: [-20, height + 20] });
+      const translateX = piece.progress.interpolate({ inputRange: [0, 1], outputRange: [0, piece.drift] });
+      const rotate = piece.progress.interpolate({ inputRange: [0, 1], outputRange: [`${piece.rotateStart}deg`, `${piece.rotateStart + piece.rotateEnd}deg`] });
+      const opacity = piece.progress.interpolate({ inputRange: [0, 0.85, 1], outputRange: [1, 1, 0] });
+      return <Animated.View key={index} style={{
+        position: 'absolute', left: piece.x, width: piece.size, height: piece.size * 1.6,
+        backgroundColor: piece.color, borderRadius: 2, opacity,
+        transform: [{ translateY }, { translateX }, { rotate }],
+      }} />;
+    })}
+    {!!caption && <Animated.View style={{ position: 'absolute', top: 90, left: 20, right: 20, alignItems: 'center', opacity: captionOpacity }}>
+      <View style={{ backgroundColor: C.navy, borderRadius: 16, paddingVertical: 10, paddingHorizontal: 16 }}>
+        <Text style={{ color: 'white', fontSize: 14, fontWeight: '700', textAlign: 'center' }}>🎉 Цель «{caption}» достигнута!</Text>
+      </View>
+    </Animated.View>}
+  </View>;
+}
 
 function PinDots({ length, filled }: { length: number; filled: number }) {
   return <View style={s.pinDots}>{Array.from({ length }, (_, i) => <View key={i} style={[s.pinDot, i < filled && s.pinDotFilled]} />)}</View>;

@@ -32,6 +32,7 @@ type AccountRow = {
   minimum_payment_percent: number | null;
   accent: string;
   card_last4: string | null;
+  tax_rate: number | null;
 };
 
 export type AccountInput = Omit<Account, 'id'>;
@@ -411,6 +412,7 @@ async function initializeDatabaseCore() {
   const creditColumns = [
     ['credit_limit', 'REAL'], ['statement_day', 'INTEGER'], ['payment_due_day', 'INTEGER'],
     ['grace_period_days', 'INTEGER'], ['minimum_payment_percent', 'REAL'], ['card_last4', 'TEXT'],
+    ['tax_rate', 'REAL'],
   ] as const;
   for (const [name, sqlType] of creditColumns) {
     if (!columns.some((column) => column.name === name)) await db.execAsync(`ALTER TABLE accounts ADD COLUMN ${name} ${sqlType};`);
@@ -598,6 +600,7 @@ async function listAccountsCore(): Promise<Account[]> {
     minimumPaymentPercent: row.minimum_payment_percent ?? undefined,
     accent: row.accent,
     cardLast4: row.card_last4 ?? undefined,
+    taxRate: row.tax_rate ?? undefined,
   }));
 }
 
@@ -621,7 +624,7 @@ export function saveAccount(input: AccountInput, id?: string) {
        interest_destination = ?, destination_account_id = ?, next_interest_date = ?, auto_renewal = ?,
        rate_review_reminder = ?, withdrawal_policy = ?, minimum_balance = ?, replenishment_allowed = ?,
        credit_limit = ?, statement_day = ?, payment_due_day = ?, grace_period_days = ?, minimum_payment_percent = ?,
-       accent = ?, card_last4 = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+       accent = ?, card_last4 = ?, tax_rate = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
         input.name, input.subtitle, input.type === 'credit_card' ? 'card' : input.type, input.balance, input.currency,
         input.rate ?? null, input.rateCaption ?? null, input.startDate ?? null, input.maturityDate ?? null,
         input.interestSchedule ?? null, input.interestDestination ?? null, input.destinationAccountId ?? null,
@@ -630,7 +633,7 @@ export function saveAccount(input: AccountInput, id?: string) {
         input.replenishmentAllowed === undefined ? null : input.replenishmentAllowed ? 1 : 0,
         input.creditLimit ?? null, input.statementDay ?? null, input.paymentDueDay ?? null,
         input.gracePeriodDays ?? null, input.minimumPaymentPercent ?? null,
-        input.accent, input.cardLast4 ?? null, id,
+        input.accent, input.cardLast4 ?? null, input.taxRate ?? null, id,
       );
       return id;
     }
@@ -640,8 +643,8 @@ export function saveAccount(input: AccountInput, id?: string) {
       start_date, maturity_date, interest_schedule, interest_destination, destination_account_id,
       next_interest_date, auto_renewal, rate_review_reminder, withdrawal_policy, minimum_balance,
       replenishment_allowed, credit_limit, statement_day, payment_due_day, grace_period_days,
-      minimum_payment_percent, accent, interest_tracking_from, card_last4)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      minimum_payment_percent, accent, interest_tracking_from, card_last4, tax_rate)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       newId, input.name, input.subtitle, input.type === 'credit_card' ? 'card' : input.type, input.balance, input.currency,
       input.rate ?? null, input.rateCaption ?? null, input.startDate ?? null, input.maturityDate ?? null,
       input.interestSchedule ?? null, input.interestDestination ?? null, input.destinationAccountId ?? null,
@@ -650,7 +653,7 @@ export function saveAccount(input: AccountInput, id?: string) {
       input.replenishmentAllowed === undefined ? null : input.replenishmentAllowed ? 1 : 0,
       input.creditLimit ?? null, input.statementDay ?? null, input.paymentDueDay ?? null,
       input.gracePeriodDays ?? null, input.minimumPaymentPercent ?? null,
-      input.accent, trackingFrom, input.cardLast4 ?? null,
+      input.accent, trackingFrom, input.cardLast4 ?? null, input.taxRate ?? null,
     );
     return newId;
   });
