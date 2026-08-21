@@ -122,9 +122,28 @@ export type ImportDraft = {
   accountId?: string;
   merchant?: string;
   balanceAfter?: number;
+  // Set only when the bank message ALSO reports a deposit renewal alongside a transaction — e.g.
+  // Sberbank's "СберВклад ... Продлили по ставке 12,10% до 21.01.27. Выплатили проценты ...". The
+  // transaction (interest payout) still goes through the normal confirm/dedup flow; these two
+  // fields let the confirm UI additionally offer to apply the new rate/maturity to the account.
+  renewedRate?: number;
+  renewedMaturityDate?: string;
   status: ImportDraftStatus;
   operationId?: string;
   dedupOperationId?: string;
+};
+
+// One row per rate/maturity change on a deposit or savings account — kept so "what rate did I
+// actually have in March" stays answerable after an auto-renewal changes account.rate in place.
+export type DepositRateHistory = {
+  id: string;
+  accountId: string;
+  oldRate?: number;
+  newRate: number;
+  oldMaturityDate?: string;
+  newMaturityDate?: string;
+  occurredAt: string;
+  note?: string;
 };
 
 export type PlannedExecutionInput = {

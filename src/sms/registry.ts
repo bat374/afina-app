@@ -1,10 +1,11 @@
 import { ParsedSms, SmsParser } from './types';
 import { kapitalbankParser } from './parsers/kapitalbank';
 import { p13131Parser } from './parsers/p13131';
+import { sberbankSmsParser } from './parsers/sberbank';
 
 // New bank format = one new file under parsers/ + one line here. Existing parsers are never
 // touched, and a parser only ever runs against the senders it explicitly declares.
-const PARSERS: SmsParser[] = [kapitalbankParser, p13131Parser];
+const PARSERS: SmsParser[] = [kapitalbankParser, p13131Parser, sberbankSmsParser];
 
 const normalizeSender = (sender: string) => sender.trim().toLowerCase();
 

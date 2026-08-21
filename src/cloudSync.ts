@@ -117,6 +117,11 @@ async function runUpload(userId: string): Promise<SyncResult> {
     note: event.note ?? null, operation_id: event.operationId ?? null,
     related_history_id: event.relatedHistoryId ?? null,
   })));
+  await upsertOwnedTable('deposit_rate_history', userId, snapshot.depositRateHistory.map((event) => ({
+    id: event.id, account_id: event.accountId, old_rate: event.oldRate ?? null, new_rate: event.newRate,
+    old_maturity_date: dateOrNull(event.oldMaturityDate), new_maturity_date: dateOrNull(event.newMaturityDate),
+    occurred_at: event.occurredAt, note: event.note ?? null,
+  })));
   await upsertOwnedTable('budgets', userId, snapshot.budgets.map((budget) => ({
     id: budget.id, category: budget.category, currency: budget.currency, limit_amount: budget.limit,
   })));
@@ -149,6 +154,7 @@ async function runUpload(userId: string): Promise<SyncResult> {
   await deleteMissingOwnedRows('planned_occurrences', snapshot.plannedOccurrences.map((row) => row.id));
   await deleteMissingOwnedRows('interest_postings', snapshot.interestPostings.map((row) => row.id));
   await deleteMissingOwnedRows('debt_history', snapshot.debtHistory.map((row) => row.id));
+  await deleteMissingOwnedRows('deposit_rate_history', snapshot.depositRateHistory.map((row) => row.id));
   await deleteMissingOwnedRows('financial_goals', snapshot.goals.map((row) => row.id));
   await deleteMissingOwnedRows('operations', snapshot.operations.map((row) => row.id));
   await deleteMissingOwnedRows('transfers', snapshot.transfers.map((row) => row.id));
@@ -164,7 +170,7 @@ const numberOrUndefined = (value: unknown) => value === null || value === undefi
 export async function downloadCloudData(userId: string): Promise<LocalSnapshot> {
   if (!supabase) throw new Error('Supabase is not configured');
   const client = supabase;
-  const tableNames = ['accounts', 'scheduled_flows', 'debts', 'operations', 'debt_history', 'budgets', 'financial_goals', 'interest_postings', 'transfers', 'planned_occurrences'] as const;
+  const tableNames = ['accounts', 'scheduled_flows', 'debts', 'operations', 'debt_history', 'budgets', 'financial_goals', 'interest_postings', 'transfers', 'planned_occurrences', 'deposit_rate_history'] as const;
   const results = await Promise.all(tableNames.map((table) => client.from(table).select('*').is('deleted_at', null)));
   const failed = results.find((result) => result.error);
   if (failed?.error) throw failed.error;
@@ -178,6 +184,7 @@ export async function downloadCloudData(userId: string): Promise<LocalSnapshot> 
   const interestPostingRows = results[7]?.data ?? [];
   const transferRows = results[8]?.data ?? [];
   const plannedOccurrenceRows = results[9]?.data ?? [];
+  const depositRateHistoryRows = results[10]?.data ?? [];
   const { data: settings, error: settingsError } = await client.from('user_settings').select('*').eq('user_id', userId).single();
   if (settingsError) throw settingsError;
   const { data: rateRows, error: ratesError } = await client.from('user_currency_rates').select('*');
@@ -230,6 +237,11 @@ export async function downloadCloudData(userId: string): Promise<LocalSnapshot> 
       fromDate: row.from_date ?? undefined, toDate: row.to_date ?? undefined, occurredAt: row.occurred_at,
       note: row.note ?? undefined, operationId: row.operation_id ?? undefined,
       relatedHistoryId: row.related_history_id ?? undefined,
+    })),
+    depositRateHistory: depositRateHistoryRows.map((row) => ({
+      id: row.id, accountId: row.account_id, oldRate: numberOrUndefined(row.old_rate), newRate: Number(row.new_rate),
+      oldMaturityDate: row.old_maturity_date ?? undefined, newMaturityDate: row.new_maturity_date ?? undefined,
+      occurredAt: row.occurred_at, note: row.note ?? undefined,
     })),
     budgets: budgetRows.map((row) => ({ id: row.id, category: row.category, currency: row.currency, limit: Number(row.limit_amount) })),
     goals: goalRows.map((row) => ({

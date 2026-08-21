@@ -11,8 +11,8 @@ import { Ionicons } from '@expo/vector-icons';
 import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
 import { budgets, calendarDays, goals, transactions } from './src/data';
 import { money, percent } from './src/format';
-import { Account, AccountType, Budget, CashFlowKind, CurrencySettings, Debt, DebtDirection, DebtHistory, ExpenseRepeat, FinancialGoal, FinancialOperation, GoalType, ImportDraft, InterestSchedule, PlannedExecutionInput, PlannedExpense, PlannedOccurrence, RecurrenceUnit, Transfer, TransferInput, WithdrawalPolicy } from './src/types';
-import { AccountInput, BudgetInput, cancelPlannedOccurrence, confirmImportDraft, confirmImportDraftAsTransfer, countPendingImportDrafts, createDebt, createImportDraft, createOperation, DebtInput, deleteAccount, deleteBudget, deleteFinancialGoal, deletePlannedExpense, dismissImportDraft, executePlannedOccurrence, extendDebt, FinancialGoalInput, FinancialOperationInput, getCurrencySettings, getSmsScanWatermark, initializeDatabase, listAccounts, listBudgets, listDebtHistory, listDebts, listFinancialGoals, listImportDrafts, listOperations, listPlannedExpenses, listPlannedOccurrences, listTransfers, markDebtOverdue, PlannedExpenseInput, recordDebtPayment, recordTransfer, rematchImportDrafts, reverseDebtPayment, reverseTransfer, saveAccount, saveBudget, saveCurrencySettings, saveFinancialGoal, savePlannedExpense, setSmsScanWatermark, synchronizeInterestPostings, synchronizePlannedOccurrences, updateDebt } from './src/database';
+import { Account, AccountType, Budget, CashFlowKind, CurrencySettings, Debt, DebtDirection, DebtHistory, DepositRateHistory, ExpenseRepeat, FinancialGoal, FinancialOperation, GoalType, ImportDraft, InterestSchedule, PlannedExecutionInput, PlannedExpense, PlannedOccurrence, RecurrenceUnit, Transfer, TransferInput, WithdrawalPolicy } from './src/types';
+import { AccountInput, BudgetInput, cancelPlannedOccurrence, confirmImportDraft, confirmImportDraftAsTransfer, countPendingImportDrafts, createDebt, createImportDraft, createOperation, DebtInput, deleteAccount, deleteBudget, deleteFinancialGoal, deletePlannedExpense, dismissImportDraft, executePlannedOccurrence, extendDebt, extendDepositRate, FinancialGoalInput, FinancialOperationInput, getCurrencySettings, getSmsScanWatermark, initializeDatabase, listAccounts, listBudgets, listDebtHistory, listDebts, listDepositRateHistory, listFinancialGoals, listImportDrafts, listOperations, listPlannedExpenses, listPlannedOccurrences, listTransfers, markDebtOverdue, PlannedExpenseInput, recordDebtPayment, recordTransfer, rematchImportDrafts, reverseDebtPayment, reverseTransfer, saveAccount, saveBudget, saveCurrencySettings, saveFinancialGoal, savePlannedExpense, setSmsScanWatermark, synchronizeInterestPostings, synchronizePlannedOccurrences, updateDebt } from './src/database';
 import { parsersForSender, parseSms } from './src/sms/registry';
 import { parsePush } from './src/push/registry';
 import { KNOWN_BANK_PACKAGES } from './src/push/packages';
@@ -577,7 +577,7 @@ function ReceiptViewerModal({ uri, onClose }: { uri: string | null; onClose: () 
 }
 
 // Senders with a registered parser (see src/sms/registry.ts).
-const KNOWN_SMS_SENDERS = ['kapitalbank', '13131', '2212'];
+const KNOWN_SMS_SENDERS = ['kapitalbank', '13131', '2212', '900'];
 
 // Foreground scan only — on app launch and on return from background, per the architecture plan:
 // a background listener needs a foreground-service notification on Android 8+ and still gets
@@ -709,6 +709,20 @@ function ImportDraftsModal({ visible, accounts, onClose }: { visible: boolean; a
       if (transferCounterpartyId) await confirmImportDraftAsTransfer(draft.id, { counterpartyAccountId: transferCounterpartyId });
       else await confirmImportDraft(draft.id, { accountId, title: draft.merchant || (draft.kind === 'income' ? 'Поступление' : 'Операция по карте'), category: 'Другое', feeAsSeparateOperation: includeFee });
       await reload();
+      // The message reported a renewal (new rate/maturity) alongside the transaction it just
+      // confirmed — offer to apply it to the account too, but never silently: the user picks.
+      if (draft.renewedRate && !transferCounterpartyId) {
+        const rateLabel = `${draft.renewedRate}%`;
+        const untilLabel = draft.renewedMaturityDate ? ` до ${draft.renewedMaturityDate}` : '';
+        Alert.alert(
+          'Обновить ставку по вкладу?',
+          `Банк сообщил о продлении: ${rateLabel} годовых${untilLabel}. Применить к этому счёту?`,
+          [
+            { text: 'Не сейчас', style: 'cancel' },
+            { text: 'Обновить', onPress: () => extendDepositRate(accountId, { newRate: draft.renewedRate!, newMaturityDate: draft.renewedMaturityDate }).catch((error) => Alert.alert('Не удалось обновить ставку', describeError(error) ?? 'Попробуйте изменить счёт вручную.')) },
+          ],
+        );
+      }
     } catch (error) { Alert.alert('Не удалось подтвердить', describeError(error) ?? 'Попробуйте ещё раз.'); }
   };
   const handleDismiss = async (draft: ImportDraft) => { await dismissImportDraft(draft.id); await reload(); };
@@ -1143,11 +1157,12 @@ function InterestSettings({
 }
 
 function AccountEditor({
-  visible, account, accounts, onClose, onSave, onDelete,
+  visible, account, accounts, rateHistory, onClose, onSave, onDelete,
 }: {
   visible: boolean;
   account: Account | null;
   accounts: Account[];
+  rateHistory: DepositRateHistory[];
   onClose: () => void;
   onSave: (input: AccountInput) => Promise<void>;
   onDelete: (account: Account) => void;
@@ -1266,6 +1281,10 @@ function AccountEditor({
           <Text style={s.fieldLabel}>ВАЛЮТА</Text><CurrencyPicker value={currency} onChange={(value) => { setCurrency(value); setDestinationAccountId(undefined); }} />
           {type === 'credit_card' && <><Text style={s.fieldLabel}>КРЕДИТНЫЙ ЛИМИТ</Text><DecimalInput value={creditLimit} onChange={setCreditLimit} placeholder="0,00" /><View style={s.twoColumns}><View style={{ flex: 1 }}><Text style={s.fieldLabel}>ДЕНЬ ВЫПИСКИ</Text><DecimalInput value={statementDay} onChange={setStatementDay} placeholder="Например, 5" /></View><View style={{ flex: 1 }}><Text style={s.fieldLabel}>ДЕНЬ ПЛАТЕЖА</Text><DecimalInput value={paymentDueDay} onChange={setPaymentDueDay} placeholder="Например, 25" /></View></View><View style={s.twoColumns}><View style={{ flex: 1 }}><Text style={s.fieldLabel}>ЛЬГОТНЫЙ ПЕРИОД, ДНЕЙ</Text><DecimalInput value={gracePeriodDays} onChange={setGracePeriodDays} placeholder="Например, 55" /></View><View style={{ flex: 1 }}><Text style={s.fieldLabel}>МИН. ПЛАТЁЖ, %</Text><DecimalInput value={minimumPaymentPercent} onChange={setMinimumPaymentPercent} placeholder="Например, 5" /></View></View><Text style={s.fieldLabel}>СТАВКА ПОСЛЕ ЛЬГОТНОГО ПЕРИОДА, %</Text><DecimalInput value={rate} onChange={setRate} placeholder="Например, 36" /></>}
           {(type === 'deposit' || type === 'savings') && <><Text style={s.fieldLabel}>ПРОЦЕНТНАЯ СТАВКА, % ГОДОВЫХ</Text><DecimalInput value={rate} onChange={setRate} placeholder="Например, 17" /><Text style={s.fieldLabel}>НАЛОГ НА ПРОЦЕНТЫ, % (ЕСЛИ БАНК УДЕРЖИВАЕТ)</Text><DecimalInput value={taxRate} onChange={setTaxRate} placeholder="Например, 20 — если не удерживают, оставьте пустым" /><InterestSettings startDate={startDate} maturityDate={maturityDate} nextInterestDate={nextInterestDate} schedule={interestSchedule} destination={interestDestination} destinationAccountId={destinationAccountId} autoRenewal={autoRenewal} rateReviewReminder={rateReviewReminder} withdrawalPolicy={withdrawalPolicy} minimumBalance={minimumBalance} replenishmentAllowed={replenishmentAllowed} currency={currency} accounts={accounts} currentAccountId={account?.id} onChange={(patch) => { if (patch.startDate !== undefined) setStartDate(patch.startDate); if (patch.maturityDate !== undefined) setMaturityDate(patch.maturityDate); if ('nextInterestDate' in patch) setNextInterestDate(patch.nextInterestDate ?? ''); if (patch.interestSchedule) setInterestSchedule(patch.interestSchedule); if (patch.interestDestination) setInterestDestination(patch.interestDestination); if ('destinationAccountId' in patch) setDestinationAccountId(patch.destinationAccountId); if ('autoRenewal' in patch) setAutoRenewal(patch.autoRenewal ?? false); if ('rateReviewReminder' in patch) setRateReviewReminder(patch.rateReviewReminder ?? true); if (patch.withdrawalPolicy) setWithdrawalPolicy(patch.withdrawalPolicy); if ('minimumBalance' in patch) setMinimumBalance(patch.minimumBalance); if ('replenishmentAllowed' in patch) setReplenishmentAllowed(patch.replenishmentAllowed ?? false); }} /></>}
+          {(type === 'deposit' || type === 'savings') && rateHistory.length > 0 && <>
+            <Text style={s.fieldLabel}>ИСТОРИЯ СТАВОК</Text>
+            <View style={s.targetList}>{rateHistory.map((event) => <View key={event.id} style={s.historyRow}><View style={{ flex: 1 }}><Text style={s.rowTitle}>{event.oldRate !== undefined ? `${event.oldRate}% → ` : ''}{event.newRate}%</Text><Text style={s.rowSub}>{event.occurredAt.slice(0, 10)}{event.newMaturityDate ? ` · до ${event.newMaturityDate}` : ''}</Text></View></View>)}</View>
+          </>}
 
           <Pressable style={[s.primaryButton, saving && { opacity: .6 }]} disabled={saving} onPress={submit}><Text style={s.primaryText}>{saving ? 'Сохраняем…' : account ? 'Сохранить изменения' : 'Добавить счёт'}</Text></Pressable>
           {account && <Pressable style={s.deleteButton} onPress={() => onDelete(account)}><Ionicons name="trash-outline" size={18} color={C.red} /><Text style={s.deleteText}>Удалить счёт</Text></Pressable>}
@@ -1776,6 +1795,7 @@ function AppContent({ userId, email }: { userId: string; email?: string }) {
   const [budgetEditorOpen, setBudgetEditorOpen] = useState(false);
   const [goalEditorOpen, setGoalEditorOpen] = useState(false);
   const [editingAccount, setEditingAccount] = useState<Account | null>(null);
+  const [depositRateHistory, setDepositRateHistory] = useState<DepositRateHistory[]>([]);
   const [editingExpense, setEditingExpense] = useState<PlannedExpense | null>(null);
   const [newExpenseInitialDate, setNewExpenseInitialDate] = useState<string | undefined>();
   const [editingDebt, setEditingDebt] = useState<Debt | null>(null);
@@ -1863,8 +1883,8 @@ function AppContent({ userId, email }: { userId: string; email?: string }) {
     return () => clearInterval(timer);
   }, []);
 
-  const openNewAccount = () => { setEditingAccount(null); setAccountEditorOpen(true); };
-  const openAccount = (account: Account) => { setEditingAccount(account); setAccountEditorOpen(true); };
+  const openNewAccount = () => { setEditingAccount(null); setDepositRateHistory([]); setAccountEditorOpen(true); };
+  const openAccount = (account: Account) => { setEditingAccount(account); setAccountEditorOpen(true); listDepositRateHistory(account.id).then(setDepositRateHistory); };
   const openNewExpense = (date?: string) => { setEditingExpense(null); setNewExpenseInitialDate(date); setExpenseEditorOpen(true); };
   const openExpense = (expense: PlannedExpense) => { setEditingExpense(expense); setNewExpenseInitialDate(undefined); setExpenseEditorOpen(true); };
   const openNewDebt = () => { setEditingDebt(null); setDebtHistory([]); setDebtEditorOpen(true); };
@@ -1969,7 +1989,7 @@ function AppContent({ userId, email }: { userId: string; email?: string }) {
     <View style={s.screen}>{screen}</View>
     <View style={s.tabBar}>{tabs.map((item) => { const active = tab === item.key; return <Pressable key={item.key} style={s.tab} onPress={() => setTab(item.key)}><Ionicons name={active ? item.icon.replace('-outline', '') as keyof typeof Ionicons.glyphMap : item.icon} size={21} color={active ? C.navy : '#98A1A4'} /><Text style={[s.tabText, active && s.tabTextActive]}>{item.label}</Text></Pressable> })}</View>
     <ImportModal visible={importOpen} onClose={() => setImportOpen(false)} accounts={userAccounts} onAccountSaved={async (input) => { await saveAccount(input); await synchronizeInterestPostings(); await Promise.all([reloadAccounts(), reloadOperations()]); }} />
-    <AccountEditor visible={accountEditorOpen} account={editingAccount} accounts={userAccounts} onClose={() => setAccountEditorOpen(false)} onSave={handleSaveAccount} onDelete={handleDeleteAccount} />
+    <AccountEditor visible={accountEditorOpen} account={editingAccount} accounts={userAccounts} rateHistory={depositRateHistory} onClose={() => setAccountEditorOpen(false)} onSave={handleSaveAccount} onDelete={handleDeleteAccount} />
     <PlannedExpenseEditor visible={expenseEditorOpen} expense={editingExpense} initialDate={newExpenseInitialDate} accounts={userAccounts} currencySettings={currencySettings} onClose={() => setExpenseEditorOpen(false)} onSave={handleSaveExpense} onDelete={handleDeleteExpense} />
     <DebtEditor visible={debtEditorOpen} debt={editingDebt} history={debtHistory} accounts={userAccounts} currencySettings={currencySettings} onClose={() => setDebtEditorOpen(false)} onCreate={handleCreateDebt} onUpdate={handleUpdateDebt} onPayment={handleDebtPayment} onReversePayment={handleReverseDebtPayment} onExtend={handleDebtExtension} onOverdue={handleDebtOverdue} />
     <CurrencySettingsEditor visible={currencySettingsOpen} currencies={usedCurrencies} settings={currencySettings} onClose={() => setCurrencySettingsOpen(false)} onSave={handleCurrencySettings} />

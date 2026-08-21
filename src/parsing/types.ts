@@ -16,4 +16,8 @@ export type ParsedTransaction = {
   merchant?: string;
   feeAmount?: number;
   balanceAfter?: number;
+  // Set only when the message ALSO reports a deposit renewal alongside this transaction — see
+  // ImportDraft.renewedRate/renewedMaturityDate in src/types.ts for the full rationale.
+  renewedRate?: number;
+  renewedMaturityDate?: string;
 };

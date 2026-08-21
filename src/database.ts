@@ -1,5 +1,5 @@
 import * as SQLite from 'expo-sqlite';
-import { Account, AccountType, Budget, CashFlowKind, CurrencySettings, Debt, DebtDirection, DebtHistory, DebtHistoryType, DebtStatus, ExpenseRepeat, FinancialGoal, FinancialOperation, GoalType, ImportDraft, ImportDraftSource, InterestDestination, InterestPosting, InterestSchedule, PlannedExecutionInput, PlannedExpense, PlannedOccurrence, PlannedOccurrenceStatus, RecurrenceUnit, Transfer, TransferInput, WithdrawalPolicy } from './types';
+import { Account, AccountType, Budget, CashFlowKind, CurrencySettings, Debt, DebtDirection, DebtHistory, DebtHistoryType, DebtStatus, DepositRateHistory, ExpenseRepeat, FinancialGoal, FinancialOperation, GoalType, ImportDraft, ImportDraftSource, InterestDestination, InterestPosting, InterestSchedule, PlannedExecutionInput, PlannedExpense, PlannedOccurrence, PlannedOccurrenceStatus, RecurrenceUnit, Transfer, TransferInput, WithdrawalPolicy } from './types';
 import { addLocalDays, daysBetween, localToday, nextBusinessMonday, nextMonthlyDate, parseLocalDate, previousMonthlyDate, toLocalIso } from './date';
 import { occursOn } from './recurrence';
 import { ParsedSms } from './sms/types';
@@ -81,6 +81,7 @@ export type LocalSnapshot = {
   scheduledFlows: PlannedExpense[];
   debts: Debt[];
   debtHistory: DebtHistory[];
+  depositRateHistory: DepositRateHistory[];
   operations: FinancialOperation[];
   budgets: Budget[];
   goals: FinancialGoal[];
@@ -308,12 +309,25 @@ async function initializeDatabaseCore() {
       account_id TEXT,
       merchant TEXT,
       balance_after REAL,
+      renewed_rate REAL,
+      renewed_maturity_date TEXT,
       status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending', 'unrecognized', 'confirmed', 'dismissed')),
       operation_id TEXT,
       dedup_operation_id TEXT,
       created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
       updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
       UNIQUE(sender, body_hash)
+    );
+    CREATE TABLE IF NOT EXISTS deposit_rate_history (
+      id TEXT PRIMARY KEY NOT NULL,
+      account_id TEXT NOT NULL,
+      old_rate REAL,
+      new_rate REAL NOT NULL,
+      old_maturity_date TEXT,
+      new_maturity_date TEXT,
+      occurred_at TEXT NOT NULL,
+      note TEXT,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
     );
     INSERT OR IGNORE INTO scheduled_flows
       (id, title, category, amount, currency, account_id, start_date, end_date, repeat_rule, kind,
@@ -482,6 +496,10 @@ async function initializeDatabaseCore() {
   // No CHECK on this ALTER — SQLite's ADD COLUMN doesn't take one the way CREATE TABLE does;
   // validity of 'sms' | 'push' is enforced in TypeScript instead (ImportDraftSource).
   if (!smsDraftColumns.some((column) => column.name === 'source')) await db.execAsync("ALTER TABLE sms_drafts ADD COLUMN source TEXT NOT NULL DEFAULT 'sms';");
+  if (!smsDraftColumns.some((column) => column.name === 'renewed_rate')) {
+    await db.execAsync('ALTER TABLE sms_drafts ADD COLUMN renewed_rate REAL;');
+    await db.execAsync('ALTER TABLE sms_drafts ADD COLUMN renewed_maturity_date TEXT;');
+  }
   const flowColumns = await db.getAllAsync<{ name: string }>('PRAGMA table_info(scheduled_flows)');
   if (!flowColumns.some((column) => column.name === 'occurrences_tracking_from')) {
     await db.execAsync('ALTER TABLE scheduled_flows ADD COLUMN occurrences_tracking_from TEXT;');
@@ -664,6 +682,47 @@ export function deleteAccount(id: string) {
     const db = await getDatabase();
     await db.runAsync('DELETE FROM accounts WHERE id = ?', id);
   });
+}
+
+// Applies a deposit/savings auto-renewal (new rate, and usually a new maturity date) and logs it,
+// so "what rate did this deposit actually have in March" stays answerable after the bank rolls it
+// over — account.rate/maturity_date only ever hold the CURRENT terms, same as before this existed.
+// Interest already paid out on renewal is not this function's concern: it arrives as an ordinary
+// income operation (via the normal SMS/push import-draft flow) and is deduped/recorded exactly
+// like any other bank-reported interest credit.
+export function extendDepositRate(accountId: string, input: { newRate: number; newMaturityDate?: string; note?: string }) {
+  return enqueue(async () => {
+    const db = await getDatabase();
+    const row = await db.getFirstAsync<{ rate: number | null; maturity_date: string | null }>('SELECT rate, maturity_date FROM accounts WHERE id = ?', accountId);
+    if (!row) throw new Error('Счёт не найден');
+    await db.withTransactionAsync(async () => {
+      await db.runAsync('UPDATE accounts SET rate = ?, maturity_date = COALESCE(?, maturity_date), updated_at = CURRENT_TIMESTAMP WHERE id = ?',
+        input.newRate, input.newMaturityDate ?? null, accountId);
+      await db.runAsync(
+        `INSERT INTO deposit_rate_history (id, account_id, old_rate, new_rate, old_maturity_date, new_maturity_date, occurred_at, note)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        makeId(), accountId, row.rate, input.newRate, row.maturity_date,
+        input.newMaturityDate ?? row.maturity_date, new Date().toISOString(), input.note ?? null,
+      );
+    });
+  });
+}
+
+async function listDepositRateHistoryCore(accountId: string): Promise<DepositRateHistory[]> {
+  const db = await getDatabase();
+  const rows = await db.getAllAsync<{
+    id: string; account_id: string; old_rate: number | null; new_rate: number;
+    old_maturity_date: string | null; new_maturity_date: string | null; occurred_at: string; note: string | null;
+  }>('SELECT * FROM deposit_rate_history WHERE account_id = ? ORDER BY occurred_at DESC', accountId);
+  return rows.map((row) => ({
+    id: row.id, accountId: row.account_id, oldRate: row.old_rate ?? undefined, newRate: row.new_rate,
+    oldMaturityDate: row.old_maturity_date ?? undefined, newMaturityDate: row.new_maturity_date ?? undefined,
+    occurredAt: row.occurred_at, note: row.note ?? undefined,
+  }));
+}
+
+export function listDepositRateHistory(accountId: string): Promise<DepositRateHistory[]> {
+  return enqueue(() => listDepositRateHistoryCore(accountId));
 }
 
 async function listPlannedExpensesCore(): Promise<PlannedExpense[]> {
@@ -1342,6 +1401,7 @@ type ImportDraftRow = {
   received_at: string; occurred_at: string | null; amount: number | null; currency: string | null;
   kind: 'income' | 'expense' | null; fee_amount: number | null; card_last4: string | null;
   account_id: string | null; merchant: string | null; balance_after: number | null;
+  renewed_rate: number | null; renewed_maturity_date: string | null;
   status: ImportDraft['status']; operation_id: string | null; dedup_operation_id: string | null;
 };
 
@@ -1351,7 +1411,9 @@ const mapImportDraftRow = (row: ImportDraftRow): ImportDraft => ({
   amount: row.amount ?? undefined, currency: row.currency ?? undefined, kind: row.kind ?? undefined,
   feeAmount: row.fee_amount ?? undefined, cardLast4: row.card_last4 ?? undefined,
   accountId: row.account_id ?? undefined, merchant: row.merchant ?? undefined,
-  balanceAfter: row.balance_after ?? undefined, status: row.status,
+  balanceAfter: row.balance_after ?? undefined,
+  renewedRate: row.renewed_rate ?? undefined, renewedMaturityDate: row.renewed_maturity_date ?? undefined,
+  status: row.status,
   operationId: row.operation_id ?? undefined, dedupOperationId: row.dedup_operation_id ?? undefined,
 });
 
@@ -1428,20 +1490,22 @@ export function createImportDraft(input: { source: ImportDraftSource; sender: st
     if (existing) {
       await db.runAsync(
         `UPDATE sms_drafts SET parser_id = ?, occurred_at = ?, amount = ?, currency = ?, kind = ?, fee_amount = ?,
-         card_last4 = ?, account_id = ?, merchant = ?, balance_after = ?, status = 'pending',
-         dedup_operation_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+         card_last4 = ?, account_id = ?, merchant = ?, balance_after = ?, renewed_rate = ?, renewed_maturity_date = ?,
+         status = 'pending', dedup_operation_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
         input.parserId ?? null, occurredAt, parsed!.amount, parsed!.currency, parsed!.kind,
         parsed!.feeAmount ?? null, parsed!.cardLast4 ?? null, accountId ?? null, parsed!.merchant ?? null,
-        parsed!.balanceAfter ?? null, dedupOperationId ?? null, id,
+        parsed!.balanceAfter ?? null, parsed!.renewedRate ?? null, parsed!.renewedMaturityDate ?? null,
+        dedupOperationId ?? null, id,
       );
     } else {
       await db.runAsync(
-        `INSERT INTO sms_drafts (id, source, sender, parser_id, raw_body, body_hash, received_at, occurred_at, amount, currency, kind, fee_amount, card_last4, account_id, merchant, balance_after, status, dedup_operation_id)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO sms_drafts (id, source, sender, parser_id, raw_body, body_hash, received_at, occurred_at, amount, currency, kind, fee_amount, card_last4, account_id, merchant, balance_after, renewed_rate, renewed_maturity_date, status, dedup_operation_id)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         id, input.source, input.sender, input.parserId ?? null, input.rawBody, bodyHash, input.receivedAt,
         parsed ? occurredAt : null, parsed?.amount ?? null, parsed?.currency ?? null, parsed?.kind ?? null,
         parsed?.feeAmount ?? null, parsed?.cardLast4 ?? null, accountId ?? null, parsed?.merchant ?? null,
-        parsed?.balanceAfter ?? null, parsed ? 'pending' : 'unrecognized', dedupOperationId ?? null,
+        parsed?.balanceAfter ?? null, parsed?.renewedRate ?? null, parsed?.renewedMaturityDate ?? null,
+        parsed ? 'pending' : 'unrecognized', dedupOperationId ?? null,
       );
     }
     const row = await db.getFirstAsync<ImportDraftRow>('SELECT * FROM sms_drafts WHERE id = ?', id);
@@ -1695,6 +1759,8 @@ export function exportLocalSnapshot(): Promise<LocalSnapshot> {
     const plannedOccurrences = await listPlannedOccurrencesCore();
     const debtHistory: DebtHistory[] = [];
     for (const debt of debts) debtHistory.push(...(await listDebtHistoryCore(debt.id)));
+    const depositRateHistory: DepositRateHistory[] = [];
+    for (const account of accounts) depositRateHistory.push(...(await listDepositRateHistoryCore(account.id)));
     return {
       schemaVersion: 1,
       exportedAt: new Date().toISOString(),
@@ -1702,6 +1768,7 @@ export function exportLocalSnapshot(): Promise<LocalSnapshot> {
       scheduledFlows,
       debts,
       debtHistory,
+      depositRateHistory,
       operations,
       budgets,
       goals,
@@ -1734,6 +1801,7 @@ export function replaceLocalSnapshot(snapshot: LocalSnapshot) {
     await db.withTransactionAsync(async () => {
       await db.execAsync(`
       DELETE FROM debt_history;
+      DELETE FROM deposit_rate_history;
       DELETE FROM interest_postings;
       DELETE FROM transfers;
       DELETE FROM planned_occurrences;
@@ -1853,6 +1921,14 @@ export function replaceLocalSnapshot(snapshot: LocalSnapshot) {
           event.id, event.debtId, event.type, event.amount ?? null, event.fromDate ?? null,
           event.toDate ?? null, event.occurredAt, event.note ?? null, event.operationId ?? null,
           event.relatedHistoryId ?? null,
+        );
+      }
+      for (const event of snapshot.depositRateHistory) {
+        await db.runAsync(
+          `INSERT INTO deposit_rate_history (id, account_id, old_rate, new_rate, old_maturity_date, new_maturity_date, occurred_at, note)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+          event.id, event.accountId, event.oldRate ?? null, event.newRate,
+          event.oldMaturityDate ?? null, event.newMaturityDate ?? null, event.occurredAt, event.note ?? null,
         );
       }
       for (const budget of snapshot.budgets) {
