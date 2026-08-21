@@ -18,12 +18,12 @@ import { parsePush } from './src/push/registry';
 import { KNOWN_BANK_PACKAGES } from './src/push/packages';
 import { hasSmsPermission, isSmsReaderAvailable, readSmsInbox, requestSmsPermission } from './modules/sms-reader';
 import { DetectedAccount, recognizeAccountScreenshot } from './src/ocr';
-import { annualPassiveIncome, buildMonthProjection, getCurrencyTotals } from './src/finance';
+import { annualPassiveIncome, buildMonthProjection, flowAmountInCurrency, getCurrencyTotals } from './src/finance';
 import { consolidatedNetWorth, convertCurrency, convertToBase, fetchOfficialCurrencyRates, operationConversionBasis, rebaseRates, weightedAssetRates } from './src/currency';
 import { calculateGoalProgress } from './src/goals';
-import { localToday, nextMonthlyDate, toLocalIso } from './src/date';
-import { recurrenceLabel } from './src/recurrence';
-import { AnalyticsPeriod, analyticsRange, summarizeOperations, summarizePlannedFlows } from './src/analytics';
+import { addLocalDays, localToday, nextMonthlyDate, parseLocalDate, toLocalIso } from './src/date';
+import { occursOn, recurrenceLabel } from './src/recurrence';
+import { AnalyticsPeriod, DateRange, analyticsRange, summarizeOperations, summarizePlannedFlows } from './src/analytics';
 import { supabase, isCloudConfigured } from './src/supabase';
 import { initializeCloudData, uploadLocalDataToCloud } from './src/cloudSync';
 import type { Session } from '@supabase/supabase-js';
@@ -127,13 +127,21 @@ function LegacyHome({ onImport, go, accounts }: { onImport: () => void; go: (tab
   </ScrollView>;
 }
 
-function Home({ onImport, go, accounts, plannedExpenses, plannedOccurrences, debts, currencySettings, onCurrencySettings, onProfile, pendingImportDrafts, operations, transfers }: { onImport: () => void; go: (tab: Tab) => void; accounts: Account[]; plannedExpenses: PlannedExpense[]; plannedOccurrences: PlannedOccurrence[]; debts: Debt[]; currencySettings: CurrencySettings; onCurrencySettings: () => void; onProfile: () => void; pendingImportDrafts: number; operations: FinancialOperation[]; transfers: Transfer[] }) {
+function Home({ onImport, go, accounts, plannedExpenses, plannedOccurrences, debts, currencySettings, onCurrencySettings, onProfile, pendingImportDrafts, operations, transfers, onEditAccount }: { onImport: () => void; go: (tab: Tab) => void; accounts: Account[]; plannedExpenses: PlannedExpense[]; plannedOccurrences: PlannedOccurrence[]; debts: Debt[]; currencySettings: CurrencySettings; onCurrencySettings: () => void; onProfile: () => void; pendingImportDrafts: number; operations: FinancialOperation[]; transfers: Transfer[]; onEditAccount: (account: Account) => void }) {
   const now = new Date();
   const totals = getCurrencyTotals(accounts);
   const currencies = Array.from(new Set([currencySettings.baseCurrency, ...Object.keys(totals), ...plannedExpenses.map((item) => item.currency), ...debts.map((item) => item.currency)])).sort((a, b) => a === 'UZS' ? -1 : b === 'UZS' ? 1 : a.localeCompare(b));
   const primaryCurrency = currencies[0] ?? 'UZS';
   const projection = buildMonthProjection(accounts, primaryCurrency, now.getFullYear(), now.getMonth(), plannedExpenses, debts, currencySettings, localToday(), plannedOccurrences, operations, transfers);
   const consolidated = consolidatedNetWorth(accounts, debts, currencySettings);
+  // Same period, same aggregation function ("Аналитика" already uses summarizeOperations) for
+  // all three hero stats -- "Активно"/"Расходы" used to be a hardcoded 0 regardless of real
+  // data (BACKLOG.md OV-03), and "Пассивно" used buildMonthProjection's forward-looking daily
+  // interest schedule rather than what was actually posted this period, which isn't the same
+  // number once any day in the period has an actual, possibly-differing bank-credited amount.
+  const heroRange = analyticsRange('month', localToday());
+  const heroActual = summarizeOperations(operations, primaryCurrency, heroRange, currencySettings);
+  const heroPeriodLabel = `за ${now.toLocaleString('ru-RU', { month: 'long' })} ${now.getFullYear()}`;
   const risk = projection.days.find((day) => day.risky);
   const events = projection.events.filter((event) => event.day >= now.getDate()).slice(0, 3);
   return <ScrollView contentContainerStyle={s.page} showsVerticalScrollIndicator={false}>
@@ -148,10 +156,11 @@ function Home({ onImport, go, accounts, plannedExpenses, plannedOccurrences, deb
       </Pressable>
       <View style={s.heroDelta}><Ionicons name="cloud-done-outline" size={14} color="#DCE7DD" /><Text style={s.heroDeltaText}> Данные синхронизируются с облаком</Text></View>
       <View style={s.heroRule} />
+      <Text style={[s.heroStatLabel, { marginBottom: 8 }]}>{heroPeriodLabel.toUpperCase()}</Text>
       <View style={s.heroStats}>
-        <View><Text style={s.heroStatLabel}>Активно</Text><Text style={s.heroStat}>0 {primaryCurrency}</Text></View>
-        <View><Text style={s.heroStatLabel}>Расходы</Text><Text style={s.heroStat}>0 {primaryCurrency}</Text></View>
-        <View><Text style={s.heroStatLabel}>Пассивно</Text><Text style={s.heroStat}>+{money(projection.passiveIncome, true, primaryCurrency)}</Text></View>
+        <View><Text style={s.heroStatLabel}>Активные доходы</Text><Text style={s.heroStat}>+{money(heroActual.income - heroActual.passive, true, primaryCurrency)}</Text></View>
+        <View><Text style={s.heroStatLabel}>Расходы</Text><Text style={s.heroStat}>{money(heroActual.expense, true, primaryCurrency)}</Text></View>
+        <View><Text style={s.heroStatLabel}>Пассивные доходы</Text><Text style={s.heroStat}>+{money(heroActual.passive, true, primaryCurrency)}</Text></View>
       </View>
     </View>
 
@@ -166,7 +175,7 @@ function Home({ onImport, go, accounts, plannedExpenses, plannedOccurrences, deb
     {events.length ? <View style={s.card}>{events.map((event, index) => { const outgoing = event.kind === 'expense' || event.kind === 'debt_expense' || event.kind === 'credit_payment'; const incoming = event.kind === 'interest' || event.kind === 'debt_income' || event.kind === 'planned_income'; return <View key={`${event.date}-${event.accountId}-${event.kind}`}><View style={s.eventRow}><View style={[s.dateTile, { backgroundColor: outgoing ? C.redSoft : event.kind === 'reminder' ? C.bg : C.sageSoft }]}><Text style={s.dateDay}>{String(event.day).padStart(2, '0')}</Text><Text style={s.dateMonth}>{now.toLocaleString('ru-RU', { month: 'short' }).toUpperCase()}</Text></View><View style={{ flex: 1 }}><Text style={s.rowTitle}>{event.title}</Text><Text style={s.rowSub}>{event.kind === 'planned_income' ? 'Запланированный доход' : event.kind === 'debt_income' ? 'Возврат долга' : event.kind === 'debt_expense' ? 'Погашение долга' : event.kind === 'credit_payment' ? 'Минимальный платёж по кредитной карте' : event.kind === 'expense' ? 'Запланированный расход' : event.kind === 'reminder' ? 'Напоминание' : `Пассивный доход${event.trackedInBalance ? '' : ' · счёт зачисления не выбран'}`}</Text></View>{incoming && <Text style={s.income}>+{money(event.amount, false, event.currency)}</Text>}{outgoing && <Text style={s.expense}>−{money(event.amount, false, event.currency)}</Text>}</View>{index < events.length - 1 && <View style={s.divider} />}</View>; })}</View> : <View style={s.emptyCard}><Ionicons name="calendar-outline" size={24} color={C.blue} /><Text style={s.emptyTitle}>Событий пока нет</Text><Text style={s.emptyText}>Запланируйте доход, расход или добавьте условия вклада</Text></View>}
 
     <SectionTitle title="Счета" action="Все счета" onAction={() => go('accounts')} />
-    {accounts.length === 0 ? <View style={s.emptyCard}><Ionicons name="wallet-outline" size={25} color={C.blue} /><Text style={s.emptyTitle}>Добавьте первый счёт</Text><Text style={s.emptyText}>Баланс и аналитика появятся здесь автоматически</Text></View> : <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={s.accountRail}>{accounts.slice(0, 4).map((account) => <View key={account.id} style={[s.miniAccount, { borderTopColor: account.accent }]}><View style={[s.roundIcon, { backgroundColor: `${account.accent}18` }]}><Ionicons name={iconForType[account.type]} size={20} color={account.accent} /></View><Text style={s.miniName}>{account.name}</Text><Text style={s.miniBalance}>{money(account.balance, false, account.currency)}</Text><Text style={s.rowSub}>{account.subtitle}</Text></View>)}</ScrollView>}
+    {accounts.length === 0 ? <View style={s.emptyCard}><Ionicons name="wallet-outline" size={25} color={C.blue} /><Text style={s.emptyTitle}>Добавьте первый счёт</Text><Text style={s.emptyText}>Баланс и аналитика появятся здесь автоматически</Text></View> : <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={s.accountRail}>{accounts.slice(0, 4).map((account) => <Pressable key={account.id} onPress={() => onEditAccount(account)} style={[s.miniAccount, { borderTopColor: account.accent }]}><View style={[s.roundIcon, { backgroundColor: `${account.accent}18` }]}><Ionicons name={iconForType[account.type]} size={20} color={account.accent} /></View><Text style={s.miniName}>{account.name}</Text><Text style={s.miniBalance}>{money(account.balance, false, account.currency)}</Text><Text style={s.rowSub}>{account.subtitle}</Text></Pressable>)}</ScrollView>}
     <View style={{ height: 20 }} />
   </ScrollView>;
 }
@@ -284,15 +293,32 @@ function Calendar({ accounts, plannedExpenses, plannedOccurrences, debts, curren
   const [currency, setCurrency] = useState(currencies[0] ?? 'UZS');
   const [viewDate, setViewDate] = useState(new Date(todayDate.getFullYear(), todayDate.getMonth(), 1));
   const [selectedDay, setSelectedDay] = useState(todayDate.getDate());
+  const [typeFilter, setTypeFilter] = useState<'ALL' | AccountType>('ALL');
+  const [accountFilterId, setAccountFilterId] = useState('ALL');
+  const [filtersOpen, setFiltersOpen] = useState(false);
+  const typeNames: Record<AccountType, string> = { card: 'Карты', credit_card: 'Кред. карты', savings: 'Накопительные', deposit: 'Вклады', cash: 'Наличные' };
   useEffect(() => { const timer = setInterval(() => setToday(localToday()), 60_000); return () => clearInterval(timer); }, []);
   useEffect(() => { if (currencies.length && !currencies.includes(currency)) setCurrency(currencies[0] ?? 'UZS'); }, [accounts, plannedExpenses, debts]);
+  useEffect(() => { if (accountFilterId !== 'ALL' && !accounts.some((account) => account.id === accountFilterId)) setAccountFilterId('ALL'); }, [accounts, accountFilterId]);
   const year = viewDate.getFullYear(); const month = viewDate.getMonth();
-  const projection = useMemo(() => buildMonthProjection(accounts, currency, year, month, plannedExpenses, debts, currencySettings, today, plannedOccurrences, operations, transfers), [accounts, currency, year, month, plannedExpenses, debts, currencySettings, today, plannedOccurrences, operations, transfers]);
+  const accountFilter = (typeFilter === 'ALL' && accountFilterId === 'ALL') ? undefined
+    : (account: Account) => (typeFilter === 'ALL' || account.type === typeFilter) && (accountFilterId === 'ALL' || account.id === accountFilterId);
+  const activeCalendarFilterCount = (typeFilter !== 'ALL' ? 1 : 0) + (accountFilterId !== 'ALL' ? 1 : 0);
+  const calendarFilterSummaryParts = [
+    typeFilter !== 'ALL' ? typeNames[typeFilter] : null,
+    accountFilterId !== 'ALL' ? (accounts.find((item) => item.id === accountFilterId)?.name ?? null) : null,
+  ].filter((part): part is string => !!part);
+  const projection = useMemo(() => buildMonthProjection(accounts, currency, year, month, plannedExpenses, debts, currencySettings, today, plannedOccurrences, operations, transfers, accountFilter), [accounts, currency, year, month, plannedExpenses, debts, currencySettings, today, plannedOccurrences, operations, transfers, typeFilter, accountFilterId]);
   const offset = (new Date(year, month, 1).getDay() + 6) % 7;
   const selectedEvents = projection.events.filter((event) => event.day === selectedDay);
   const delta = projection.closingBalance - projection.openingBalance;
   const selectedDate = toLocalIso(new Date(year, month, selectedDay, 12));
-  const visibleFlows = plannedExpenses.filter((flow) => (accounts.find((account) => account.id === flow.accountId)?.currency ?? flow.currency) === currency);
+  const visibleFlows = plannedExpenses.filter((flow) => {
+    const linkedAccount = accounts.find((account) => account.id === flow.accountId);
+    if ((linkedAccount?.currency ?? flow.currency) !== currency) return false;
+    if (linkedAccount && accountFilter && !accountFilter(linkedAccount)) return false;
+    return true;
+  });
   // Past occurrences awaiting confirmation live in plannedOccurrences, not in the (future-only)
   // live projection — buildMonthProjection only generates events for days that haven't passed yet,
   // so there's no overlap between the two sources by construction.
@@ -300,24 +326,54 @@ function Calendar({ accounts, plannedExpenses, plannedOccurrences, debts, curren
   for (const occurrence of plannedOccurrences) {
     if (occurrence.status !== 'planned') continue;
     const flow = plannedExpenses.find((item) => item.id === occurrence.flowId);
-    const effectiveCurrency = flow ? (accounts.find((account) => account.id === flow.accountId)?.currency ?? flow.currency) : occurrence.currency;
+    const linkedAccount = flow ? accounts.find((account) => account.id === flow.accountId) : undefined;
+    const effectiveCurrency = flow ? (linkedAccount?.currency ?? flow.currency) : occurrence.currency;
     if (effectiveCurrency !== currency) continue;
+    if (linkedAccount && accountFilter && !accountFilter(linkedAccount)) continue;
     const list = pendingByDate.get(occurrence.occurrenceDate) ?? [];
     list.push(occurrence);
     pendingByDate.set(occurrence.occurrenceDate, list);
   }
   const selectedOccurrences = pendingByDate.get(selectedDate) ?? [];
+  // Past days must show what actually happened, not the (empty, by construction — see
+  // buildMonthProjection's `!past` gates) projected events list. Future/today keep the forecast.
+  const selectedIsPast = selectedDate < today;
+  const dayBalanceLabel = selectedIsPast ? 'Фактический баланс' : 'Прогнозный баланс';
+  const trackedAccountIds = new Set(accounts.filter((account) => account.currency === currency && (!accountFilter || accountFilter(account))).map((account) => account.id));
+  const factualOperations = selectedIsPast ? operations.filter((op) => op.date === selectedDate && op.status !== 'reversed' && op.currency === currency && trackedAccountIds.has(op.accountId)) : [];
+  const factualTransfers = selectedIsPast ? transfers.filter((transfer) => transfer.date === selectedDate && transfer.status !== 'reversed' && ((transfer.fromCurrency === currency && trackedAccountIds.has(transfer.fromAccountId)) || (transfer.toCurrency === currency && trackedAccountIds.has(transfer.toAccountId)))) : [];
   return <ScrollView contentContainerStyle={s.page} showsVerticalScrollIndicator={false}>
     <Header eyebrow={`СЕГОДНЯ · ${today} · АФИНА 1.1`} title="Платёжный календарь" onAvatarPress={onProfile} />
     <Pressable style={s.planExpenseButton} onPress={() => onAddExpense(selectedDate)}><Ionicons name="add-circle-outline" size={20} color="white" /><Text style={s.importAccountText}>Запланировать доход или расход</Text></Pressable>
     <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={s.currencyRail}>{(currencies.length ? currencies : ['UZS']).map((item) => <Pressable key={item} style={[s.currencyFilter, currency === item && s.currencyFilterActive]} onPress={() => setCurrency(item)}><Text style={[s.currencyFilterText, currency === item && s.currencyFilterTextActive]}>{item}</Text></Pressable>)}</ScrollView>
+    <Pressable style={s.groupHeader} onPress={() => setFiltersOpen((value) => !value)}>
+      <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
+        <Text style={s.sectionTitle}>Фильтры</Text>
+        {activeCalendarFilterCount > 0 && <View style={s.chartBadge}><Text style={s.chartBadgeText}>{activeCalendarFilterCount}</Text></View>}
+      </View>
+      <Ionicons name={filtersOpen ? 'chevron-up' : 'chevron-down'} size={20} color={C.blue} />
+    </Pressable>
+    {!filtersOpen && !!calendarFilterSummaryParts.length && <Text style={[s.rowSub, { marginTop: -6, marginBottom: 10 }]}>{calendarFilterSummaryParts.join(' · ')}</Text>}
+    {filtersOpen && <>
+      <Text style={s.fieldLabel}>ТИП СЧЁТА</Text>
+      <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={s.currencyRail}>{(['ALL', 'card', 'credit_card', 'savings', 'deposit', 'cash'] as const).map((type) => <Pressable key={type} style={[s.currencyFilter, typeFilter === type && s.currencyFilterActive]} onPress={() => setTypeFilter(type)}><Text style={[s.currencyFilterText, typeFilter === type && s.currencyFilterTextActive]}>{type === 'ALL' ? 'Все' : typeNames[type]}</Text></Pressable>)}</ScrollView>
+      <Text style={s.fieldLabel}>СЧЁТ</Text>
+      <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={s.currencyRail}>{['ALL', ...accounts.filter((account) => typeFilter === 'ALL' || account.type === typeFilter).map((item) => item.id)].map((id) => { const account = accounts.find((item) => item.id === id); return <Pressable key={id} style={[s.currencyFilter, accountFilterId === id && s.currencyFilterActive]} onPress={() => setAccountFilterId(id)}><Text style={[s.currencyFilterText, accountFilterId === id && s.currencyFilterTextActive]}>{id === 'ALL' ? 'Все' : account?.name}</Text></Pressable>; })}</ScrollView>
+    </>}
     <View style={s.monthBar}><Pressable onPress={() => { setViewDate(new Date(year, month - 1, 1)); setSelectedDay(1); }}><Ionicons name="chevron-back" size={20} color={C.ink} /></Pressable><Text style={s.month}>{viewDate.toLocaleString('ru-RU', { month: 'long', year: 'numeric' })}</Text><Pressable onPress={() => { setViewDate(new Date(year, month + 1, 1)); setSelectedDay(1); }}><Ionicons name="chevron-forward" size={20} color={C.ink} /></Pressable></View>
     <View style={s.forecastCard}><View><Text style={s.forecastLabel}>ОСТАТОК К КОНЦУ МЕСЯЦА · {currency}</Text><Text style={s.forecastAmount}>{money(projection.closingBalance, false, currency)}</Text></View><View style={s.forecastPill}><Text style={[s.forecastPillText, delta >= 0 && { color: '#DCE7DD' }]}>{delta >= 0 ? '+' : '−'}{money(Math.abs(delta), true, currency)}</Text></View></View>
     <View style={s.weekHead}>{['ПН','ВТ','СР','ЧТ','ПТ','СБ','ВС'].map((day) => <Text key={day} style={s.weekDay}>{day}</Text>)}</View>
     <View style={s.calendarGrid}>{Array.from({ length: offset }, (_, index) => <View key={`empty-${index}`} style={s.dayCell} />)}{projection.days.map((item) => { const isToday = item.date === today; const hasPending = pendingByDate.has(item.date); return <Pressable key={item.day} onPress={() => setSelectedDay(item.day)} style={[s.dayCell, item.risky && s.riskyDay, isToday && s.todayMarker, selectedDay === item.day && s.selectedDay]}><Text style={[s.dayNumber, item.risky && { color: C.red }, isToday && { color: C.blue }]}>{item.day}</Text><Text style={[s.dayBalance, item.risky && { color: C.red }]}>{money(item.balance, true, currency).replace(` ${currency}`, '')}</Text><View style={s.dots}>{item.income > 0 && <View style={[s.dot, { backgroundColor: C.green }]} />}{item.expense > 0 && <View style={[s.dot, { backgroundColor: C.blue }]} />}{hasPending && <View style={[s.dot, { backgroundColor: C.muted }]} />}</View></Pressable>; })}</View>
     <View style={s.legend}><View style={s.legendItem}><View style={[s.dot, { backgroundColor: C.green }]} /><Text style={s.legendText}>Доход</Text></View><View style={s.legendItem}><View style={[s.dot, { backgroundColor: C.blue }]} /><Text style={s.legendText}>Расход</Text></View><View style={s.legendItem}><View style={[s.dot, { backgroundColor: C.red }]} /><Text style={s.legendText}>Разрыв</Text></View></View>
-    <SectionTitle title={`${selectedDay} ${viewDate.toLocaleString('ru-RU', { month: 'long' })}`} />
-    {selectedEvents.length ? <View style={s.card}>{selectedEvents.map((event, index) => { const outgoing = event.kind === 'expense' || event.kind === 'debt_expense' || event.kind === 'credit_payment'; const incoming = event.kind === 'interest' || event.kind === 'debt_income' || event.kind === 'planned_income'; return <View key={`${event.accountId}-${event.kind}-${index}`}><View style={s.eventRow}><View style={[s.roundIcon, { backgroundColor: outgoing ? C.redSoft : event.kind === 'reminder' ? C.bg : C.sageSoft }]}><Ionicons name={event.kind.startsWith('debt_') ? 'people-outline' : event.kind === 'credit_payment' ? 'card-outline' : outgoing ? 'receipt-outline' : event.kind === 'reminder' ? 'notifications-outline' : 'sparkles-outline'} size={20} color={outgoing ? C.red : event.kind === 'reminder' ? C.blue : C.green} /></View><View style={{ flex: 1 }}><Text style={s.rowTitle}>{event.title}</Text><Text style={s.rowSub}>{event.kind === 'planned_income' ? 'Запланированный доход' : event.kind === 'expense' ? 'Запланированный расход' : event.kind === 'credit_payment' ? 'Минимальный платёж по кредитной карте' : event.kind === 'reminder' ? 'Напоминание' : event.kind.startsWith('debt_') ? 'Платёж по долгу' : 'Процентный доход'}</Text></View>{incoming && <Text style={s.income}>+{money(event.amount, false, currency)}</Text>}{outgoing && <Text style={s.expense}>−{money(event.amount, false, currency)}</Text>}</View>{index < selectedEvents.length - 1 && <View style={s.divider} />}</View>; })}</View> : <View style={s.emptyCard}><Text style={s.emptyText}>На этот день событий нет. Прогнозный баланс: {money(projection.days[selectedDay - 1]?.balance ?? projection.openingBalance, false, currency)}</Text></View>}
+    <SectionTitle title={`${selectedDay} ${viewDate.toLocaleString('ru-RU', { month: 'long' })} · ${dayBalanceLabel}`} />
+    {selectedIsPast ? (
+      (factualOperations.length || factualTransfers.length) ? <View style={s.card}>
+        {factualOperations.map((operation, index) => <View key={`fo-${operation.id}`}><View style={s.eventRow}><View style={[s.roundIcon, { backgroundColor: operation.kind === 'income' ? C.sageSoft : C.redSoft }]}><Ionicons name={operation.kind === 'income' ? 'sparkles-outline' : 'receipt-outline'} size={20} color={operation.kind === 'income' ? C.green : C.red} /></View><View style={{ flex: 1 }}><Text style={s.rowTitle}>{operation.title || operation.category}</Text><Text style={s.rowSub}>{operation.category}</Text></View>{operation.kind === 'income' ? <Text style={s.income}>+{money(operation.amount, false, currency)}</Text> : <Text style={s.expense}>−{money(operation.amount, false, currency)}</Text>}</View>{(index < factualOperations.length - 1 || factualTransfers.length > 0) && <View style={s.divider} />}</View>)}
+        {factualTransfers.map((transfer, index) => { const fromAccount = accounts.find((item) => item.id === transfer.fromAccountId); const toAccount = accounts.find((item) => item.id === transfer.toAccountId); return <View key={`ft-${transfer.id}`}><View style={s.eventRow}><View style={[s.roundIcon, { backgroundColor: `${C.blue}18` }]}><Ionicons name="swap-horizontal-outline" size={19} color={C.blue} /></View><View style={{ flex: 1 }}><Text style={s.rowTitle}>{fromAccount?.name ?? 'Счёт удалён'} → {toAccount?.name ?? 'Счёт удалён'}</Text><Text style={s.rowSub}>Перевод</Text></View><Text style={{ color: C.blue, fontWeight: '600' }}>{transfer.fromCurrency === transfer.toCurrency ? money(transfer.fromAmount, false, transfer.fromCurrency) : `${money(transfer.fromAmount, false, transfer.fromCurrency)} → ${money(transfer.toAmount, false, transfer.toCurrency)}`}</Text></View>{index < factualTransfers.length - 1 && <View style={s.divider} />}</View>; })}
+      </View> : <View style={s.emptyCard}><Text style={s.emptyText}>В этот день операций не было. Фактический баланс: {money(projection.days[selectedDay - 1]?.balance ?? projection.openingBalance, false, currency)}</Text></View>
+    ) : (
+      selectedEvents.length ? <View style={s.card}>{selectedEvents.map((event, index) => { const outgoing = event.kind === 'expense' || event.kind === 'debt_expense' || event.kind === 'credit_payment'; const incoming = event.kind === 'interest' || event.kind === 'debt_income' || event.kind === 'planned_income'; return <View key={`${event.accountId}-${event.kind}-${index}`}><View style={s.eventRow}><View style={[s.roundIcon, { backgroundColor: outgoing ? C.redSoft : event.kind === 'reminder' ? C.bg : C.sageSoft }]}><Ionicons name={event.kind.startsWith('debt_') ? 'people-outline' : event.kind === 'credit_payment' ? 'card-outline' : outgoing ? 'receipt-outline' : event.kind === 'reminder' ? 'notifications-outline' : 'sparkles-outline'} size={20} color={outgoing ? C.red : event.kind === 'reminder' ? C.blue : C.green} /></View><View style={{ flex: 1 }}><Text style={s.rowTitle}>{event.title}</Text><Text style={s.rowSub}>{event.kind === 'planned_income' ? 'Запланированный доход' : event.kind === 'expense' ? 'Запланированный расход' : event.kind === 'credit_payment' ? 'Минимальный платёж по кредитной карте' : event.kind === 'reminder' ? 'Напоминание' : event.kind.startsWith('debt_') ? 'Платёж по долгу' : 'Процентный доход'}</Text></View>{incoming && <Text style={s.income}>+{money(event.amount, false, currency)}</Text>}{outgoing && <Text style={s.expense}>−{money(event.amount, false, currency)}</Text>}</View>{index < selectedEvents.length - 1 && <View style={s.divider} />}</View>; })}</View> : <View style={s.emptyCard}><Text style={s.emptyText}>На этот день событий нет. Прогнозный баланс: {money(projection.days[selectedDay - 1]?.balance ?? projection.openingBalance, false, currency)}</Text></View>
+    )}
     {selectedOccurrences.length > 0 && <><SectionTitle title="Ожидают подтверждения" /><View style={s.card}>{selectedOccurrences.map((occurrence, index) => { const flow = plannedExpenses.find((item) => item.id === occurrence.flowId); if (!flow) return null; return <View key={occurrence.id}><View style={s.eventRow}><View style={[s.roundIcon, { backgroundColor: C.bg }]}><Ionicons name="time-outline" size={20} color={C.muted} /></View><View style={{ flex: 1 }}><Text style={s.rowTitle}>{flow.title}</Text><Text style={s.rowSub}>План: {money(occurrence.amount, false, occurrence.currency)}</Text></View><Pressable onPress={() => onExecuteOccurrence(occurrence, flow)}><Text style={s.link}>Провести</Text></Pressable></View><Pressable onPress={() => onCancelOccurrence(occurrence)}><Text style={[s.link, { color: C.red, textAlign: 'right' }]}>Отменить</Text></Pressable>{index < selectedOccurrences.length - 1 && <View style={s.divider} />}</View>; })}</View></>}
     <SectionTitle title="Запланированные движения" action="+ Добавить" onAction={() => onAddExpense(selectedDate)} />
     {visibleFlows.length ? <View style={s.card}>{visibleFlows.map((flow, index) => <Pressable key={flow.id} onPress={() => onEditExpense(flow)}><View style={s.eventRow}><View style={[s.roundIcon, { backgroundColor: flow.kind === 'income' ? C.sageSoft : C.redSoft }]}><Ionicons name="repeat-outline" size={20} color={flow.kind === 'income' ? C.green : C.red} /></View><View style={{ flex: 1 }}><Text style={s.rowTitle}>{flow.title}</Text><Text style={s.rowSub}>{flow.category} · {recurrenceLabel(flow)} · с {flow.startDate}{flow.currency !== currency ? ` · ${flow.currency} → ${currency}` : ''}</Text></View><Text style={flow.kind === 'income' ? s.income : s.expense}>{flow.kind === 'income' ? '+' : '−'}{money(flow.amount, false, flow.currency)}</Text></View>{index < visibleFlows.length - 1 && <View style={s.divider} />}</Pressable>)}</View> : <View style={s.emptyCard}><Text style={s.emptyText}>Движений в {currency} пока не запланировано</Text></View>}
@@ -348,6 +404,32 @@ function Operations({ operations, transfers, plannedOccurrences, plannedExpenses
     ...filteredTransfers.map((transfer) => ({ key: `tr-${transfer.id}`, date: transfer.date, kind: 'transfer' as const, transfer })),
   ].sort((a, b) => b.date.localeCompare(a.date));
   const activeFilterCount = (currency !== 'ALL' ? 1 : 0) + (accountId !== 'ALL' ? 1 : 0) + (category !== 'ALL' ? 1 : 0) + (fromDate || toDate ? 1 : 0);
+  const filterSummaryParts = [
+    currency !== 'ALL' ? currency : null,
+    accountId !== 'ALL' ? (accounts.find((item) => item.id === accountId)?.name ?? null) : null,
+    category !== 'ALL' ? category : null,
+    fromDate || toDate ? `${fromDate || '…'} – ${toDate || '…'}` : null,
+  ].filter((part): part is string => !!part);
+  // Excludes reversed operations and reversals of a reversed operation (same rule
+  // summarizeOperations already applies), so these tiles match what's actually visible below,
+  // not a raw sum that includes struck-through rows.
+  const reversedOperationIds = new Set(operations.filter((item) => item.status === 'reversed').map((item) => item.id));
+  const liveFiltered = filtered.filter((item) => item.status !== 'reversed' && !(item.relatedOperationId && reversedOperationIds.has(item.relatedOperationId)));
+  const liveTransfers = filteredTransfers.filter((item) => item.status !== 'reversed');
+  const summaryCurrencies = Array.from(new Set([...liveFiltered.map((item) => item.currency), ...liveTransfers.flatMap((item) => [item.fromCurrency, item.toCurrency])]));
+  const summaryCurrency = summaryCurrencies.length === 1 ? summaryCurrencies[0] : undefined;
+  const summaryIncome = summaryCurrency ? liveFiltered.filter((item) => item.kind === 'income').reduce((sum, item) => sum + item.amount, 0) : 0;
+  const summaryExpense = summaryCurrency ? liveFiltered.filter((item) => item.kind === 'expense').reduce((sum, item) => sum + item.amount, 0) : 0;
+  const summaryTransfers = summaryCurrency ? liveTransfers.filter((item) => item.fromCurrency === summaryCurrency).reduce((sum, item) => sum + item.fromAmount, 0) : 0;
+  const summaryPeriodLabel = fromDate && toDate ? `${fromDate} – ${toDate}` : fromDate ? `с ${fromDate}` : toDate ? `по ${toDate}` : 'за всё время';
+  const today = localToday();
+  const yesterday = addLocalDays(today, -1);
+  const dayGroupLabel = (iso: string) => {
+    const formatted = dateFromIso(iso).toLocaleString('ru-RU', { day: 'numeric', month: 'long' });
+    if (iso === today) return `${formatted} · Сегодня`;
+    if (iso === yesterday) return `${formatted} · Вчера`;
+    return formatted;
+  };
   // Daily interest postings dominate this feed (one row per account per day); collapsing
   // consecutive same-account/currency/category interest rows into one expandable group keeps
   // the occasional real operation from getting lost in a wall of identical-looking entries.
@@ -367,10 +449,33 @@ function Operations({ operations, transfers, plannedOccurrences, plannedExpenses
     if (isInterest && row.kind === 'operation') displayRows.push({ key: `grp-${row.key}`, kind: 'interestGroup', operations: [row.operation] });
     else displayRows.push({ key: row.key, kind: 'single', row });
   }
+  // The date a display row visually sits under -- for an interest group this is its most recent
+  // date (operations[0], since the group is built by prepending onto a descending-sorted feed),
+  // not every date the group actually spans. Keeps the header math consistent with what's visibly
+  // grouped under it, instead of a date range's operations being split across two headers.
+  const bucketDateOf = (entry: DisplayRow): string => entry.kind === 'single' ? entry.row.date : entry.operations[0]!.date;
+  // Only computed when the whole screen is already single-currency (summaryCurrency defined) --
+  // same guard as the top tiles, so a per-day total never silently sums two currencies together.
+  const dayNetByDate = new Map<string, number>();
+  if (summaryCurrency) {
+    for (const entry of displayRows) {
+      const date = bucketDateOf(entry);
+      let delta = 0;
+      if (entry.kind === 'single' && entry.row.kind === 'operation') {
+        const op = entry.row.operation;
+        if (op.currency === summaryCurrency && op.status !== 'reversed' && !(op.relatedOperationId && reversedOperationIds.has(op.relatedOperationId))) {
+          delta = op.kind === 'income' ? op.amount : -op.amount;
+        }
+      } else if (entry.kind === 'interestGroup') {
+        delta = entry.operations.filter((op) => op.currency === summaryCurrency).reduce((sum, op) => sum + op.amount, 0);
+      }
+      dayNetByDate.set(date, (dayNetByDate.get(date) ?? 0) + delta);
+    }
+  }
   const renderOperation = (operation: FinancialOperation) => {
     const account = accounts.find((item) => item.id === operation.accountId); const cancelled = operation.status === 'reversed';
     const deviates = operation.plannedAmount !== undefined && operation.plannedCurrency !== undefined && (Math.abs(operation.plannedAmount - operation.amount) > 0.005 || operation.plannedCurrency !== operation.currency);
-    return <View style={[s.eventRow, cancelled && { opacity: .55 }]}><View style={[s.roundIcon, { backgroundColor: operation.kind === 'income' ? C.sageSoft : C.redSoft }]}><Ionicons name={operation.relatedOperationId ? 'return-down-back-outline' : operation.sourceOccurrenceId ? 'checkmark-done-outline' : operation.kind === 'income' ? 'arrow-down-outline' : 'arrow-up-outline'} size={19} color={operation.kind === 'income' ? C.green : C.red} /></View><View style={{ flex: 1 }}><Text style={[s.rowTitle, cancelled && { textDecorationLine: 'line-through' }]}>{operation.title}</Text><Text style={s.rowSub}>{operation.date} · {operation.category} · {account?.name ?? 'Счёт удалён'}{cancelled ? ' · отменено' : operation.relatedOperationId ? ' · обратная проводка' : ''}</Text>{deviates && <Text style={s.rowSub}>план {money(operation.plannedAmount!, false, operation.plannedCurrency!)}</Text>}</View><Text style={operation.kind === 'income' ? s.income : s.expense}>{operation.kind === 'income' ? '+' : '−'}{money(operation.amount, false, operation.currency)}</Text>{!!operation.receiptPhotoUri && <Pressable onPress={() => setViewingReceipt(operation.receiptPhotoUri!)} hitSlop={8} style={{ marginLeft: 8 }}><Ionicons name="receipt-outline" size={18} color={C.blue} /></Pressable>}</View>;
+    return <View style={[s.eventRow, cancelled && { opacity: .55 }]}><View style={[s.roundIcon, { backgroundColor: operation.kind === 'income' ? C.sageSoft : C.redSoft }]}><Ionicons name={operation.relatedOperationId ? 'return-down-back-outline' : operation.sourceOccurrenceId ? 'checkmark-done-outline' : operation.kind === 'income' ? 'arrow-down-outline' : 'arrow-up-outline'} size={19} color={operation.kind === 'income' ? C.green : C.red} /></View><View style={{ flex: 1 }}><Text style={[s.rowTitle, cancelled && { textDecorationLine: 'line-through' }]}>{operation.title}</Text><Text style={s.rowSub}>{operation.category} · {account?.name ?? 'Счёт удалён'}{cancelled ? ' · отменено' : operation.relatedOperationId ? ' · обратная проводка' : ''}</Text>{deviates && <Text style={s.rowSub}>план {money(operation.plannedAmount!, false, operation.plannedCurrency!)}</Text>}</View><Text style={operation.kind === 'income' ? s.income : s.expense}>{operation.kind === 'income' ? '+' : '−'}{money(operation.amount, false, operation.currency)}</Text>{!!operation.receiptPhotoUri && <Pressable onPress={() => setViewingReceipt(operation.receiptPhotoUri!)} hitSlop={8} style={{ marginLeft: 8 }}><Ionicons name="receipt-outline" size={18} color={C.blue} /></Pressable>}</View>;
   };
   const confirmReverseTransfer = (transfer: Transfer) => {
     const fromAccount = accounts.find((item) => item.id === transfer.fromAccountId);
@@ -388,6 +493,13 @@ function Operations({ operations, transfers, plannedOccurrences, plannedExpenses
       <Pressable style={[s.planExpenseButton, { flex: 1 }]} onPress={onAdd}><Ionicons name="add-circle-outline" size={20} color="white" /><Text style={s.importAccountText}>Добавить операцию</Text></Pressable>
       <Pressable style={[s.planExpenseButton, { flex: 1, backgroundColor: C.blue }]} onPress={onTransfer}><Ionicons name="swap-horizontal-outline" size={20} color="white" /><Text style={s.importAccountText}>Перевод</Text></Pressable>
     </View>
+    {summaryCurrency ? <View style={s.metricRow}>
+      <View style={s.metric}><Text style={s.metricLabel}>ДОХОДЫ</Text><Text style={[s.metricValue, { color: C.green }]}>+{money(summaryIncome, true, summaryCurrency)}</Text><Text style={s.metricSub}>{summaryPeriodLabel}</Text></View>
+      <View style={s.metric}><Text style={s.metricLabel}>РАСХОДЫ</Text><Text style={[s.metricValue, { color: C.red }]}>−{money(summaryExpense, true, summaryCurrency)}</Text><Text style={s.metricSub}>{summaryPeriodLabel}</Text></View>
+      <View style={s.metric}><Text style={s.metricLabel}>ПЕРЕВОДЫ</Text><Text style={[s.metricValue, { color: C.blue }]}>{money(summaryTransfers, true, summaryCurrency)}</Text><Text style={s.metricSub}>{summaryPeriodLabel}</Text></View>
+    </View> : (liveFiltered.length > 0 || liveTransfers.length > 0) && <Pressable style={s.metric} onPress={() => { setFiltersOpen(true); setCurrency(summaryCurrencies[0] ?? 'ALL'); }}>
+      <Text style={s.metricLabel}>СУММЫ ЗА ПЕРИОД</Text><Text style={s.rowSub}>Выберите одну валюту в фильтрах, чтобы увидеть суммы — сейчас в списке несколько валют сразу</Text>
+    </Pressable>}
     {pendingOccurrences.length > 0 && <><SectionTitle title={`Ожидают подтверждения · ${pendingOccurrences.length}`} /><View style={s.card}>{pendingOccurrences.map((occurrence, index) => {
       const flow = plannedExpenses.find((item) => item.id === occurrence.flowId);
       if (!flow) return null;
@@ -400,40 +512,54 @@ function Operations({ operations, transfers, plannedOccurrences, plannedExpenses
       </View>
       <Ionicons name={filtersOpen ? 'chevron-up' : 'chevron-down'} size={20} color={C.blue} />
     </Pressable>
+    {!filtersOpen && !!filterSummaryParts.length && <Text style={[s.rowSub, { marginTop: -6, marginBottom: 10 }]}>{filterSummaryParts.join(' · ')}</Text>}
     {filtersOpen && <>
       <Text style={s.fieldLabel}>ВАЛЮТА</Text><ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={s.currencyRail}>{['ALL', ...currencies].map((item) => <Pressable key={item} style={[s.currencyFilter, currency === item && s.currencyFilterActive]} onPress={() => setCurrency(item)}><Text style={[s.currencyFilterText, currency === item && s.currencyFilterTextActive]}>{item === 'ALL' ? 'Все' : item}</Text></Pressable>)}</ScrollView>
       <Text style={s.fieldLabel}>СЧЁТ</Text><ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={s.currencyRail}>{['ALL', ...accounts.map((item) => item.id)].map((id) => { const account = accounts.find((item) => item.id === id); return <Pressable key={id} style={[s.currencyFilter, accountId === id && s.currencyFilterActive]} onPress={() => setAccountId(id)}><Text style={[s.currencyFilterText, accountId === id && s.currencyFilterTextActive]}>{id === 'ALL' ? 'Все' : account?.name}</Text></Pressable>; })}</ScrollView>
       <Text style={s.fieldLabel}>КАТЕГОРИЯ</Text><ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={s.currencyRail}>{['ALL', ...categories].map((item) => <Pressable key={item} style={[s.currencyFilter, category === item && s.currencyFilterActive]} onPress={() => setCategory(item)}><Text style={[s.currencyFilterText, category === item && s.currencyFilterTextActive]}>{item === 'ALL' ? 'Все' : item}</Text></Pressable>)}</ScrollView>
       <Text style={s.fieldLabel}>ПЕРИОД</Text><View style={s.twoColumns}><View style={{ flex: 1 }}><DateField value={fromDate} onPress={() => setDateTarget('from')} placeholder="С даты" /></View><View style={{ flex: 1 }}><DateField value={toDate} onPress={() => setDateTarget('to')} placeholder="По дату" /></View></View>{(fromDate || toDate) && <Pressable onPress={() => { setFromDate(''); setToDate(''); }}><Text style={s.link}>Сбросить период</Text></Pressable>}
     </>}
-    <SectionTitle title={`Найдено: ${feed.length}`} />{displayRows.length ? <View style={s.card}>{displayRows.map((entry, index) => {
-      const isLast = index === displayRows.length - 1;
+    <SectionTitle title={`Найдено: ${feed.length}`} />{displayRows.length ? <View style={s.card}>{displayRows.flatMap((entry, index) => {
+      const bucketDate = bucketDateOf(entry);
+      const nextEntry = displayRows[index + 1];
+      const isLastInGroup = !nextEntry || bucketDateOf(nextEntry) !== bucketDate;
+      const header = index === 0 || bucketDateOf(displayRows[index - 1]!) !== bucketDate
+        ? <View key={`hdr-${bucketDate}`} style={[s.dayGroupHeader, index > 0 && { marginTop: 14 }]}>
+            <Text style={s.dayGroupLabel}>{dayGroupLabel(bucketDate)}</Text>
+            {dayNetByDate.has(bucketDate) && <Text style={(dayNetByDate.get(bucketDate) ?? 0) >= 0 ? s.income : s.expense}>{(dayNetByDate.get(bucketDate) ?? 0) >= 0 ? '+' : '−'}{money(Math.abs(dayNetByDate.get(bucketDate) ?? 0), true, summaryCurrency!)}</Text>}
+          </View>
+        : null;
+      let content: React.ReactNode;
       if (entry.kind === 'single') {
         const row = entry.row;
         if (row.kind === 'transfer') {
           const transfer = row.transfer; const fromAccount = accounts.find((item) => item.id === transfer.fromAccountId); const toAccount = accounts.find((item) => item.id === transfer.toAccountId); const cancelled = transfer.status === 'reversed';
-          return <Pressable key={entry.key} disabled={cancelled} onPress={() => confirmReverseTransfer(transfer)}><View style={[s.eventRow, cancelled && { opacity: .55 }]}><View style={[s.roundIcon, { backgroundColor: `${C.blue}18` }]}><Ionicons name="swap-horizontal-outline" size={19} color={C.blue} /></View><View style={{ flex: 1 }}><Text style={[s.rowTitle, cancelled && { textDecorationLine: 'line-through' }]}>{fromAccount?.name ?? 'Счёт удалён'} → {toAccount?.name ?? 'Счёт удалён'}</Text><Text style={s.rowSub}>{transfer.date} · Перевод{transfer.note ? ` · ${transfer.note}` : ''}{cancelled ? ' · отменено' : ''}</Text></View><Text style={{ color: C.blue, fontWeight: '600' }}>{transfer.fromCurrency === transfer.toCurrency ? money(transfer.fromAmount, false, transfer.fromCurrency) : `${money(transfer.fromAmount, false, transfer.fromCurrency)} → ${money(transfer.toAmount, false, transfer.toCurrency)}`}</Text></View>{!isLast && <View style={s.divider} />}</Pressable>;
+          content = <Pressable key={entry.key} disabled={cancelled} onPress={() => confirmReverseTransfer(transfer)}><View style={[s.eventRow, cancelled && { opacity: .55 }]}><View style={[s.roundIcon, { backgroundColor: `${C.blue}18` }]}><Ionicons name="swap-horizontal-outline" size={19} color={C.blue} /></View><View style={{ flex: 1 }}><Text style={[s.rowTitle, cancelled && { textDecorationLine: 'line-through' }]}>{fromAccount?.name ?? 'Счёт удалён'} → {toAccount?.name ?? 'Счёт удалён'}</Text><Text style={s.rowSub}>Перевод{transfer.note ? ` · ${transfer.note}` : ''}{cancelled ? ' · отменено' : ''}</Text></View><Text style={{ color: C.blue, fontWeight: '600' }}>{transfer.fromCurrency === transfer.toCurrency ? money(transfer.fromAmount, false, transfer.fromCurrency) : `${money(transfer.fromAmount, false, transfer.fromCurrency)} → ${money(transfer.toAmount, false, transfer.toCurrency)}`}</Text></View>{!isLastInGroup && <View style={s.divider} />}</Pressable>;
+        } else {
+          content = <View key={entry.key}>{renderOperation(row.operation)}{!isLastInGroup && <View style={s.divider} />}</View>;
         }
-        return <View key={entry.key}>{renderOperation(row.operation)}{!isLast && <View style={s.divider} />}</View>;
+      } else if (entry.operations.length === 1) {
+        content = <View key={entry.key}>{renderOperation(entry.operations[0]!)}{!isLastInGroup && <View style={s.divider} />}</View>;
+      } else {
+        const expanded = !!expandedGroups[entry.key];
+        const total = entry.operations.reduce((sum, op) => sum + op.amount, 0);
+        const account = accounts.find((item) => item.id === entry.operations[0]!.accountId);
+        const dates = entry.operations.map((op) => op.date).sort();
+        const sortedOps = entry.operations.slice().sort((a, b) => b.date.localeCompare(a.date));
+        content = <View key={entry.key}>
+          <Pressable onPress={() => setExpandedGroups((current) => ({ ...current, [entry.key]: !current[entry.key] }))}>
+            <View style={s.eventRow}>
+              <View style={[s.roundIcon, { backgroundColor: C.sageSoft }]}><Ionicons name="leaf-outline" size={19} color={C.green} /></View>
+              <View style={{ flex: 1 }}><Text style={s.rowTitle}>{entry.operations[0]!.title}</Text><Text style={s.rowSub}>{dates[0]} – {dates[dates.length - 1]} · {entry.operations.length} начислений{account ? ` · ${account.name}` : ''}</Text></View>
+              <Text style={s.income}>+{money(total, false, entry.operations[0]!.currency)}</Text>
+              <Ionicons name={expanded ? 'chevron-up' : 'chevron-down'} size={18} color={C.muted} style={{ marginLeft: 8 }} />
+            </View>
+          </Pressable>
+          {expanded && sortedOps.map((op, opIndex) => <View key={op.id} style={{ paddingLeft: 20 }}>{renderOperation(op)}{opIndex < sortedOps.length - 1 && <View style={s.divider} />}</View>)}
+          {!isLastInGroup && <View style={s.divider} />}
+        </View>;
       }
-      if (entry.operations.length === 1) return <View key={entry.key}>{renderOperation(entry.operations[0]!)}{!isLast && <View style={s.divider} />}</View>;
-      const expanded = !!expandedGroups[entry.key];
-      const total = entry.operations.reduce((sum, op) => sum + op.amount, 0);
-      const account = accounts.find((item) => item.id === entry.operations[0]!.accountId);
-      const dates = entry.operations.map((op) => op.date).sort();
-      const sortedOps = entry.operations.slice().sort((a, b) => b.date.localeCompare(a.date));
-      return <View key={entry.key}>
-        <Pressable onPress={() => setExpandedGroups((current) => ({ ...current, [entry.key]: !current[entry.key] }))}>
-          <View style={s.eventRow}>
-            <View style={[s.roundIcon, { backgroundColor: C.sageSoft }]}><Ionicons name="leaf-outline" size={19} color={C.green} /></View>
-            <View style={{ flex: 1 }}><Text style={s.rowTitle}>{entry.operations[0]!.title}</Text><Text style={s.rowSub}>{dates[0]} – {dates[dates.length - 1]} · {entry.operations.length} начислений{account ? ` · ${account.name}` : ''}</Text></View>
-            <Text style={s.income}>+{money(total, false, entry.operations[0]!.currency)}</Text>
-            <Ionicons name={expanded ? 'chevron-up' : 'chevron-down'} size={18} color={C.muted} style={{ marginLeft: 8 }} />
-          </View>
-        </Pressable>
-        {expanded && sortedOps.map((op, opIndex) => <View key={op.id} style={{ paddingLeft: 20 }}>{renderOperation(op)}{opIndex < sortedOps.length - 1 && <View style={s.divider} />}</View>)}
-        {!isLast && <View style={s.divider} />}
-      </View>;
+      return header ? [header, content] : [content];
     })}</View> : <View style={s.emptyCard}><Ionicons name="receipt-outline" size={24} color={C.blue} /><Text style={s.emptyTitle}>Операции не найдены</Text><Text style={s.emptyText}>Измените фильтры или добавьте новую операцию</Text></View>}
     <DatePickerModal visible={dateTarget !== null} value={dateTarget === 'to' ? toDate : fromDate} onClose={() => setDateTarget(null)} onSelect={(value) => dateTarget === 'to' ? setToDate(value) : setFromDate(value)} />
     <ReceiptViewerModal uri={viewingReceipt} onClose={() => setViewingReceipt(null)} />
@@ -673,6 +799,7 @@ function Analytics({ accounts, plannedExpenses, plannedOccurrences, debts, curre
   const [period, setPeriod] = useState<AnalyticsPeriod>('month');
   const [customRange, setCustomRange] = useState({ from: `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-01`, to: localToday() });
   const [dateTarget, setDateTarget] = useState<'from' | 'to' | null>(null);
+  const [drilldownKind, setDrilldownKind] = useState<'income' | 'expense' | 'passive' | null>(null);
   useEffect(() => { if (currencies.length && !currencies.includes(currency)) setCurrency(currencies[0] ?? 'UZS'); }, [accounts, plannedExpenses, debts]);
   const relevant = accounts.filter((account) => account.currency === currency);
   const total = totals[currency] ?? 0;
@@ -689,6 +816,21 @@ function Analytics({ accounts, plannedExpenses, plannedOccurrences, debts, curre
   const otherInterestAccountIds = Object.keys(byAccount).filter((id) => !relevant.some((account) => account.id === id));
   const visibleBudgets = userBudgets.filter((budget) => budget.currency === currency);
   const spentForBudget = (budget: Budget) => operations.filter((operation) => operation.status !== 'reversed' && !operation.relatedOperationId && operation.kind === 'expense' && operation.category === budget.category && operation.date >= range.from && operation.date <= range.to).map((operation) => operationConversionBasis(operation)).filter((basis) => basis.currency === budget.currency).reduce((sum, basis) => sum + basis.amount, 0);
+  // Same live-operation rule as summarizeOperations (exclude reversed + reversals-of-reversed) so
+  // this breakdown's totals agree with the "РАСХОДЫ" tile above rather than a raw sum that
+  // includes struck-through rows.
+  const reversedOperationIds = new Set(operations.filter((operation) => operation.status === 'reversed').map((operation) => operation.id));
+  const categoryTotals = new Map<string, number>();
+  for (const operation of operations) {
+    if (operation.status === 'reversed' || (operation.relatedOperationId && reversedOperationIds.has(operation.relatedOperationId))) continue;
+    if (operation.kind !== 'expense' || operation.date < range.from || operation.date > range.to) continue;
+    const basis = operationConversionBasis(operation);
+    const converted = convertCurrency(basis.amount, basis.currency, currency, currencySettings);
+    if (converted === null) continue;
+    categoryTotals.set(operation.category, (categoryTotals.get(operation.category) ?? 0) + converted);
+  }
+  const categoryBreakdown = Array.from(categoryTotals.entries()).map(([category, amount]) => ({ category, amount, percent: actual.expense ? amount / actual.expense * 100 : 0 })).sort((a, b) => b.amount - a.amount);
+  const [categoryDrilldown, setCategoryDrilldown] = useState<string | null>(null);
   return <ScrollView contentContainerStyle={s.page} showsVerticalScrollIndicator={false}>
     <Header eyebrow={`${range.from} — ${range.to}`} title="Аналитика" onAvatarPress={onProfile} />
     <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={s.currencyRail}>{([['month', 'Месяц'], ['quarter', 'Квартал'], ['year', 'Год'], ['all', 'Всё время'], ['custom', 'Свой период']] as [AnalyticsPeriod, string][]).map(([value, label]) => <Pressable key={value} style={[s.currencyFilter, period === value && s.currencyFilterActive]} onPress={() => setPeriod(value)}><Text style={[s.currencyFilterText, period === value && s.currencyFilterTextActive]}>{label}</Text></Pressable>)}</ScrollView>
@@ -701,9 +843,17 @@ function Analytics({ accounts, plannedExpenses, plannedOccurrences, debts, curre
       {otherInterestAccountIds.map((accountId) => { const account = accounts.find((item) => item.id === accountId); return <View key={accountId} style={s.assetRow}><View style={s.budgetTop}><Text style={s.rowTitle}>{account?.name ?? 'Проценты'}</Text><Text style={s.income}>+{money(byAccount[accountId] ?? 0, false, currency)}</Text></View><Text style={s.rowSub}>Проценты в {currency} · счёт в другой валюте</Text></View>; })}
     </View>
     <SectionTitle title="Средневзвешенная ставка" /><View style={s.chartCard}><View style={s.budgetTop}><Text style={s.rowTitle}>Все активы · {currencySettings.baseCurrency}</Text><Text style={s.budgetAmount}>{weightedRates.all.toFixed(2)}%</Text></View>{Object.entries(weightedRates.byCurrency).sort(([left], [right]) => left.localeCompare(right)).map(([code, value]) => <View key={code} style={[s.budgetTop, { marginTop: 12 }]}><Text style={s.rowSub}>{code} · {money(value.assets, true, code)}</Text><Text style={s.budgetAmount}>{value.rate.toFixed(2)}%</Text></View>)}</View>
-    <View style={s.metricRow}><View style={s.metric}><Text style={s.metricLabel}>ПАССИВНО</Text><Text style={s.metricValue}>{money(actual.passive, true, currency)}</Text><Text style={s.metricSub}>факт за период</Text></View><View style={s.metric}><Text style={s.metricLabel}>ДОХОДЫ</Text><Text style={s.metricValue}>{money(actual.income, true, currency)}</Text><Text style={s.metricSub}>факт · план {money(planned.income, true, currency)}</Text></View><View style={s.metric}><Text style={s.metricLabel}>РАСХОДЫ</Text><Text style={s.metricValue}>{money(actual.expense, true, currency)}</Text><Text style={s.metricSub}>факт · план {money(planned.expense, true, currency)}</Text></View></View>
+    <View style={s.metricRow}>
+      <Pressable style={s.metric} onPress={() => setDrilldownKind('passive')}><Text style={s.metricLabel}>ПАССИВНО</Text><Text style={s.metricValue}>{money(actual.passive, true, currency)}</Text><Text style={s.metricSub}>факт за период</Text></Pressable>
+      <Pressable style={s.metric} onPress={() => setDrilldownKind('income')}><Text style={s.metricLabel}>ДОХОДЫ</Text><Text style={s.metricValue}>{money(actual.income, true, currency)}</Text><Text style={s.metricSub}>факт · план {money(planned.income, true, currency)}</Text></Pressable>
+      <Pressable style={s.metric} onPress={() => setDrilldownKind('expense')}><Text style={s.metricLabel}>РАСХОДЫ</Text><Text style={s.metricValue}>{money(actual.expense, true, currency)}</Text><Text style={s.metricSub}>факт · план {money(planned.expense, true, currency)}</Text></Pressable>
+    </View>
+    <AnalyticsDrilldownModal visible={drilldownKind !== null} kind={drilldownKind ?? 'income'} operations={operations} plannedExpenses={plannedExpenses} accounts={accounts} currency={currency} range={range} settings={currencySettings} onClose={() => setDrilldownKind(null)} />
     {!!actual.missing.length && <Text style={[s.helperText, { color: C.red, marginBottom: 14 }]}>Не учтены операции без курса: {actual.missing.join(', ')}</Text>}
     <SectionTitle title="Планы" />
+    <Text style={s.fieldLabel}>РАСХОДЫ ПО КАТЕГОРИЯМ</Text>
+    {categoryBreakdown.length ? <View style={s.card}>{categoryBreakdown.map((item, index) => <Pressable key={item.category} style={[s.budgetRow, index > 0 && s.budgetBorder]} onPress={() => setCategoryDrilldown(item.category)}><View style={s.budgetTop}><Text style={s.rowTitle}>{item.category}</Text><Text style={s.budgetAmount}>{money(item.amount, true, currency)}</Text></View><Progress value={item.percent} color={C.blue} /><Text style={s.budgetHint}>{item.percent.toFixed(1)}% от расходов</Text></Pressable>)}</View> : <View style={s.emptyCard}><Text style={s.emptyText}>Расходов за период нет</Text></View>}
+    <AnalyticsDrilldownModal visible={categoryDrilldown !== null} kind="expense" category={categoryDrilldown ?? undefined} operations={operations} plannedExpenses={plannedExpenses} accounts={accounts} currency={currency} range={range} settings={currencySettings} onClose={() => setCategoryDrilldown(null)} />
     <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }}><Text style={s.fieldLabel}>БЮДЖЕТЫ</Text><Pressable onPress={onAddBudget}><Text style={s.link}>+ Бюджет</Text></Pressable></View>
     {visibleBudgets.length ? <View style={s.card}>{visibleBudgets.map((budget, index) => { const spent = spentForBudget(budget); const ratio = budget.limit ? spent / budget.limit * 100 : 0; return <Pressable key={budget.id} style={[s.budgetRow, index > 0 && s.budgetBorder]} onPress={() => onEditBudget(budget)}><View style={s.budgetTop}><Text style={s.rowTitle}>{budget.category}</Text><Text style={s.budgetAmount}>{money(spent, true, currency)} <Text style={s.rowSub}>из {money(budget.limit, true, currency)}</Text></Text></View><Progress value={ratio} color={ratio > 100 ? C.red : C.blue} /><Text style={s.budgetHint}>{Math.round(ratio)}% использовано</Text></Pressable>; })}</View> : <Pressable style={s.emptyCard} onPress={onAddBudget}><Ionicons name="pie-chart-outline" size={24} color={C.blue} /><Text style={s.emptyTitle}>Бюджетов в {currency} пока нет</Text><Text style={s.emptyText}>Задайте месячный лимит для категории</Text></Pressable>}
     <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }}><Text style={s.fieldLabel}>ФИНАНСОВЫЕ ЦЕЛИ</Text><Pressable onPress={onAddGoal}><Text style={s.link}>+ Цель</Text></Pressable></View>
@@ -713,6 +863,72 @@ function Analytics({ accounts, plannedExpenses, plannedOccurrences, debts, curre
     <DatePickerModal visible={dateTarget !== null} value={dateTarget ? customRange[dateTarget] : undefined} onClose={() => setDateTarget(null)} onSelect={(value) => { if (dateTarget === 'from') setCustomRange((current) => ({ from: value, to: value > current.to ? value : current.to })); else if (dateTarget === 'to') setCustomRange((current) => ({ from: value < current.from ? value : current.from, to: value })); setDateTarget(null); }} />
     <View style={{ height: 20 }} />
   </ScrollView>;
+}
+
+function AnalyticsDrilldownModal({ visible, kind, category, operations, plannedExpenses, accounts, currency, range, settings, onClose }: {
+  visible: boolean; kind: 'income' | 'expense' | 'passive'; category?: string; operations: FinancialOperation[]; plannedExpenses: PlannedExpense[]; accounts: Account[];
+  currency: string; range: DateRange; settings: CurrencySettings; onClose: () => void;
+}) {
+  const kindTitle = category ?? (kind === 'passive' ? 'Пассивные доходы' : kind === 'income' ? 'Доходы' : 'Расходы');
+  const reversedIds = new Set(operations.filter((operation) => operation.status === 'reversed').map((operation) => operation.id));
+  const factRows = operations
+    .filter((operation) => operation.status !== 'reversed' && !(operation.relatedOperationId && reversedIds.has(operation.relatedOperationId)) && operation.date >= range.from && operation.date <= range.to)
+    .filter((operation) => kind === 'passive' ? (operation.kind === 'income' && operation.source === 'interest') : operation.kind === kind)
+    .filter((operation) => !category || operation.category === category)
+    .map((operation) => {
+      const basis = operationConversionBasis(operation);
+      const converted = convertCurrency(basis.amount, basis.currency, currency, settings);
+      return converted === null ? null : { operation, amount: converted };
+    })
+    .filter((item): item is { operation: FinancialOperation; amount: number } => item !== null)
+    .sort((a, b) => b.operation.date.localeCompare(a.operation.date));
+  const activeFact = kind === 'income' ? factRows.filter((item) => item.operation.source !== 'interest') : factRows;
+  const passiveFact = kind === 'income' ? factRows.filter((item) => item.operation.source === 'interest') : [];
+  const plannedRows: { flow: PlannedExpense; date: string; amount: number }[] = [];
+  if (kind !== 'passive') {
+    const start = parseLocalDate(range.from); const end = parseLocalDate(range.to);
+    if (start && end) for (let cursor = range.from; cursor <= range.to; cursor = addLocalDays(cursor, 1)) {
+      const date = parseLocalDate(cursor);
+      if (!date) break;
+      for (const flow of plannedExpenses) {
+        if (flow.kind !== kind || (category && flow.category !== category) || !occursOn(flow, date)) continue;
+        const account = accounts.find((item) => item.id === flow.accountId);
+        const amount = flowAmountInCurrency(flow, account, currency, settings);
+        if (amount === null) continue;
+        plannedRows.push({ flow, date: cursor, amount });
+      }
+    }
+  }
+  const factTotal = factRows.reduce((sum, item) => sum + item.amount, 0);
+  const plannedTotal = plannedRows.reduce((sum, item) => sum + item.amount, 0);
+  const renderFactRow = (item: { operation: FinancialOperation; amount: number }, isLast: boolean) => {
+    const account = accounts.find((acc) => acc.id === item.operation.accountId);
+    return <View key={item.operation.id}><View style={s.eventRow}>
+      <View style={[s.roundIcon, { backgroundColor: item.operation.kind === 'income' ? C.sageSoft : C.redSoft }]}><Ionicons name={item.operation.kind === 'income' ? 'sparkles-outline' : 'receipt-outline'} size={19} color={item.operation.kind === 'income' ? C.green : C.red} /></View>
+      <View style={{ flex: 1 }}><Text style={s.rowTitle}>{item.operation.title || item.operation.category}</Text><Text style={s.rowSub}>{item.operation.date} · {account?.name ?? 'Счёт удалён'}</Text></View>
+      <Text style={item.operation.kind === 'income' ? s.income : s.expense}>{item.operation.kind === 'income' ? '+' : '−'}{money(item.amount, false, currency)}</Text>
+    </View>{!isLast && <View style={s.divider} />}</View>;
+  };
+  return <Modal visible={visible} animationType="slide" presentationStyle="pageSheet" onRequestClose={onClose}><SafeAreaView style={s.modal} edges={['top', 'bottom']}>
+    <View style={s.modalHead}><Pressable onPress={onClose} style={s.close}><Ionicons name="close" size={22} color={C.ink} /></Pressable><Text style={s.modalTitle}>{kindTitle}</Text><View style={{ width: 40 }} /></View>
+    <ScrollView contentContainerStyle={s.formBody}>
+      <View style={s.chartCard}><Text style={s.chartLabel}>ИТОГО ФАКТ · {currency}</Text><Text style={s.chartValue}>{money(factTotal, false, currency)}</Text><Text style={[s.rowSub, { marginTop: 7 }]}>{range.from} — {range.to}</Text></View>
+      {kind === 'income' ? <>
+        <SectionTitle title="Активные доходы" />
+        {activeFact.length ? <View style={s.card}>{activeFact.map((item, index) => renderFactRow(item, index === activeFact.length - 1))}</View> : <View style={s.emptyCard}><Text style={s.emptyText}>Нет активных доходов за период</Text></View>}
+        <SectionTitle title="Пассивные доходы" />
+        {passiveFact.length ? <View style={s.card}>{passiveFact.map((item, index) => renderFactRow(item, index === passiveFact.length - 1))}</View> : <View style={s.emptyCard}><Text style={s.emptyText}>Нет пассивных доходов за период</Text></View>}
+      </> : <>
+        <SectionTitle title="Фактические операции" />
+        {factRows.length ? <View style={s.card}>{factRows.map((item, index) => renderFactRow(item, index === factRows.length - 1))}</View> : <View style={s.emptyCard}><Text style={s.emptyText}>Операций за период нет</Text></View>}
+      </>}
+      {kind !== 'passive' && <>
+        <SectionTitle title="Плановые события" />
+        {plannedRows.length ? <View style={s.card}>{plannedRows.map((item, index) => <View key={`${item.flow.id}-${item.date}`}><View style={s.eventRow}><View style={[s.roundIcon, { backgroundColor: C.bg }]}><Ionicons name="repeat-outline" size={19} color={C.muted} /></View><View style={{ flex: 1 }}><Text style={s.rowTitle}>{item.flow.title}</Text><Text style={s.rowSub}>{item.date}</Text></View><Text style={item.flow.kind === 'income' ? s.income : s.expense}>{item.flow.kind === 'income' ? '+' : '−'}{money(item.amount, false, currency)}</Text></View>{index < plannedRows.length - 1 && <View style={s.divider} />}</View>)}</View> : <View style={s.emptyCard}><Text style={s.emptyText}>Плановых событий в этом периоде нет</Text></View>}
+        <Text style={[s.rowSub, { marginTop: 8 }]}>План за период: {money(plannedTotal, false, currency)}</Text>
+      </>}
+    </ScrollView>
+  </SafeAreaView></Modal>;
 }
 
 function Profile({ email, accounts, currencySettings, onCurrencySettings, onBack, pendingSmsDrafts, onSmsDraftsChanged }: { email?: string; accounts: Account[]; currencySettings: CurrencySettings; onCurrencySettings: () => void; onBack: () => void; pendingSmsDrafts: number; onSmsDraftsChanged: () => void }) {
@@ -1719,7 +1935,7 @@ function AppContent({ userId, email }: { userId: string; email?: string }) {
     if (tab === 'calendar') return <Calendar accounts={userAccounts} plannedExpenses={plannedExpenses} plannedOccurrences={plannedOccurrences} debts={debts} currencySettings={currencySettings} onAddExpense={openNewExpense} onEditExpense={openExpense} onExecuteOccurrence={handleOpenOccurrence} onCancelOccurrence={handleCancelOccurrence} onProfile={onProfile} operations={operations} transfers={transfers} />;
     if (tab === 'operations') return <Operations operations={operations} transfers={transfers} plannedOccurrences={plannedOccurrences} plannedExpenses={plannedExpenses} accounts={userAccounts} onAdd={() => setOperationEditorOpen(true)} onTransfer={() => setTransferModalOpen(true)} onReverseTransfer={handleReverseTransfer} onExecuteOccurrence={handleOpenOccurrence} onCancelOccurrence={handleCancelOccurrence} onProfile={onProfile} />;
     if (tab === 'analytics') return <Analytics accounts={userAccounts} plannedExpenses={plannedExpenses} plannedOccurrences={plannedOccurrences} debts={debts} currencySettings={currencySettings} operations={operations} transfers={transfers} userBudgets={userBudgets} financialGoals={financialGoals} onAddBudget={openNewBudget} onEditBudget={openBudget} onAddGoal={openNewGoal} onEditGoal={openGoal} onProfile={onProfile} />;
-    return <Home onImport={() => setImportOpen(true)} go={setTab} accounts={userAccounts} plannedExpenses={plannedExpenses} plannedOccurrences={plannedOccurrences} debts={debts} currencySettings={currencySettings} onCurrencySettings={() => setCurrencySettingsOpen(true)} onProfile={onProfile} pendingImportDrafts={pendingSmsDrafts} operations={operations} transfers={transfers} />;
+    return <Home onImport={() => setImportOpen(true)} go={setTab} accounts={userAccounts} plannedExpenses={plannedExpenses} plannedOccurrences={plannedOccurrences} debts={debts} currencySettings={currencySettings} onCurrencySettings={() => setCurrencySettingsOpen(true)} onProfile={onProfile} pendingImportDrafts={pendingSmsDrafts} operations={operations} transfers={transfers} onEditAccount={openAccount} />;
   }, [tab, userAccounts, plannedExpenses, plannedOccurrences, debts, currencySettings, operations, transfers, userBudgets, financialGoals, email, pendingSmsDrafts]);
   return <SafeAreaView style={s.safe} edges={['top']}>
     <StatusBar style="dark" />
@@ -1959,6 +2175,8 @@ const s = StyleSheet.create({
   accountActions: { flexDirection: 'row', gap: 9, marginBottom: 14 }, importAccountButton: { flex: 1, minHeight: 48, backgroundColor: C.navy, borderRadius: 14, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 7 }, importAccountText: { color: 'white', fontSize: 12, fontWeight: '700' }, manualAccountButton: { flex: 1, minHeight: 48, backgroundColor: '#DDEEF4', borderRadius: 14, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 7 }, manualAccountText: { color: C.blue, fontSize: 12, fontWeight: '700' },
   filterPanel: { gap: 9, marginBottom: 10 }, filterRail: { gap: 7, paddingRight: 8 }, debtGroupTitle: { color: C.muted, fontSize: 11, fontWeight: '700', letterSpacing: .7, marginTop: 4, marginBottom: 7, textTransform: 'uppercase' },
   groupHeader: { minHeight: 52, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: 12, marginTop: 4 },
+  dayGroupHeader: { minHeight: 30, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingBottom: 8 },
+  dayGroupLabel: { color: C.ink, fontSize: 13, fontWeight: '700' },
   planExpenseButton: { minHeight: 50, backgroundColor: C.navy, borderRadius: 15, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 8, marginBottom: 14 },
   currencySettingsButton: { minHeight: 46, backgroundColor: '#DDEEF4', borderRadius: 14, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 8, marginBottom: 12 },
   secondaryAction: { minHeight: 48, borderRadius: 14, backgroundColor: '#DDEEF4', flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 8, marginTop: 10 },

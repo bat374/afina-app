@@ -64,7 +64,7 @@ export const flowAmountInCurrency = (flow: PlannedExpense, account: Account | un
   return settings ? convertCurrency(nativeAmount, nativeCurrency, currency, settings) : null;
 };
 
-export function buildMonthProjection(accounts: Account[], currency: string, year: number, month: number, plannedExpenses: PlannedExpense[] = [], debts: Debt[] = [], settings?: CurrencySettings, today = localToday(), plannedOccurrences: PlannedOccurrence[] = [], operations: FinancialOperation[] = [], transfers: Transfer[] = []) {
+export function buildMonthProjection(accounts: Account[], currency: string, year: number, month: number, plannedExpenses: PlannedExpense[] = [], debts: Debt[] = [], settings?: CurrencySettings, today = localToday(), plannedOccurrences: PlannedOccurrence[] = [], operations: FinancialOperation[] = [], transfers: Transfer[] = [], accountFilter?: (account: Account) => boolean) {
   // A flow's occurrence for "today" can already be resolved (executed or cancelled) by the time
   // this projection runs — "today" itself doesn't count as `past` below, so without this the same
   // flow would otherwise be counted once as a real operation (already in account.balance) and a
@@ -73,7 +73,7 @@ export function buildMonthProjection(accounts: Account[], currency: string, year
     plannedOccurrences.filter((occurrence) => occurrence.status !== 'planned').map((occurrence) => `${occurrence.flowId}|${occurrence.occurrenceDate}`),
   );
   const count = new Date(year, month + 1, 0).getDate();
-  const relevant = accounts.filter((account) => account.currency === currency);
+  const relevant = accounts.filter((account) => account.currency === currency && (!accountFilter || accountFilter(account)));
   const trackedIds = new Set(relevant.map((account) => account.id));
   const runningPrincipal = new Map(relevant.map((account) => [account.id, account.balance]));
   let balance = relevant.reduce((sum, account) => sum + account.balance, 0);
@@ -164,6 +164,7 @@ export function buildMonthProjection(accounts: Account[], currency: string, year
     if (!past) for (const expense of plannedExpenses) {
       if (resolvedOccurrenceKeys.has(`${expense.id}|${date}`)) continue;
       const linkedAccount = accounts.find((item) => item.id === expense.accountId);
+      if (linkedAccount && accountFilter && !accountFilter(linkedAccount)) continue;
       const amount = flowAmountInCurrency(expense, linkedAccount, currency, settings);
       if (amount === null || !occursOn(expense, current)) continue;
       if (expense.kind === 'income') { income += amount; balance += amount; }
@@ -176,6 +177,8 @@ export function buildMonthProjection(accounts: Account[], currency: string, year
     if (!past) for (const debt of debts.filter((item) => item.currency === currency && item.status !== 'paid' && item.currentBalance > 0)) {
       const dueDate = parseLocalDate(debt.dueDate);
       if (!dueDate || !sameDay(current, dueDate)) continue;
+      const linkedDebtAccount = accounts.find((item) => item.id === debt.accountId);
+      if (linkedDebtAccount && accountFilter && !accountFilter(linkedDebtAccount)) continue;
       if (debt.direction === 'owed_to_me') {
         income += debt.currentBalance;
         balance += debt.currentBalance;
