@@ -931,29 +931,25 @@ export function reverseDebtPayment(debtId: string, historyId: string, fallbackAc
       const restored = Math.min(debt.original_amount, debt.current_balance + history.amount!);
       const status: DebtStatus = debt.due_date < localToday() ? 'overdue' : 'active';
       await db.runAsync('UPDATE debts SET current_balance = ?, status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?', restored, status, debtId);
-      let reversalOperationId: string | undefined;
+      // Mirrors reverseTransfer: undo the original balance effect directly and mark the original
+      // operation reversed (so it drops out of analytics, same as summarizeOperations already
+      // does for status==='reversed'). Deliberately does NOT insert a new opposite-kind operation
+      // — that used to make an erroneous payment's cancellation itself show up as a fresh real
+      // income/expense in whatever period the cancellation happens to fall in, even though no
+      // money should ever have moved in the first place.
       if (accountId) {
         const account = await db.getFirstAsync<{ currency: string }>('SELECT currency FROM accounts WHERE id = ?', accountId);
         if (!account) throw new Error('Счёт исходного погашения не найден');
         const accountAmount = operation?.account_amount ?? await convertUsingStoredRates(db, history.amount!, debt.currency, account.currency);
         const originalKind = operation?.kind ?? (debt.direction === 'owed_to_me' ? 'income' : 'expense');
-        const reverseKind = originalKind === 'income' ? 'expense' : 'income';
-        const delta = reverseKind === 'income' ? accountAmount : -accountAmount;
+        const delta = originalKind === 'income' ? -accountAmount : accountAmount;
         await db.runAsync('UPDATE accounts SET balance = balance + ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?', delta, accountId);
-        reversalOperationId = makeId();
-        await db.runAsync(
-          `INSERT INTO operations (id, title, category, amount, currency, account_id, date, kind, source,
-          debt_id, related_operation_id, account_amount, account_currency, status)
-         VALUES (?, ?, 'Долги', ?, ?, ?, ?, ?, 'debt', ?, ?, ?, ?, 'posted')`,
-          reversalOperationId, `Отмена погашения · ${debt.person}`, history.amount, debt.currency, accountId,
-          localToday(), reverseKind, debtId, operation?.id ?? null, accountAmount, account.currency,
-        );
         if (operation) await db.runAsync("UPDATE operations SET status = 'reversed' WHERE id = ?", operation.id);
       }
       await db.runAsync(
         `INSERT INTO debt_history (id, debt_id, type, amount, occurred_at, note, operation_id, related_history_id)
        VALUES (?, ?, 'payment_reversed', ?, ?, ?, ?, ?)`,
-        makeId(), debtId, history.amount, new Date().toISOString(), 'Ошибочное погашение отменено', reversalOperationId ?? null, historyId,
+        makeId(), debtId, history.amount, new Date().toISOString(), 'Ошибочное погашение отменено', null, historyId,
       );
     });
   });

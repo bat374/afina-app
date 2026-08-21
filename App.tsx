@@ -158,9 +158,9 @@ function Home({ onImport, go, accounts, plannedExpenses, plannedOccurrences, deb
       <View style={s.heroRule} />
       <Text style={[s.heroStatLabel, { marginBottom: 8 }]}>{heroPeriodLabel.toUpperCase()}</Text>
       <View style={s.heroStats}>
-        <View><Text style={s.heroStatLabel}>Активные доходы</Text><Text style={s.heroStat}>+{money(heroActual.income - heroActual.passive, true, primaryCurrency)}</Text></View>
-        <View><Text style={s.heroStatLabel}>Расходы</Text><Text style={s.heroStat}>{money(heroActual.expense, true, primaryCurrency)}</Text></View>
-        <View><Text style={s.heroStatLabel}>Пассивные доходы</Text><Text style={s.heroStat}>+{money(heroActual.passive, true, primaryCurrency)}</Text></View>
+        <View style={{ flex: 1 }}><Text style={s.heroStatLabel}>Активные доходы</Text><Text style={s.heroStat}>+{money(heroActual.income - heroActual.passive, true, primaryCurrency)}</Text></View>
+        <View style={{ flex: 1, alignItems: 'center' }}><Text style={s.heroStatLabel}>Расходы</Text><Text style={s.heroStat}>{money(heroActual.expense, true, primaryCurrency)}</Text></View>
+        <View style={{ flex: 1, alignItems: 'flex-end' }}><Text style={[s.heroStatLabel, { textAlign: 'right' }]}>Пассивные доходы</Text><Text style={s.heroStat}>+{money(heroActual.passive, true, primaryCurrency)}</Text></View>
       </View>
     </View>
 
@@ -456,20 +456,20 @@ function Operations({ operations, transfers, plannedOccurrences, plannedExpenses
   const bucketDateOf = (entry: DisplayRow): string => entry.kind === 'single' ? entry.row.date : entry.operations[0]!.date;
   // Only computed when the whole screen is already single-currency (summaryCurrency defined) --
   // same guard as the top tiles, so a per-day total never silently sums two currencies together.
-  const dayNetByDate = new Map<string, number>();
+  // Expenses only (not net income-expense, not transfers) -- matches the reference pattern from
+  // Sberbank's own history screen, where the day header shows that day's total spend.
+  const dayExpenseByDate = new Map<string, number>();
   if (summaryCurrency) {
     for (const entry of displayRows) {
       const date = bucketDateOf(entry);
       let delta = 0;
       if (entry.kind === 'single' && entry.row.kind === 'operation') {
         const op = entry.row.operation;
-        if (op.currency === summaryCurrency && op.status !== 'reversed' && !(op.relatedOperationId && reversedOperationIds.has(op.relatedOperationId))) {
-          delta = op.kind === 'income' ? op.amount : -op.amount;
+        if (op.kind === 'expense' && op.currency === summaryCurrency && op.status !== 'reversed' && !(op.relatedOperationId && reversedOperationIds.has(op.relatedOperationId))) {
+          delta = op.amount;
         }
-      } else if (entry.kind === 'interestGroup') {
-        delta = entry.operations.filter((op) => op.currency === summaryCurrency).reduce((sum, op) => sum + op.amount, 0);
       }
-      dayNetByDate.set(date, (dayNetByDate.get(date) ?? 0) + delta);
+      if (delta) dayExpenseByDate.set(date, (dayExpenseByDate.get(date) ?? 0) + delta);
     }
   }
   const renderOperation = (operation: FinancialOperation) => {
@@ -526,7 +526,7 @@ function Operations({ operations, transfers, plannedOccurrences, plannedExpenses
       const header = index === 0 || bucketDateOf(displayRows[index - 1]!) !== bucketDate
         ? <View key={`hdr-${bucketDate}`} style={[s.dayGroupHeader, index > 0 && { marginTop: 14 }]}>
             <Text style={s.dayGroupLabel}>{dayGroupLabel(bucketDate)}</Text>
-            {dayNetByDate.has(bucketDate) && <Text style={(dayNetByDate.get(bucketDate) ?? 0) >= 0 ? s.income : s.expense}>{(dayNetByDate.get(bucketDate) ?? 0) >= 0 ? '+' : '−'}{money(Math.abs(dayNetByDate.get(bucketDate) ?? 0), true, summaryCurrency!)}</Text>}
+            {dayExpenseByDate.has(bucketDate) && <Text style={s.expense}>−{money(dayExpenseByDate.get(bucketDate) ?? 0, true, summaryCurrency!)}</Text>}
           </View>
         : null;
       let content: React.ReactNode;
@@ -2159,7 +2159,7 @@ const s = StyleSheet.create({
   safe: { flex: 1, backgroundColor: C.bg }, screen: { flex: 1 }, page: { padding: 20, paddingBottom: 24 },
   header: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 22 }, eyebrow: { fontSize: 11, letterSpacing: 1.6, color: C.muted, fontWeight: '700', marginBottom: 4 }, title: { fontSize: 28, fontWeight: '700', color: C.ink, letterSpacing: -.7 },
   avatar: { width: 42, height: 42, borderRadius: 21, backgroundColor: '#D8EAF2', alignItems: 'center', justifyContent: 'center' }, avatarText: { color: C.navy, fontSize: 17, fontWeight: '700' },
-  hero: { backgroundColor: C.navy, borderRadius: 24, padding: 22, marginBottom: 14 }, heroLabel: { color: '#AFC0C7', fontSize: 10, letterSpacing: 1.5, fontWeight: '700' }, heroAmount: { color: 'white', fontSize: 30, fontWeight: '700', marginTop: 8, letterSpacing: -.5 }, heroOtherCurrency: { color: '#C6D5DB', fontSize: 13, fontWeight: '600', marginTop: 4 }, heroDelta: { flexDirection: 'row', alignItems: 'center', marginTop: 7 }, heroDeltaText: { color: '#DCE7DD', fontSize: 12 }, heroRule: { height: 1, backgroundColor: '#49606B', marginVertical: 18 }, heroStats: { flexDirection: 'row', justifyContent: 'space-between' }, heroStatLabel: { color: '#AFC0C7', fontSize: 11, marginBottom: 5 }, heroStat: { color: 'white', fontSize: 13, fontWeight: '700' },
+  hero: { backgroundColor: C.navy, borderRadius: 24, padding: 22, marginBottom: 14 }, heroLabel: { color: '#AFC0C7', fontSize: 10, letterSpacing: 1.5, fontWeight: '700' }, heroAmount: { color: 'white', fontSize: 30, fontWeight: '700', marginTop: 8, letterSpacing: -.5 }, heroOtherCurrency: { color: '#C6D5DB', fontSize: 13, fontWeight: '600', marginTop: 4 }, heroDelta: { flexDirection: 'row', alignItems: 'center', marginTop: 7 }, heroDeltaText: { color: '#DCE7DD', fontSize: 12 }, heroRule: { height: 1, backgroundColor: '#49606B', marginVertical: 18 }, heroStats: { flexDirection: 'row', justifyContent: 'space-between', gap: 8 }, heroStatLabel: { color: '#AFC0C7', fontSize: 11, marginBottom: 5 }, heroStat: { color: 'white', fontSize: 13, fontWeight: '700' },
   scanButton: { flexDirection: 'row', alignItems: 'center', gap: 12, backgroundColor: '#D7EAF2', borderRadius: 18, padding: 14, marginBottom: 12 }, scanIcon: { width: 42, height: 42, borderRadius: 13, backgroundColor: '#EDF7FA', alignItems: 'center', justifyContent: 'center' }, scanTitle: { color: C.ink, fontSize: 15, fontWeight: '700' }, scanSub: { color: C.muted, fontSize: 12, marginTop: 2 },
   alert: { flexDirection: 'row', alignItems: 'center', backgroundColor: C.redSoft, borderRadius: 18, padding: 15, marginBottom: 24, gap: 12 }, alertIcon: { width: 38, height: 38, borderRadius: 19, backgroundColor: '#F7D6D1', alignItems: 'center', justifyContent: 'center' }, alertTitle: { color: '#873A35', fontSize: 14, fontWeight: '700' }, alertText: { color: '#A25C56', fontSize: 12, marginTop: 3 },
   sectionHead: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginTop: 4, marginBottom: 11 }, sectionTitle: { color: C.ink, fontSize: 18, fontWeight: '700' }, link: { color: C.blue, fontSize: 13, fontWeight: '600' }, card: { backgroundColor: C.card, borderRadius: 18, paddingHorizontal: 16, marginBottom: 22 },
