@@ -11,8 +11,10 @@ import { Ionicons } from '@expo/vector-icons';
 import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
 import { budgets, calendarDays, goals, transactions } from './src/data';
 import { money, percent } from './src/format';
-import { Account, AccountType, Budget, CashFlowKind, CurrencySettings, Debt, DebtDirection, DebtHistory, DepositRateHistory, ExpenseRepeat, FinancialGoal, FinancialOperation, GoalType, ImportDraft, InterestSchedule, PlannedExecutionInput, PlannedExpense, PlannedOccurrence, RecurrenceUnit, Transfer, TransferInput, WithdrawalPolicy } from './src/types';
-import { AccountInput, BudgetInput, cancelPlannedOccurrence, confirmImportDraft, confirmImportDraftAsTransfer, countPendingImportDrafts, createDebt, createImportDraft, createOperation, DebtInput, deleteAccount, deleteBudget, deleteFinancialGoal, deletePlannedExpense, dismissImportDraft, executePlannedOccurrence, extendDebt, extendDepositRate, FinancialGoalInput, FinancialOperationInput, getCurrencySettings, getSmsScanWatermark, initializeDatabase, listAccounts, listBudgets, listDebtHistory, listDebts, listDepositRateHistory, listFinancialGoals, listImportDrafts, listOperations, listPlannedExpenses, listPlannedOccurrences, listTransfers, markDebtOverdue, PlannedExpenseInput, recordDebtPayment, recordTransfer, rematchImportDrafts, reverseDebtPayment, reverseTransfer, saveAccount, saveBudget, saveCurrencySettings, saveFinancialGoal, savePlannedExpense, setSmsScanWatermark, synchronizeInterestPostings, synchronizePlannedOccurrences, updateDebt } from './src/database';
+import { Account, AccountType, AiChatMessage, AiProposal, Budget, CashFlowKind, CurrencySettings, Debt, DebtDirection, DebtHistory, DepositRateHistory, ExpenseRepeat, FinancialGoal, FinancialOperation, GoalType, ImportDraft, InterestSchedule, PlannedExecutionInput, PlannedExpense, PlannedOccurrence, RecurrenceUnit, Transfer, TransferInput, WithdrawalPolicy } from './src/types';
+import { AccountInput, BudgetInput, cancelPlannedOccurrence, clearAiChat, commitAiProposal, confirmImportDraft, confirmImportDraftAsTransfer, countPendingAiProposals, countPendingImportDrafts, createDebt, createImportDraft, createOperation, DebtInput, deleteAccount, deleteBudget, deleteFinancialGoal, deletePlannedExpense, dismissAiProposal, dismissImportDraft, executePlannedOccurrence, extendDebt, extendDepositRate, FinancialGoalInput, FinancialOperationInput, getCurrencySettings, getSmsScanWatermark, initializeDatabase, listAccounts, listAiChatMessages, listAiProposals, listBudgets, listDebtHistory, listDebts, listDepositRateHistory, listFinancialGoals, listImportDrafts, listOperations, listPlannedExpenses, listPlannedOccurrences, listTransfers, markDebtOverdue, PlannedExpenseInput, recordDebtPayment, recordTransfer, rematchImportDrafts, reverseDebtPayment, reverseTransfer, saveAccount, saveBudget, saveCurrencySettings, saveFinancialGoal, savePlannedExpense, setSmsScanWatermark, synchronizeInterestPostings, synchronizePlannedOccurrences, updateDebt } from './src/database';
+import { sendUserMessage } from './src/ai/loop';
+import { extractReceiptText } from './src/ai/receipt';
 import { parsersForSender, parseSms } from './src/sms/registry';
 import { parsePush } from './src/push/registry';
 import { KNOWN_BANK_PACKAGES } from './src/push/packages';
@@ -140,7 +142,10 @@ function Home({ onImport, go, accounts, plannedExpenses, plannedOccurrences, deb
   // interest schedule rather than what was actually posted this period, which isn't the same
   // number once any day in the period has an actual, possibly-differing bank-credited amount.
   const heroRange = analyticsRange('month', localToday());
-  const heroActual = summarizeOperations(operations, primaryCurrency, heroRange, currencySettings);
+  // Base currency (not primaryCurrency, which is just "UZS if any account has it, else
+  // alphabetical") — these three figures are meant to be the user's one across-accounts view,
+  // so they're converted via the same system rates consolidatedNetWorth above already uses.
+  const heroActual = summarizeOperations(operations, currencySettings.baseCurrency, heroRange, currencySettings);
   const heroPeriodLabel = `за ${now.toLocaleString('ru-RU', { month: 'long' })} ${now.getFullYear()}`;
   const risk = projection.days.find((day) => day.risky);
   const events = projection.events.filter((event) => event.day >= now.getDate()).slice(0, 3);
@@ -156,12 +161,13 @@ function Home({ onImport, go, accounts, plannedExpenses, plannedOccurrences, deb
       </Pressable>
       <View style={s.heroDelta}><Ionicons name="cloud-done-outline" size={14} color="#DCE7DD" /><Text style={s.heroDeltaText}> Данные синхронизируются с облаком</Text></View>
       <View style={s.heroRule} />
-      <Text style={[s.heroStatLabel, { marginBottom: 8 }]}>{heroPeriodLabel.toUpperCase()}</Text>
+      <Text style={[s.heroStatLabel, { marginBottom: 8, textAlign: 'center' }]}>{heroPeriodLabel.toUpperCase()} · {currencySettings.baseCurrency}</Text>
       <View style={s.heroStats}>
-        <View style={{ flex: 1 }}><Text style={s.heroStatLabel}>Активные доходы</Text><Text style={s.heroStat}>+{money(heroActual.income - heroActual.passive, true, primaryCurrency)}</Text></View>
-        <View style={{ flex: 1, alignItems: 'center' }}><Text style={s.heroStatLabel}>Расходы</Text><Text style={s.heroStat}>{money(heroActual.expense, true, primaryCurrency)}</Text></View>
-        <View style={{ flex: 1, alignItems: 'flex-end' }}><Text style={[s.heroStatLabel, { textAlign: 'right' }]}>Пассивные доходы</Text><Text style={s.heroStat}>+{money(heroActual.passive, true, primaryCurrency)}</Text></View>
+        <View style={s.heroStatCol}><Text style={[s.heroStatLabel, s.heroStatLabelBox]}>Активные доходы</Text><Text style={s.heroStat}>+{money(heroActual.income - heroActual.passive, true, currencySettings.baseCurrency)}</Text></View>
+        <View style={s.heroStatCol}><Text style={[s.heroStatLabel, s.heroStatLabelBox]}>Расходы</Text><Text style={s.heroStat}>{money(heroActual.expense, true, currencySettings.baseCurrency)}</Text></View>
+        <View style={s.heroStatCol}><Text style={[s.heroStatLabel, s.heroStatLabelBox]}>Пассивные доходы</Text><Text style={s.heroStat}>+{money(heroActual.passive, true, currencySettings.baseCurrency)}</Text></View>
       </View>
+      {!!heroActual.missing.length && <Text style={[s.heroOtherCurrency, { marginTop: 8 }]}>Без курса: {heroActual.missing.join(', ')}</Text>}
     </View>
 
     <Pressable style={s.currencySettingsButton} onPress={onCurrencySettings}><Ionicons name="swap-horizontal-outline" size={19} color={C.blue} /><Text style={s.manualAccountText}>Базовая валюта и курсы</Text></Pressable>
@@ -772,6 +778,116 @@ function ImportDraftsModal({ visible, accounts, onClose }: { visible: boolean; a
   </Modal>;
 }
 
+// Human-readable summary of a proposal payload for the confirm card -- one line per kind, since
+// each kind's fields differ (see AiProposalPayload in src/types.ts).
+function describeAiProposal(proposal: AiProposal, accounts: Account[]): { title: string; amount: number; currency: string; positive: boolean } {
+  const payload = proposal.payload;
+  if (payload.kind === 'operation') return { title: payload.title, amount: payload.amount, currency: payload.currency, positive: payload.operationKind === 'income' };
+  if (payload.kind === 'transfer') return { title: 'Перевод между счетами', amount: payload.fromAmount, currency: accounts.find((account) => account.id === payload.fromAccountId)?.currency ?? '', positive: false };
+  if (payload.kind === 'debt') return { title: `Долг · ${payload.person}`, amount: payload.originalAmount, currency: payload.currency, positive: payload.direction === 'owed_to_me' };
+  if (payload.kind === 'debt_payment') return { title: 'Погашение долга', amount: payload.amount, currency: accounts.find((account) => account.id === payload.accountId)?.currency ?? '', positive: false };
+  if (payload.kind === 'planned_flow') return { title: payload.title, amount: payload.amount, currency: payload.currency, positive: payload.flowKind === 'income' };
+  return { title: payload.title, amount: payload.totalAmount, currency: payload.currency, positive: false };
+}
+
+function AiProposalCard({ proposal, accounts, debts, onConfirmed, onDismissed }: { proposal: AiProposal; accounts: Account[]; debts: Debt[]; onConfirmed: () => void; onDismissed: () => void }) {
+  const payload = proposal.payload;
+  const [accountId, setAccountId] = useState<string | undefined>(
+    payload.kind === 'operation' || payload.kind === 'transfer' || payload.kind === 'debt' || payload.kind === 'debt_payment' || payload.kind === 'planned_flow'
+      ? (payload.kind === 'transfer' ? payload.fromAccountId : payload.accountId) : payload.kind === 'bill_split' ? payload.payingAccountId : undefined,
+  );
+  // Transfer is the one proposal kind with two account sides — the destination must be just as
+  // visible/editable as the source before the user confirms moving money, not just implied.
+  const [toAccountId, setToAccountId] = useState<string | undefined>(payload.kind === 'transfer' ? payload.toAccountId : undefined);
+  const [debtId, setDebtId] = useState<string | undefined>(payload.kind === 'debt_payment' ? payload.debtId : undefined);
+  const [confirming, setConfirming] = useState(false);
+  const description = describeAiProposal(proposal, accounts);
+  const needsAccount = payload.kind !== 'debt_payment' ? !accountId : false;
+  const needsToAccount = payload.kind === 'transfer' && (!toAccountId || toAccountId === accountId);
+  const needsDebt = payload.kind === 'debt_payment' && !debtId;
+  const canConfirm = !needsAccount && !needsToAccount && !needsDebt;
+  const handleConfirm = async () => {
+    setConfirming(true);
+    try {
+      if (payload.kind === 'debt_payment') payload.debtId = debtId;
+      else if (payload.kind === 'transfer') { payload.fromAccountId = accountId; payload.toAccountId = toAccountId; }
+      else if (payload.kind === 'bill_split') payload.payingAccountId = accountId;
+      else payload.accountId = accountId;
+      await commitAiProposal(proposal.id);
+      onConfirmed();
+    } catch (error) {
+      Alert.alert('Не удалось подтвердить', describeError(error) ?? 'Проверьте данные и попробуйте ещё раз.');
+    } finally {
+      setConfirming(false);
+    }
+  };
+  const handleDismiss = async () => { await dismissAiProposal(proposal.id); onDismissed(); };
+  return <View style={[s.card, { padding: 16, marginTop: 8 }]}>
+    <View style={s.budgetTop}><Text style={s.rowTitle}>{description.title}</Text><Text style={description.positive ? s.income : s.expense}>{description.positive ? '+' : ''}{money(description.amount, false, description.currency)}</Text></View>
+    {payload.kind === 'transfer' && <Text style={s.rowSub}>Зачисление: {money(payload.toAmount, false, accounts.find((account) => account.id === toAccountId)?.currency ?? '')}</Text>}
+    {payload.kind === 'bill_split' && <Text style={s.rowSub}>{payload.participants.map((participant) => `${participant.name}: ${money(participant.amount ?? 0, false, payload.currency)}`).join(' · ')}</Text>}
+    {needsAccount && <><Text style={[s.fieldLabel, { marginTop: 8 }]}>{payload.kind === 'transfer' ? 'СЧЁТ СПИСАНИЯ' : 'СЧЁТ'}</Text><View style={s.targetList}>{accounts.map((account) => <Pressable key={account.id} style={[s.targetAccount, accountId === account.id && s.targetAccountActive]} onPress={() => setAccountId(account.id)}><Text style={s.targetAccountText}>{account.name} · {account.currency}</Text></Pressable>)}</View></>}
+    {payload.kind === 'transfer' && <><Text style={[s.fieldLabel, { marginTop: 8 }]}>СЧЁТ ЗАЧИСЛЕНИЯ</Text><View style={s.targetList}>{accounts.filter((account) => account.id !== accountId).map((account) => <Pressable key={account.id} style={[s.targetAccount, toAccountId === account.id && s.targetAccountActive]} onPress={() => setToAccountId(account.id)}><Text style={s.targetAccountText}>{account.name} · {account.currency}</Text></Pressable>)}</View></>}
+    {needsDebt && <><Text style={[s.fieldLabel, { marginTop: 8 }]}>ДОЛГ</Text><View style={s.targetList}>{debts.filter((debt) => debt.status !== 'paid').map((debt) => <Pressable key={debt.id} style={[s.targetAccount, debtId === debt.id && s.targetAccountActive]} onPress={() => setDebtId(debt.id)}><Text style={s.targetAccountText}>{debt.person} · {money(debt.currentBalance, false, debt.currency)}</Text></Pressable>)}</View></>}
+    <View style={{ flexDirection: 'row', gap: 10, marginTop: 12 }}>
+      <Pressable style={[s.secondaryButton, { flex: 1 }]} onPress={handleDismiss}><Text style={s.secondaryText}>Отклонить</Text></Pressable>
+      <Pressable style={[s.primaryButton, { flex: 1 }, (!canConfirm || confirming) && { opacity: .5 }]} disabled={!canConfirm || confirming} onPress={handleConfirm}><Text style={s.primaryText}>{confirming ? 'Подтверждаем…' : 'Подтвердить'}</Text></Pressable>
+    </View>
+  </View>;
+}
+
+function AiAssistantModal({ visible, accounts, debts, onClose }: { visible: boolean; accounts: Account[]; debts: Debt[]; onClose: () => void }) {
+  const [messages, setMessages] = useState<AiChatMessage[]>([]);
+  const [proposals, setProposals] = useState<AiProposal[]>([]);
+  const [input, setInput] = useState('');
+  const [sending, setSending] = useState(false);
+  const reload = async () => { setMessages(await listAiChatMessages()); setProposals(await listAiProposals('pending')); };
+  useEffect(() => { if (visible) reload(); }, [visible]);
+  const send = async (text: string) => {
+    if (!text.trim() || sending) return;
+    setInput('');
+    setSending(true);
+    try { await sendUserMessage(text.trim()); await reload(); }
+    catch (error) { Alert.alert('Помощник не ответил', describeError(error) ?? 'Попробуйте ещё раз.'); }
+    finally { setSending(false); }
+  };
+  const attachReceipt = async () => {
+    const result = await ImagePicker.launchImageLibraryAsync({ mediaTypes: ['images'], quality: 0.8 });
+    if (result.canceled || !result.assets[0]?.uri) return;
+    setSending(true);
+    try {
+      const text = await extractReceiptText(result.assets[0].uri);
+      await sendUserMessage(`Текст с фото чека:\n${text}`);
+      await reload();
+    } catch (error) { Alert.alert('Не удалось разобрать фото', describeError(error) ?? 'Попробуйте ещё раз.'); }
+    finally { setSending(false); }
+  };
+  const textBlocksOf = (message: AiChatMessage) => message.content.filter((block) => block.type === 'text') as { type: 'text'; text: string }[];
+  return <Modal visible={visible} animationType="slide" presentationStyle="pageSheet" onRequestClose={onClose}><SafeAreaView style={s.modal} edges={['top', 'bottom']}>
+    <View style={s.modalHead}><Pressable onPress={onClose} style={s.close}><Ionicons name="close" size={22} color={C.ink} /></Pressable><Text style={s.modalTitle}>Афина · помощник</Text><Pressable onPress={() => Alert.alert('Очистить историю?', 'Диалог с помощником будет удалён с этого устройства.', [{ text: 'Отмена', style: 'cancel' }, { text: 'Очистить', style: 'destructive', onPress: async () => { await clearAiChat(); await reload(); } }])}><Ionicons name="trash-outline" size={20} color={C.muted} /></Pressable></View>
+    <KeyboardAvoidingView style={{ flex: 1 }} behavior={Platform.OS === 'ios' ? 'padding' : 'height'}>
+      <ScrollView contentContainerStyle={s.formBody} keyboardShouldPersistTaps="handled">
+        {!messages.length && <Text style={s.emptyText}>Спросите про доходы, расходы, долги или планы — например «сколько я потратила на еду в августе».</Text>}
+        {messages.map((message) => {
+          const text = textBlocksOf(message).map((block) => block.text).join('\n');
+          const relatedProposals = proposals.filter((proposal) => proposal.messageId === message.id);
+          if (!text && !relatedProposals.length) return null;
+          return <View key={message.id} style={{ marginBottom: 12, alignItems: message.role === 'user' ? 'flex-end' : 'flex-start' }}>
+            {!!text && <View style={[s.card, { padding: 12, backgroundColor: message.role === 'user' ? C.navy : C.card, maxWidth: '85%' }]}><Text style={{ color: message.role === 'user' ? 'white' : C.ink, fontSize: 14 }}>{text}</Text></View>}
+            {relatedProposals.map((proposal) => <AiProposalCard key={proposal.id} proposal={proposal} accounts={accounts} debts={debts} onConfirmed={reload} onDismissed={reload} />)}
+          </View>;
+        })}
+        {sending && <ActivityIndicator style={{ marginTop: 8 }} color={C.blue} />}
+      </ScrollView>
+      <View style={{ flexDirection: 'row', gap: 8, padding: 16, borderTopWidth: 1, borderTopColor: C.line, alignItems: 'flex-end' }}>
+        <Pressable onPress={attachReceipt} disabled={sending} style={{ padding: 8 }}><Ionicons name="camera-outline" size={24} color={C.blue} /></Pressable>
+        <TextInput value={input} onChangeText={setInput} placeholder="Спросите что-нибудь…" placeholderTextColor="#9BA9AF" style={[s.input, { flex: 1 }]} multiline editable={!sending} onSubmitEditing={() => send(input)} />
+        <Pressable onPress={() => send(input)} disabled={sending || !input.trim()} style={{ padding: 8, opacity: sending || !input.trim() ? .5 : 1 }}><Ionicons name="send" size={22} color={C.blue} /></Pressable>
+      </View>
+    </KeyboardAvoidingView>
+  </SafeAreaView></Modal>;
+}
+
 function LegacyAnalytics() {
   const maxBar = 11.2;
   return <ScrollView contentContainerStyle={s.page} showsVerticalScrollIndicator={false}>
@@ -968,7 +1084,7 @@ function AnalyticsDrilldownModal({ visible, kind, category, operations, plannedE
   </SafeAreaView></Modal>;
 }
 
-function Profile({ email, accounts, currencySettings, onCurrencySettings, onBack, pendingSmsDrafts, onSmsDraftsChanged }: { email?: string; accounts: Account[]; currencySettings: CurrencySettings; onCurrencySettings: () => void; onBack: () => void; pendingSmsDrafts: number; onSmsDraftsChanged: () => void }) {
+function Profile({ email, accounts, currencySettings, onCurrencySettings, onBack, pendingSmsDrafts, onSmsDraftsChanged, onOpenAssistant, pendingAiProposals }: { email?: string; accounts: Account[]; currencySettings: CurrencySettings; onCurrencySettings: () => void; onBack: () => void; pendingSmsDrafts: number; onSmsDraftsChanged: () => void; onOpenAssistant: () => void; pendingAiProposals: number }) {
   const [lockEnabled, setLockEnabledState] = useState(false);
   const [lockLoaded, setLockLoaded] = useState(false);
   const [pinSetupOpen, setPinSetupOpen] = useState(false);
@@ -1032,6 +1148,13 @@ function Profile({ email, accounts, currencySettings, onCurrencySettings, onBack
       <View style={[s.roundIcon, { backgroundColor: `${C.green}18` }]}><Ionicons name="chatbox-ellipses-outline" size={20} color={C.green} /></View>
       <View style={{ flex: 1 }}><Text style={s.rowTitle}>Черновики из SMS</Text><Text style={s.rowSub}>{pendingSmsDrafts > 0 ? `${pendingSmsDrafts} ждут подтверждения` : 'Посмотреть черновики или вставить текст вручную'}</Text></View>
       {pendingSmsDrafts > 0 && <View style={[s.chartBadge, { marginRight: 8 }]}><Text style={s.chartBadgeText}>{pendingSmsDrafts}</Text></View>}
+      <Ionicons name="chevron-forward" size={19} color={C.muted} />
+    </Pressable>
+    <SectionTitle title="Помощник" />
+    <Pressable style={s.accountCard} onPress={onOpenAssistant}>
+      <View style={[s.roundIcon, { backgroundColor: `${C.blue}18` }]}><Ionicons name="sparkles-outline" size={20} color={C.blue} /></View>
+      <View style={{ flex: 1 }}><Text style={s.rowTitle}>Афина · помощник</Text><Text style={s.rowSub}>{pendingAiProposals > 0 ? `${pendingAiProposals} предложений ждут подтверждения` : 'Спросите про доходы, расходы, долги или планы'}</Text></View>
+      {pendingAiProposals > 0 && <View style={[s.chartBadge, { marginRight: 8 }]}><Text style={s.chartBadgeText}>{pendingAiProposals}</Text></View>}
       <Ionicons name="chevron-forward" size={19} color={C.muted} />
     </Pressable>
     <SectionTitle title="О приложении" />
@@ -1134,7 +1257,8 @@ function InterestSettings({
   const automaticMonthlyDate = nextInterestDate ?? (startDate ? nextMonthlyDate(startDate) : undefined);
   return <View style={s.interestBox}>
     <Text style={s.fieldLabel}>СРОК</Text>
-    <View style={s.twoColumns}><View style={{ flex: 1 }}><Text style={s.miniFieldLabel}>Дата открытия</Text><DateField value={startDate} onPress={() => setDateTarget('start')} /></View><View style={{ flex: 1 }}><Text style={s.miniFieldLabel}>Дата окончания</Text><DateField value={maturityDate} onPress={() => setDateTarget('maturity')} /></View></View>
+    <Text style={s.miniFieldLabel}>Дата открытия</Text><DateField value={startDate} onPress={() => setDateTarget('start')} />
+    <Text style={[s.miniFieldLabel, { marginTop: 10 }]}>Дата окончания</Text><DateField value={maturityDate} onPress={() => setDateTarget('maturity')} />
     <Text style={s.fieldLabel}>КОГДА НАЧИСЛЯЮТСЯ ПРОЦЕНТЫ</Text>
     <View style={s.choiceRow}><Pressable style={[s.choice, schedule === 'daily' && s.choiceActive]} onPress={() => onChange({ interestSchedule: 'daily' })}><Text style={[s.choiceText, schedule === 'daily' && s.choiceTextActive]}>Ежедневно</Text></Pressable><Pressable style={[s.choice, schedule === 'monthly' && s.choiceActive]} onPress={() => onChange({ interestSchedule: 'monthly' })}><Text style={[s.choiceText, schedule === 'monthly' && s.choiceTextActive]}>Раз в месяц</Text></Pressable><Pressable style={[s.choice, schedule === 'maturity' && s.choiceActive]} onPress={() => onChange({ interestSchedule: 'maturity' })}><Text style={[s.choiceText, schedule === 'maturity' && s.choiceTextActive]}>В конце срока</Text></Pressable></View>
     {schedule === 'monthly' && <><Text style={s.fieldLabel}>БЛИЖАЙШАЯ ВЫПЛАТА ПРОЦЕНТОВ</Text><Text style={s.helperText}>{automaticMonthlyDate ?? 'Сначала выберите дату открытия'} · определяется автоматически по дню открытия</Text></>}
@@ -1814,6 +1938,10 @@ function AppContent({ userId, email }: { userId: string; email?: string }) {
   const [currencySettings, setCurrencySettings] = useState<CurrencySettings>({ baseCurrency: 'UZS', rates: { UZS: 1 }, autoUpdate: true });
   const [databaseReady, setDatabaseReady] = useState(false);
   const [pendingSmsDrafts, setPendingSmsDrafts] = useState(0);
+  const [pendingAiProposals, setPendingAiProposals] = useState(0);
+  const [aiAssistantOpen, setAiAssistantOpen] = useState(false);
+  useEffect(() => { countPendingAiProposals().then(setPendingAiProposals); }, []);
+  const refreshAiProposals = () => countPendingAiProposals().then(setPendingAiProposals);
 
   const reloadAccounts = async () => setUserAccounts(await listAccounts());
   const reloadExpenses = async () => setPlannedExpenses(await listPlannedExpenses());
@@ -1977,7 +2105,7 @@ function AppContent({ userId, email }: { userId: string; email?: string }) {
 
   const screen = useMemo(() => {
     const onProfile = () => setTab('profile');
-    if (tab === 'profile') return <Profile email={email} accounts={userAccounts} currencySettings={currencySettings} onCurrencySettings={() => setCurrencySettingsOpen(true)} onBack={() => setTab('home')} pendingSmsDrafts={pendingSmsDrafts} onSmsDraftsChanged={() => countPendingImportDrafts().then(setPendingSmsDrafts)} />;
+    if (tab === 'profile') return <Profile email={email} accounts={userAccounts} currencySettings={currencySettings} onCurrencySettings={() => setCurrencySettingsOpen(true)} onBack={() => setTab('home')} pendingSmsDrafts={pendingSmsDrafts} onSmsDraftsChanged={() => countPendingImportDrafts().then(setPendingSmsDrafts)} onOpenAssistant={() => setAiAssistantOpen(true)} pendingAiProposals={pendingAiProposals} />;
     if (tab === 'accounts') return <Accounts accounts={userAccounts} onAdd={openNewAccount} onImport={() => setImportOpen(true)} onEdit={openAccount} debts={debts} onAddDebt={openNewDebt} onOpenDebt={openDebt} currencySettings={currencySettings} onCurrencySettings={() => setCurrencySettingsOpen(true)} onProfile={onProfile} />;
     if (tab === 'calendar') return <Calendar accounts={userAccounts} plannedExpenses={plannedExpenses} plannedOccurrences={plannedOccurrences} debts={debts} currencySettings={currencySettings} onAddExpense={openNewExpense} onEditExpense={openExpense} onExecuteOccurrence={handleOpenOccurrence} onCancelOccurrence={handleCancelOccurrence} onProfile={onProfile} operations={operations} transfers={transfers} />;
     if (tab === 'operations') return <Operations operations={operations} transfers={transfers} plannedOccurrences={plannedOccurrences} plannedExpenses={plannedExpenses} accounts={userAccounts} onAdd={() => setOperationEditorOpen(true)} onTransfer={() => setTransferModalOpen(true)} onReverseTransfer={handleReverseTransfer} onExecuteOccurrence={handleOpenOccurrence} onCancelOccurrence={handleCancelOccurrence} onProfile={onProfile} />;
@@ -1989,6 +2117,11 @@ function AppContent({ userId, email }: { userId: string; email?: string }) {
     <View style={s.screen}>{screen}</View>
     <View style={s.tabBar}>{tabs.map((item) => { const active = tab === item.key; return <Pressable key={item.key} style={s.tab} onPress={() => setTab(item.key)}><Ionicons name={active ? item.icon.replace('-outline', '') as keyof typeof Ionicons.glyphMap : item.icon} size={21} color={active ? C.navy : '#98A1A4'} /><Text style={[s.tabText, active && s.tabTextActive]}>{item.label}</Text></Pressable> })}</View>
     <ImportModal visible={importOpen} onClose={() => setImportOpen(false)} accounts={userAccounts} onAccountSaved={async (input) => { await saveAccount(input); await synchronizeInterestPostings(); await Promise.all([reloadAccounts(), reloadOperations()]); }} />
+    <AiAssistantModal visible={aiAssistantOpen} accounts={userAccounts} debts={debts} onClose={async () => {
+      setAiAssistantOpen(false);
+      await Promise.all([reloadAccounts(), reloadOperations(), reloadDebts(), reloadTransfers(), reloadExpenses(), reloadPlannedOccurrences()]);
+      await refreshAiProposals();
+    }} />
     <AccountEditor visible={accountEditorOpen} account={editingAccount} accounts={userAccounts} rateHistory={depositRateHistory} onClose={() => setAccountEditorOpen(false)} onSave={handleSaveAccount} onDelete={handleDeleteAccount} />
     <PlannedExpenseEditor visible={expenseEditorOpen} expense={editingExpense} initialDate={newExpenseInitialDate} accounts={userAccounts} currencySettings={currencySettings} onClose={() => setExpenseEditorOpen(false)} onSave={handleSaveExpense} onDelete={handleDeleteExpense} />
     <DebtEditor visible={debtEditorOpen} debt={editingDebt} history={debtHistory} accounts={userAccounts} currencySettings={currencySettings} onClose={() => setDebtEditorOpen(false)} onCreate={handleCreateDebt} onUpdate={handleUpdateDebt} onPayment={handleDebtPayment} onReversePayment={handleReverseDebtPayment} onExtend={handleDebtExtension} onOverdue={handleDebtOverdue} />
@@ -2269,7 +2402,7 @@ const s = StyleSheet.create({
   safe: { flex: 1, backgroundColor: C.bg }, screen: { flex: 1 }, page: { padding: 20, paddingBottom: 24 },
   header: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 22 }, eyebrow: { fontSize: 11, letterSpacing: 1.6, color: C.muted, fontWeight: '700', marginBottom: 4 }, title: { fontSize: 28, fontWeight: '700', color: C.ink, letterSpacing: -.7 },
   avatar: { width: 42, height: 42, borderRadius: 21, backgroundColor: '#D8EAF2', alignItems: 'center', justifyContent: 'center' }, avatarText: { color: C.navy, fontSize: 17, fontWeight: '700' },
-  hero: { backgroundColor: C.navy, borderRadius: 24, padding: 22, marginBottom: 14 }, heroLabel: { color: '#AFC0C7', fontSize: 10, letterSpacing: 1.5, fontWeight: '700' }, heroAmount: { color: 'white', fontSize: 30, fontWeight: '700', marginTop: 8, letterSpacing: -.5 }, heroOtherCurrency: { color: '#C6D5DB', fontSize: 13, fontWeight: '600', marginTop: 4 }, heroDelta: { flexDirection: 'row', alignItems: 'center', marginTop: 7 }, heroDeltaText: { color: '#DCE7DD', fontSize: 12 }, heroRule: { height: 1, backgroundColor: '#49606B', marginVertical: 18 }, heroStats: { flexDirection: 'row', justifyContent: 'space-between', gap: 8 }, heroStatLabel: { color: '#AFC0C7', fontSize: 11, marginBottom: 5 }, heroStat: { color: 'white', fontSize: 13, fontWeight: '700' },
+  hero: { backgroundColor: C.navy, borderRadius: 24, padding: 22, marginBottom: 14 }, heroLabel: { color: '#AFC0C7', fontSize: 10, letterSpacing: 1.5, fontWeight: '700' }, heroAmount: { color: 'white', fontSize: 30, fontWeight: '700', marginTop: 8, letterSpacing: -.5 }, heroOtherCurrency: { color: '#C6D5DB', fontSize: 13, fontWeight: '600', marginTop: 4 }, heroDelta: { flexDirection: 'row', alignItems: 'center', marginTop: 7 }, heroDeltaText: { color: '#DCE7DD', fontSize: 12 }, heroRule: { height: 1, backgroundColor: '#49606B', marginVertical: 18 }, heroStats: { flexDirection: 'row', justifyContent: 'space-between', gap: 8 }, heroStatCol: { flex: 1, alignItems: 'center' }, heroStatLabel: { color: '#AFC0C7', fontSize: 11, marginBottom: 5 }, heroStatLabelBox: { textAlign: 'center', minHeight: 28 }, heroStat: { color: 'white', fontSize: 13, fontWeight: '700' },
   scanButton: { flexDirection: 'row', alignItems: 'center', gap: 12, backgroundColor: '#D7EAF2', borderRadius: 18, padding: 14, marginBottom: 12 }, scanIcon: { width: 42, height: 42, borderRadius: 13, backgroundColor: '#EDF7FA', alignItems: 'center', justifyContent: 'center' }, scanTitle: { color: C.ink, fontSize: 15, fontWeight: '700' }, scanSub: { color: C.muted, fontSize: 12, marginTop: 2 },
   alert: { flexDirection: 'row', alignItems: 'center', backgroundColor: C.redSoft, borderRadius: 18, padding: 15, marginBottom: 24, gap: 12 }, alertIcon: { width: 38, height: 38, borderRadius: 19, backgroundColor: '#F7D6D1', alignItems: 'center', justifyContent: 'center' }, alertTitle: { color: '#873A35', fontSize: 14, fontWeight: '700' }, alertText: { color: '#A25C56', fontSize: 12, marginTop: 3 },
   sectionHead: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginTop: 4, marginBottom: 11 }, sectionTitle: { color: C.ink, fontSize: 18, fontWeight: '700' }, link: { color: C.blue, fontSize: 13, fontWeight: '600' }, card: { backgroundColor: C.card, borderRadius: 18, paddingHorizontal: 16, marginBottom: 22 },

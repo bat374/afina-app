@@ -1,0 +1,8 @@
+# First Supabase CLI config in this repo -- needed only to deploy the ai-assistant Edge Function.
+# Replace project_id with your actual project ref (visible in the Supabase dashboard URL,
+# https://supabase.com/dashboard/project/<project_id>, or via `supabase projects list` after
+# `supabase login`) before running `supabase link` / `supabase functions deploy`. Not a secret.
+project_id = "qmaojhymqavvngegeynq"
+
+[functions.ai-assistant]
+verify_jwt = true

@@ -200,7 +200,7 @@ export type FinancialOperation = {
   accountId: string;
   date: string;
   kind: 'income' | 'expense';
-  source: 'manual' | 'debt' | 'interest' | 'sms' | 'receipt' | 'push';
+  source: 'manual' | 'debt' | 'interest' | 'sms' | 'receipt' | 'push' | 'ai';
   debtId?: string;
   relatedOperationId?: string;
   accountAmount?: number;
@@ -290,4 +290,43 @@ export type Goal = {
   target: number;
   deadline: string;
   color: string;
+};
+
+// ИИ-помощник — local-only chat state (never synced to Supabase, same principle as ImportDraft's
+// raw SMS/push text: see src/database.ts and docs/ai-assistant/anthropic-design.md).
+
+// Anthropic Messages API content blocks, stored/replayed verbatim -- the assistant loop never
+// reparses or reserializes them, it just appends whatever the API actually returned/received.
+export type AiContentBlock = Record<string, unknown>;
+
+export type AiChatMessage = {
+  id: string;
+  role: 'user' | 'assistant';
+  content: AiContentBlock[];
+  createdAt: string;
+};
+
+export type AiProposalKind = 'operation' | 'transfer' | 'debt' | 'debt_payment' | 'planned_flow' | 'bill_split';
+export type AiProposalStatus = 'pending' | 'confirmed' | 'dismissed';
+
+export type AiOperationProposal = { kind: 'operation'; title: string; category: string; amount: number; currency: string; accountId?: string; date: string; operationKind: 'income' | 'expense'; note?: string };
+export type AiTransferProposal = { kind: 'transfer'; fromAccountId?: string; toAccountId?: string; fromAmount: number; toAmount: number; exchangeRate?: number; note?: string; date: string };
+export type AiDebtProposal = { kind: 'debt'; person: string; title: string; direction: DebtDirection; originalAmount: number; currency: string; accountId?: string; startDate: string; dueDate: string; note?: string };
+export type AiDebtPaymentProposal = { kind: 'debt_payment'; debtId?: string; amount: number; date: string; accountId?: string; exchangeRate?: number; note?: string };
+export type AiPlannedFlowProposal = { kind: 'planned_flow'; title: string; category: string; amount: number; currency: string; accountId?: string; startDate: string; endDate?: string; repeat: ExpenseRepeat; flowKind: CashFlowKind; repeatInterval?: number; repeatUnit?: RecurrenceUnit; weekdays?: string };
+export type AiBillSplitProposal = { kind: 'bill_split'; title: string; category: string; totalAmount: number; currency: string; payingAccountId?: string; date: string; participants: { name: string; amount?: number }[]; dueDate?: string };
+
+export type AiProposalPayload = AiOperationProposal | AiTransferProposal | AiDebtProposal | AiDebtPaymentProposal | AiPlannedFlowProposal | AiBillSplitProposal;
+
+export type AiProposal = {
+  id: string;
+  groupId: string;
+  messageId: string;
+  toolUseId: string;
+  payload: AiProposalPayload;
+  status: AiProposalStatus;
+  createdEntityKind?: string;
+  createdEntityId?: string;
+  createdAt: string;
+  updatedAt: string;
 };

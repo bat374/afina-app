@@ -1,5 +1,5 @@
 import * as SQLite from 'expo-sqlite';
-import { Account, AccountType, Budget, CashFlowKind, CurrencySettings, Debt, DebtDirection, DebtHistory, DebtHistoryType, DebtStatus, DepositRateHistory, ExpenseRepeat, FinancialGoal, FinancialOperation, GoalType, ImportDraft, ImportDraftSource, InterestDestination, InterestPosting, InterestSchedule, PlannedExecutionInput, PlannedExpense, PlannedOccurrence, PlannedOccurrenceStatus, RecurrenceUnit, Transfer, TransferInput, WithdrawalPolicy } from './types';
+import { Account, AccountType, AiChatMessage, AiContentBlock, AiProposal, AiProposalKind, AiProposalPayload, Budget, CashFlowKind, CurrencySettings, Debt, DebtDirection, DebtHistory, DebtHistoryType, DebtStatus, DepositRateHistory, ExpenseRepeat, FinancialGoal, FinancialOperation, GoalType, ImportDraft, ImportDraftSource, InterestDestination, InterestPosting, InterestSchedule, PlannedExecutionInput, PlannedExpense, PlannedOccurrence, PlannedOccurrenceStatus, RecurrenceUnit, Transfer, TransferInput, WithdrawalPolicy } from './types';
 import { addLocalDays, daysBetween, localToday, nextBusinessMonday, nextMonthlyDate, parseLocalDate, previousMonthlyDate, toLocalIso } from './date';
 import { occursOn } from './recurrence';
 import { ParsedSms } from './sms/types';
@@ -225,7 +225,7 @@ async function initializeDatabaseCore() {
       account_id TEXT NOT NULL,
       date TEXT NOT NULL,
       kind TEXT NOT NULL CHECK(kind IN ('income', 'expense')),
-      source TEXT NOT NULL CHECK(source IN ('manual', 'debt', 'interest', 'sms', 'receipt', 'push')),
+      source TEXT NOT NULL CHECK(source IN ('manual', 'debt', 'interest', 'sms', 'receipt', 'push', 'ai')),
       debt_id TEXT,
       related_operation_id TEXT,
       account_amount REAL,
@@ -328,6 +328,25 @@ async function initializeDatabaseCore() {
       occurred_at TEXT NOT NULL,
       note TEXT,
       created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE TABLE IF NOT EXISTS ai_chat_messages (
+      id TEXT PRIMARY KEY NOT NULL,
+      role TEXT NOT NULL CHECK(role IN ('user', 'assistant')),
+      content_json TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE TABLE IF NOT EXISTS ai_proposals (
+      id TEXT PRIMARY KEY NOT NULL,
+      group_id TEXT NOT NULL,
+      message_id TEXT NOT NULL,
+      tool_use_id TEXT NOT NULL,
+      kind TEXT NOT NULL CHECK(kind IN ('operation', 'transfer', 'debt', 'debt_payment', 'planned_flow', 'bill_split')),
+      payload_json TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending', 'confirmed', 'dismissed')),
+      created_entity_kind TEXT,
+      created_entity_id TEXT,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
     );
     INSERT OR IGNORE INTO scheduled_flows
       (id, title, category, amount, currency, account_id, start_date, end_date, repeat_rule, kind,
@@ -492,6 +511,38 @@ async function initializeDatabaseCore() {
       COMMIT;
     `);
   }
+  // Adds 'ai' to operations.source's CHECK for the AI assistant (commitAiProposal) — same
+  // rebuild-the-table reason and pattern as the 'push' addition just above.
+  const operationSqlForAi = await db.getFirstAsync<{ sql: string }>("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'operations'");
+  if (operationSqlForAi?.sql && !operationSqlForAi.sql.includes("'ai'")) {
+    await db.execAsync(`
+      BEGIN;
+      CREATE TABLE operations_v4 (
+        id TEXT PRIMARY KEY NOT NULL, title TEXT NOT NULL, category TEXT NOT NULL,
+        amount REAL NOT NULL CHECK(amount > 0), currency TEXT NOT NULL, account_id TEXT NOT NULL,
+        date TEXT NOT NULL, kind TEXT NOT NULL CHECK(kind IN ('income', 'expense')),
+        source TEXT NOT NULL CHECK(source IN ('manual', 'debt', 'interest', 'sms', 'receipt', 'push', 'ai')),
+        debt_id TEXT, related_operation_id TEXT, account_amount REAL, account_currency TEXT,
+        status TEXT NOT NULL DEFAULT 'posted' CHECK(status IN ('posted', 'reversed')),
+        source_occurrence_id TEXT, planned_amount REAL, planned_currency TEXT,
+        interest_source_account_id TEXT, receipt_photo_uri TEXT,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+      );
+      INSERT INTO operations_v4 (
+        id, title, category, amount, currency, account_id, date, kind, source, debt_id,
+        related_operation_id, account_amount, account_currency, status, source_occurrence_id,
+        planned_amount, planned_currency, interest_source_account_id, receipt_photo_uri, created_at
+      )
+      SELECT
+        id, title, category, amount, currency, account_id, date, kind, source, debt_id,
+        related_operation_id, account_amount, account_currency, status, source_occurrence_id,
+        planned_amount, planned_currency, interest_source_account_id, receipt_photo_uri, created_at
+      FROM operations;
+      DROP TABLE operations;
+      ALTER TABLE operations_v4 RENAME TO operations;
+      COMMIT;
+    `);
+  }
   const smsDraftColumns = await db.getAllAsync<{ name: string }>('PRAGMA table_info(sms_drafts)');
   // No CHECK on this ALTER — SQLite's ADD COLUMN doesn't take one the way CREATE TABLE does;
   // validity of 'sms' | 'push' is enforced in TypeScript instead (ImportDraftSource).
@@ -581,7 +632,18 @@ async function initializeDatabaseCore() {
     `);
     await db.runAsync("INSERT OR REPLACE INTO app_settings (key, value) VALUES ('repair_v2_backfill_interest_source_account', '1')");
   }
-  await db.execAsync('PRAGMA user_version = 5;');
+  const debtReversalRepairFlag = await db.getFirstAsync<{ value: string }>("SELECT value FROM app_settings WHERE key = 'repair_v3_hide_debt_reversal_phantom_operations'");
+  if (!debtReversalRepairFlag) {
+    // Older builds of reverseDebtPayment inserted a brand-new opposite-kind operation titled
+    // "Отмена погашения · <person>" instead of just marking the original reversed (see BUG-04) —
+    // that phantom operation still shows up as a real expense/income in whatever period it landed
+    // in. Marking it 'reversed' now (matching what the fixed code does going forward) removes it
+    // from every screen that already excludes reversed rows, without touching any balance: the
+    // balance these phantom operations moved was correct at the time and stays untouched here.
+    await db.runAsync("UPDATE operations SET status = 'reversed' WHERE source = 'debt' AND title LIKE 'Отмена погашения %' AND status = 'posted'");
+    await db.runAsync("INSERT OR REPLACE INTO app_settings (key, value) VALUES ('repair_v3_hide_debt_reversal_phantom_operations', '1')");
+  }
+  await db.execAsync('PRAGMA user_version = 6;');
 }
 
 export function initializeDatabase() {
@@ -841,23 +903,27 @@ export function listDebts(): Promise<Debt[]> {
   return enqueue(listDebtsCore);
 }
 
+async function createDebtCore(db: SQLite.SQLiteDatabase, input: DebtInput): Promise<string> {
+  const id = makeId();
+  const now = new Date().toISOString();
+  await db.runAsync(
+    `INSERT INTO debts (id, person, title, direction, original_amount, current_balance, currency, account_id, start_date, due_date, status, note)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?)`,
+    id, input.person, input.title, input.direction, input.originalAmount, input.originalAmount,
+    input.currency, input.accountId ?? null, input.startDate, input.dueDate, input.note ?? null,
+  );
+  await db.runAsync(
+    'INSERT INTO debt_history (id, debt_id, type, amount, occurred_at, note) VALUES (?, ?, ?, ?, ?, ?)',
+    makeId(), id, 'created', input.originalAmount, now, input.note ?? null,
+  );
+  return id;
+}
+
 export function createDebt(input: DebtInput) {
   return enqueue(async () => {
     const db = await getDatabase();
-    const id = makeId();
-    const now = new Date().toISOString();
-    await db.withTransactionAsync(async () => {
-      await db.runAsync(
-        `INSERT INTO debts (id, person, title, direction, original_amount, current_balance, currency, account_id, start_date, due_date, status, note)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?)`,
-        id, input.person, input.title, input.direction, input.originalAmount, input.originalAmount,
-        input.currency, input.accountId ?? null, input.startDate, input.dueDate, input.note ?? null,
-      );
-      await db.runAsync(
-        'INSERT INTO debt_history (id, debt_id, type, amount, occurred_at, note) VALUES (?, ?, ?, ?, ?, ?)',
-        makeId(), id, 'created', input.originalAmount, now, input.note ?? null,
-      );
-    });
+    let id = '';
+    await db.withTransactionAsync(async () => { id = await createDebtCore(db, input); });
     return id;
   });
 }
@@ -935,44 +1001,47 @@ const convertUsingStoredRates = async (db: SQLite.SQLiteDatabase, amount: number
   return amount * source / target;
 };
 
+async function recordDebtPaymentCore(db: SQLite.SQLiteDatabase, debtId: string, requestedAmount: number, paymentDate: string, accountId?: string | null, exchangeRate?: number, note?: string): Promise<string | undefined> {
+  const row = await db.getFirstAsync<DebtRow>('SELECT * FROM debts WHERE id = ?', debtId);
+  if (!row) throw new Error('Debt not found');
+  if (!Number.isFinite(requestedAmount) || requestedAmount <= 0) throw new Error('Сумма погашения должна быть больше нуля');
+  if (requestedAmount > row.current_balance + 0.000001) throw new Error('Сумма погашения больше остатка долга');
+  const amount = requestedAmount;
+  const balance = Math.max(0, row.current_balance - amount);
+  const paid = balance < 0.000001;
+  const historyType: DebtHistoryType = paid && paymentDate < row.due_date ? 'early_payment' : 'payment';
+  const selectedAccountId = accountId === undefined ? row.account_id : accountId;
+  await db.runAsync("UPDATE debts SET current_balance = ?, status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?", balance, paid ? 'paid' : row.status, debtId);
+  let operationId: string | undefined;
+  if (selectedAccountId) {
+    const account = await db.getFirstAsync<{ currency: string }>('SELECT currency FROM accounts WHERE id = ?', selectedAccountId);
+    if (!account) throw new Error('Счёт погашения не найден');
+    const accountAmount = exchangeRate && exchangeRate > 0
+      ? amount * exchangeRate
+      : await convertUsingStoredRates(db, amount, row.currency, account.currency);
+    const delta = row.direction === 'owed_to_me' ? accountAmount : -accountAmount;
+    await db.runAsync('UPDATE accounts SET balance = balance + ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?', delta, selectedAccountId);
+    operationId = makeId();
+    await db.runAsync(
+      `INSERT INTO operations (id, title, category, amount, currency, account_id, date, kind, source,
+      debt_id, account_amount, account_currency, status)
+     VALUES (?, ?, 'Долги', ?, ?, ?, ?, ?, 'debt', ?, ?, ?, 'posted')`,
+      operationId, `${row.direction === 'owed_to_me' ? 'Возврат долга' : 'Погашение долга'} · ${row.person}`,
+      amount, row.currency, selectedAccountId, paymentDate, row.direction === 'owed_to_me' ? 'income' : 'expense',
+      debtId, accountAmount, account.currency,
+    );
+  }
+  await db.runAsync(
+    'INSERT INTO debt_history (id, debt_id, type, amount, occurred_at, note, operation_id) VALUES (?, ?, ?, ?, ?, ?, ?)',
+    makeId(), debtId, historyType, amount, `${paymentDate}T12:00:00.000Z`, note ?? null, operationId ?? null,
+  );
+  return operationId;
+}
+
 export function recordDebtPayment(debtId: string, requestedAmount: number, paymentDate: string, accountId?: string | null, exchangeRate?: number, note?: string) {
   return enqueue(async () => {
     const db = await getDatabase();
-    const row = await db.getFirstAsync<DebtRow>('SELECT * FROM debts WHERE id = ?', debtId);
-    if (!row) throw new Error('Debt not found');
-    if (!Number.isFinite(requestedAmount) || requestedAmount <= 0) throw new Error('Сумма погашения должна быть больше нуля');
-    if (requestedAmount > row.current_balance + 0.000001) throw new Error('Сумма погашения больше остатка долга');
-    const amount = requestedAmount;
-    const balance = Math.max(0, row.current_balance - amount);
-    const paid = balance < 0.000001;
-    const historyType: DebtHistoryType = paid && paymentDate < row.due_date ? 'early_payment' : 'payment';
-    const selectedAccountId = accountId === undefined ? row.account_id : accountId;
-    await db.withTransactionAsync(async () => {
-      await db.runAsync("UPDATE debts SET current_balance = ?, status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?", balance, paid ? 'paid' : row.status, debtId);
-      let operationId: string | undefined;
-      if (selectedAccountId) {
-        const account = await db.getFirstAsync<{ currency: string }>('SELECT currency FROM accounts WHERE id = ?', selectedAccountId);
-        if (!account) throw new Error('Счёт погашения не найден');
-        const accountAmount = exchangeRate && exchangeRate > 0
-          ? amount * exchangeRate
-          : await convertUsingStoredRates(db, amount, row.currency, account.currency);
-        const delta = row.direction === 'owed_to_me' ? accountAmount : -accountAmount;
-        await db.runAsync('UPDATE accounts SET balance = balance + ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?', delta, selectedAccountId);
-        operationId = makeId();
-        await db.runAsync(
-          `INSERT INTO operations (id, title, category, amount, currency, account_id, date, kind, source,
-          debt_id, account_amount, account_currency, status)
-         VALUES (?, ?, 'Долги', ?, ?, ?, ?, ?, 'debt', ?, ?, ?, 'posted')`,
-          operationId, `${row.direction === 'owed_to_me' ? 'Возврат долга' : 'Погашение долга'} · ${row.person}`,
-          amount, row.currency, selectedAccountId, paymentDate, row.direction === 'owed_to_me' ? 'income' : 'expense',
-          debtId, accountAmount, account.currency,
-        );
-      }
-      await db.runAsync(
-        'INSERT INTO debt_history (id, debt_id, type, amount, occurred_at, note, operation_id) VALUES (?, ?, ?, ?, ?, ?, ?)',
-        makeId(), debtId, historyType, amount, `${paymentDate}T12:00:00.000Z`, note ?? null, operationId ?? null,
-      );
-    });
+    await db.withTransactionAsync(async () => { await recordDebtPaymentCore(db, debtId, requestedAmount, paymentDate, accountId, exchangeRate, note); });
   });
 }
 
@@ -1217,22 +1286,74 @@ export function synchronizeInterestPostings(today = localToday()) {
         const payoutDate = nextBusinessMonday(account.maturity_date);
         if (payoutDate <= today) dates = [payoutDate];
       }
+      // For the daily schedule, backfilling more than one missed day at once (app not opened
+      // every day) must price each day's interest on the balance as it actually stood ON that
+      // day -- not on whatever the account's live balance happens to be right now, which may
+      // already include a manual top-up/withdrawal/transfer that (chronologically) only took
+      // effect partway through the days now being caught up. Reconstructed once from real
+      // operations/transfers dated after trackingFrom, mirroring buildMonthProjection's past-day
+      // reconstruction (src/finance.ts), instead of re-reading "now" on every iteration.
+      let dailyRunningBalance: number | null = null;
+      let dailyDeltaByDate: Map<string, number> | null = null;
+      if (account.interest_schedule === 'daily' && dates.length) {
+        const laterOps = await db.getAllAsync<{ date: string; kind: 'income' | 'expense'; amount: number }>(
+          // COALESCE(account_amount, amount): a debt payment in a different currency from this
+          // account stores the debt-currency figure in `amount` but applies `account_amount` (this
+          // account's own currency) to the balance -- reconstruction must use what was actually
+          // applied, same as reverseDebtPayment already does. `account_amount` is NULL for
+          // same-currency rows (createOperation/confirmImportDraft), where it degrades to `amount`.
+          // The reversed-legacy-phantom clause covers the one-time BUG-04 repair migration above,
+          // which deliberately marks old "Отмена погашения ·" operations 'reversed' WITHOUT undoing
+          // their (already-correct-at-the-time) balance effect -- excluding them here would make
+          // this reconstruction under-subtract by exactly that amount.
+          `SELECT date, kind, COALESCE(account_amount, amount) AS amount FROM operations
+           WHERE account_id = ? AND date > ?
+           AND (status != 'reversed' OR (source = 'debt' AND title LIKE 'Отмена погашения %'))`,
+          account.id, trackingFrom,
+        );
+        const laterTransfersOut = await db.getAllAsync<{ date: string; from_amount: number }>(
+          "SELECT date, from_amount FROM transfers WHERE from_account_id = ? AND status != 'reversed' AND date > ?",
+          account.id, trackingFrom,
+        );
+        const laterTransfersIn = await db.getAllAsync<{ date: string; to_amount: number }>(
+          "SELECT date, to_amount FROM transfers WHERE to_account_id = ? AND status != 'reversed' AND date > ?",
+          account.id, trackingFrom,
+        );
+        dailyDeltaByDate = new Map<string, number>();
+        for (const op of laterOps) dailyDeltaByDate.set(op.date, (dailyDeltaByDate.get(op.date) ?? 0) + (op.kind === 'income' ? op.amount : -op.amount));
+        for (const row of laterTransfersOut) dailyDeltaByDate.set(row.date, (dailyDeltaByDate.get(row.date) ?? 0) - row.from_amount);
+        for (const row of laterTransfersIn) dailyDeltaByDate.set(row.date, (dailyDeltaByDate.get(row.date) ?? 0) + row.to_amount);
+        const totalLaterDelta = [...dailyDeltaByDate.values()].reduce((sum, value) => sum + value, 0);
+        // Current live balance minus every later delta = the balance as of trackingFrom, the
+        // known-good anchor to reconstruct forward from.
+        dailyRunningBalance = account.balance - totalLaterDelta;
+      }
       let previousDate = trackingFrom; let lastProcessedDate = trackingFrom;
       let blocked = false;
       for (const payoutDate of dates) {
-        const source = await db.getFirstAsync<{ balance: number; currency: string }>('SELECT balance, currency FROM accounts WHERE id = ?', account.id);
-        if (!source) break;
+        let sourceBalance: number; let sourceCurrency: string;
+        const isDailyReconstructed = account.interest_schedule === 'daily' && dailyRunningBalance !== null && dailyDeltaByDate !== null;
+        if (isDailyReconstructed) {
+          dailyRunningBalance = dailyRunningBalance! + (dailyDeltaByDate!.get(payoutDate) ?? 0);
+          sourceBalance = dailyRunningBalance;
+          sourceCurrency = account.currency;
+        } else {
+          const source = await db.getFirstAsync<{ balance: number; currency: string }>('SELECT balance, currency FROM accounts WHERE id = ?', account.id);
+          if (!source) break;
+          sourceBalance = source.balance; sourceCurrency = source.currency;
+        }
         const periodDays = account.interest_schedule === 'daily' ? 1 : Math.max(1, daysBetween(parseLocalDate(previousDate)!, parseLocalDate(payoutDate)!));
-        const amount = source.balance * ((account.rate ?? 0) / 100) * periodDays / 365;
+        const amount = sourceBalance * ((account.rate ?? 0) / 100) * periodDays / 365;
         let creditedAmount: number;
         try {
-          creditedAmount = await convertUsingStoredRates(db, amount, source.currency, destinationCurrency);
+          creditedAmount = await convertUsingStoredRates(db, amount, sourceCurrency, destinationCurrency);
         } catch {
           // Missing FX rate for this leg: stop here without marking the period processed,
           // so it is retried once the rate is available. Do not touch other accounts.
           blocked = true;
           break;
         }
+        let posted = false;
         await db.withTransactionAsync(async () => {
           const postingId = makeId();
           const inserted = await db.runAsync(
@@ -1240,6 +1361,7 @@ export function synchronizeInterestPostings(today = localToday()) {
             postingId, account.id, payoutDate, amount, destinationId,
           );
           if (!inserted.changes) return;
+          posted = true;
           const operationId = makeId();
           await db.runAsync('UPDATE accounts SET balance = balance + ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?', creditedAmount, destinationId);
           await db.runAsync(
@@ -1249,6 +1371,11 @@ export function synchronizeInterestPostings(today = localToday()) {
           );
           await db.runAsync('UPDATE interest_postings SET operation_id = ? WHERE id = ?', operationId, postingId);
         });
+        // Compounds the just-credited interest into the reconstructed principal so the next
+        // backfilled day prices off it too -- only valid when this account IS the destination
+        // (interest_destination='same' implies destinationId === account.id, so destinationCurrency
+        // === sourceCurrency and `amount`/`creditedAmount` are the same figure, no FX involved).
+        if (isDailyReconstructed && posted && destinationId === account.id) dailyRunningBalance = dailyRunningBalance! + amount;
         previousDate = payoutDate; lastProcessedDate = payoutDate;
       }
       if (blocked) continue;
@@ -1378,20 +1505,26 @@ export function cancelPlannedOccurrence(occurrenceId: string) {
   });
 }
 
-export function createOperation(input: FinancialOperationInput) {
+// No transaction of its own -- callers (createOperation, and commitAiProposal for AI-confirmed
+// proposals) wrap this in their own withTransactionAsync, per the file's existing *Core convention.
+async function createOperationCore(db: SQLite.SQLiteDatabase, input: FinancialOperationInput, source: FinancialOperation['source'] = 'manual'): Promise<string> {
+  const id = makeId();
+  const delta = input.kind === 'income' ? input.amount : -input.amount;
+  await db.runAsync(
+    `INSERT INTO operations (id, title, category, amount, currency, account_id, date, kind, source, receipt_photo_uri)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    id, input.title, input.category, input.amount, input.currency, input.accountId, input.date, input.kind, source,
+    input.receiptPhotoUri ?? null,
+  );
+  await db.runAsync('UPDATE accounts SET balance = balance + ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?', delta, input.accountId);
+  return id;
+}
+
+export function createOperation(input: FinancialOperationInput, source: FinancialOperation['source'] = 'manual') {
   return enqueue(async () => {
     const db = await getDatabase();
-    const id = makeId();
-    const delta = input.kind === 'income' ? input.amount : -input.amount;
-    await db.withTransactionAsync(async () => {
-      await db.runAsync(
-        `INSERT INTO operations (id, title, category, amount, currency, account_id, date, kind, source, receipt_photo_uri)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'manual', ?)`,
-        id, input.title, input.category, input.amount, input.currency, input.accountId, input.date, input.kind,
-        input.receiptPhotoUri ?? null,
-      );
-      await db.runAsync('UPDATE accounts SET balance = balance + ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?', delta, input.accountId);
-    });
+    let id = '';
+    await db.withTransactionAsync(async () => { id = await createOperationCore(db, input, source); });
     return id;
   });
 }
@@ -1628,6 +1761,193 @@ export function countPendingImportDrafts(): Promise<number> {
     const db = await getDatabase();
     const row = await db.getFirstAsync<{ count: number }>("SELECT COUNT(*) as count FROM sms_drafts WHERE status IN ('pending', 'unrecognized')");
     return row?.count ?? 0;
+  });
+}
+
+// ИИ-помощник — local-only chat/proposal state, never synced to Supabase (same principle as
+// sms_drafts' raw text: see docs/ai-assistant/anthropic-design.md).
+
+export function appendAiChatMessage(role: AiChatMessage['role'], content: AiContentBlock[]): Promise<AiChatMessage> {
+  return enqueue(async () => {
+    const db = await getDatabase();
+    const id = makeId();
+    const createdAt = new Date().toISOString();
+    await db.runAsync('INSERT INTO ai_chat_messages (id, role, content_json, created_at) VALUES (?, ?, ?, ?)', id, role, JSON.stringify(content), createdAt);
+    // Keep only the last 40 messages -- chat history is a convenience, not a financial record,
+    // and an unbounded table would grow forever with no user-facing way to prune it.
+    await db.runAsync(
+      "DELETE FROM ai_chat_messages WHERE id NOT IN (SELECT id FROM ai_chat_messages ORDER BY created_at DESC, id DESC LIMIT 40)",
+    );
+    return { id, role, content, createdAt };
+  });
+}
+
+export function listAiChatMessages(): Promise<AiChatMessage[]> {
+  return enqueue(async () => {
+    const db = await getDatabase();
+    const rows = await db.getAllAsync<{ id: string; role: AiChatMessage['role']; content_json: string; created_at: string }>(
+      'SELECT * FROM ai_chat_messages ORDER BY created_at ASC, id ASC',
+    );
+    return rows.map((row) => ({ id: row.id, role: row.role, content: JSON.parse(row.content_json), createdAt: row.created_at }));
+  });
+}
+
+export function clearAiChat() {
+  return enqueue(async () => {
+    const db = await getDatabase();
+    await db.withTransactionAsync(async () => {
+      await db.runAsync('DELETE FROM ai_chat_messages');
+      await db.runAsync("DELETE FROM ai_proposals WHERE status = 'pending'");
+    });
+  });
+}
+
+type AiProposalRow = {
+  id: string; group_id: string; message_id: string; tool_use_id: string; kind: AiProposalKind; payload_json: string;
+  status: AiProposal['status']; created_entity_kind: string | null; created_entity_id: string | null;
+  created_at: string; updated_at: string;
+};
+
+const mapAiProposalRow = (row: AiProposalRow): AiProposal => ({
+  id: row.id, groupId: row.group_id, messageId: row.message_id, toolUseId: row.tool_use_id,
+  payload: JSON.parse(row.payload_json), status: row.status,
+  createdEntityKind: row.created_entity_kind ?? undefined, createdEntityId: row.created_entity_id ?? undefined,
+  createdAt: row.created_at, updatedAt: row.updated_at,
+});
+
+export function createAiProposals(groupId: string, messageId: string, items: { toolUseId: string; kind: AiProposalKind; payload: AiProposalPayload }[]): Promise<AiProposal[]> {
+  return enqueue(async () => {
+    const db = await getDatabase();
+    const created: AiProposal[] = [];
+    await db.withTransactionAsync(async () => {
+      for (const item of items) {
+        const id = makeId();
+        const now = new Date().toISOString();
+        await db.runAsync(
+          'INSERT INTO ai_proposals (id, group_id, message_id, tool_use_id, kind, payload_json, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+          id, groupId, messageId, item.toolUseId, item.kind, JSON.stringify(item.payload), 'pending', now, now,
+        );
+        created.push({ id, groupId, messageId, toolUseId: item.toolUseId, payload: item.payload, status: 'pending', createdAt: now, updatedAt: now });
+      }
+    });
+    return created;
+  });
+}
+
+export function listAiProposals(status?: AiProposal['status']): Promise<AiProposal[]> {
+  return enqueue(async () => {
+    const db = await getDatabase();
+    const rows = status
+      ? await db.getAllAsync<AiProposalRow>('SELECT * FROM ai_proposals WHERE status = ? ORDER BY created_at ASC', status)
+      : await db.getAllAsync<AiProposalRow>('SELECT * FROM ai_proposals ORDER BY created_at ASC');
+    return rows.map(mapAiProposalRow);
+  });
+}
+
+export function countPendingAiProposals(): Promise<number> {
+  return enqueue(async () => {
+    const db = await getDatabase();
+    const row = await db.getFirstAsync<{ count: number }>("SELECT COUNT(*) as count FROM ai_proposals WHERE status = 'pending'");
+    return row?.count ?? 0;
+  });
+}
+
+export function dismissAiProposal(id: string) {
+  return enqueue(async () => {
+    const db = await getDatabase();
+    await db.runAsync("UPDATE ai_proposals SET status = 'dismissed', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND status = 'pending'", id);
+  });
+}
+
+// Writes the entity the proposal describes AND flips the proposal to 'confirmed' in one
+// transaction -- the same idempotency property confirmImportDraft relies on (a stray double-tap
+// can't create two entities, since the second call finds status !== 'pending' and no-ops).
+// Each kind either calls a *Core helper directly (createOperationCore/createDebtCore/
+// recordDebtPaymentCore -- none of which open their own transaction, per this file's convention)
+// or inlines the insert when it's simple enough not to warrant one (planned_flow), mirroring how
+// confirmImportDraftAsTransfer inlines a transfer instead of nesting recordTransferCore's own
+// withTransactionAsync (expo-sqlite doesn't support nested transactions).
+export function commitAiProposal(proposalId: string) {
+  return enqueue(async () => {
+    const db = await getDatabase();
+    const row = await db.getFirstAsync<AiProposalRow>('SELECT * FROM ai_proposals WHERE id = ?', proposalId);
+    if (!row || row.status !== 'pending') throw new Error('Предложение не найдено или уже обработано');
+    const payload = JSON.parse(row.payload_json) as AiProposalPayload;
+    let createdEntityId = '';
+    await db.withTransactionAsync(async () => {
+      if (payload.kind === 'operation') {
+        if (!payload.accountId) throw new Error('Не выбран счёт');
+        createdEntityId = await createOperationCore(db, {
+          title: payload.title, category: payload.category, amount: payload.amount, currency: payload.currency,
+          accountId: payload.accountId, date: payload.date, kind: payload.operationKind,
+        }, 'ai');
+      } else if (payload.kind === 'transfer') {
+        if (!payload.fromAccountId || !payload.toAccountId) throw new Error('Не выбраны счета перевода');
+        // Same guards recordTransferCore already enforces for the manual transfer flow — the
+        // model can propose a same-account "transfer" or a non-positive amount, and unlike a
+        // manual form there's no client-side form validation catching it before this ever runs.
+        if (payload.fromAccountId === payload.toAccountId) throw new Error('Счета списания и зачисления должны различаться');
+        if (!Number.isFinite(payload.fromAmount) || payload.fromAmount <= 0) throw new Error('Сумма списания должна быть больше нуля');
+        if (!Number.isFinite(payload.toAmount) || payload.toAmount <= 0) throw new Error('Сумма зачисления должна быть больше нуля');
+        const fromAccount = await db.getFirstAsync<{ currency: string }>('SELECT currency FROM accounts WHERE id = ?', payload.fromAccountId);
+        const toAccount = await db.getFirstAsync<{ currency: string }>('SELECT currency FROM accounts WHERE id = ?', payload.toAccountId);
+        if (!fromAccount || !toAccount) throw new Error('Счёт не найден');
+        const transferId = makeId();
+        await db.runAsync('UPDATE accounts SET balance = balance - ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?', payload.fromAmount, payload.fromAccountId);
+        await db.runAsync('UPDATE accounts SET balance = balance + ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?', payload.toAmount, payload.toAccountId);
+        await db.runAsync(
+          `INSERT INTO transfers (id, from_account_id, to_account_id, from_amount, from_currency, to_amount, to_currency, exchange_rate, note, date, status)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'posted')`,
+          transferId, payload.fromAccountId, payload.toAccountId, payload.fromAmount, fromAccount.currency,
+          payload.toAmount, toAccount.currency, payload.exchangeRate ?? null, payload.note ?? null, payload.date,
+        );
+        createdEntityId = transferId;
+      } else if (payload.kind === 'debt') {
+        createdEntityId = await createDebtCore(db, {
+          person: payload.person, title: payload.title, direction: payload.direction, originalAmount: payload.originalAmount,
+          currency: payload.currency, accountId: payload.accountId, startDate: payload.startDate, dueDate: payload.dueDate, note: payload.note,
+        });
+      } else if (payload.kind === 'debt_payment') {
+        if (!payload.debtId) throw new Error('Не выбран долг');
+        createdEntityId = (await recordDebtPaymentCore(db, payload.debtId, payload.amount, payload.date, payload.accountId, payload.exchangeRate, payload.note)) ?? payload.debtId;
+      } else if (payload.kind === 'planned_flow') {
+        const flowId = makeId();
+        await db.runAsync(
+          `INSERT INTO scheduled_flows (id, title, category, amount, currency, account_id, start_date, end_date,
+           repeat_rule, kind, repeat_interval, repeat_unit, weekdays, occurrences_tracking_from)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          flowId, payload.title, payload.category, payload.amount, payload.currency, payload.accountId ?? null,
+          payload.startDate, payload.endDate ?? null, payload.repeat, payload.flowKind, payload.repeatInterval ?? 1,
+          payload.repeatUnit ?? null, payload.weekdays ?? null, addLocalDays(payload.startDate, -1),
+        );
+        createdEntityId = flowId;
+      } else if (payload.kind === 'bill_split') {
+        if (!payload.payingAccountId) throw new Error('Не выбран счёт оплаты');
+        // Equal-split division and its rounding remainder are computed client-side before this
+        // is ever confirmable -- the model proposes intent, never arithmetic (see propose_bill_split
+        // tool description). A participant still missing an amount here means that resolution
+        // never happened; refuse rather than silently skip a receivable.
+        if (payload.participants.some((participant) => participant.amount === undefined)) {
+          throw new Error('Не для всех участников указана сумма — проверьте разделение счёта');
+        }
+        createdEntityId = await createOperationCore(db, {
+          title: payload.title, category: payload.category, amount: payload.totalAmount, currency: payload.currency,
+          accountId: payload.payingAccountId, date: payload.date, kind: 'expense',
+        }, 'ai');
+        const dueDate = payload.dueDate ?? addLocalDays(payload.date, 30);
+        for (const participant of payload.participants) {
+          await createDebtCore(db, {
+            person: participant.name, title: payload.title, direction: 'owed_to_me', originalAmount: participant.amount!,
+            currency: payload.currency, accountId: payload.payingAccountId, startDate: payload.date, dueDate,
+          });
+        }
+      }
+      await db.runAsync(
+        "UPDATE ai_proposals SET status = 'confirmed', created_entity_kind = ?, created_entity_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+        payload.kind, createdEntityId, proposalId,
+      );
+    });
+    return createdEntityId;
   });
 }
 
